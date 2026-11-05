@@ -12,12 +12,18 @@
 #include "pw_gpu_kernels.h"
 
 #include <assert.h>
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <omp.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "pw_gpu_host.h"
 
 /*******************************************************************************
  * \brief Static variables for retaining objects that are expensive to create.
@@ -65,6 +71,8 @@ typedef struct {
 #define PW_GPU_GRID_CACHE_SIZE 8
 static grid_cache_entry grid_cache[PW_GPU_GRID_CACHE_SIZE];
 static unsigned long grid_cache_clock = 0;
+// The map being extended with g-vectors must survive memory reclamation.
+static grid_cache_entry *protected_grid_entry = NULL;
 
 // Compact (ngpts complex) device scratch for the fused paths.
 static double *gbuf_dev;
@@ -73,6 +81,47 @@ static size_t allocated_gbuf_size;
 // Runtime switches, read once in pw_gpu_init().
 static bool opt_map_cache = true; // CP2K_PW_GPU_MAP_CACHE
 static bool opt_fused_xc = true;  // CP2K_PW_GPU_FUSED_XC
+
+// Counts all explicit device allocations in this module. FFT-library internal
+// workspaces are opaque and are not included in this budget.
+static size_t max_gpu_memory_bytes = 0;
+static int host_fallback_enabled = 1;
+static size_t current_gpu_allocated_bytes = 0;
+static size_t peak_gpu_allocated_bytes = 0;
+static bool memory_environment_read = false;
+static bool memory_limit_from_environment = false;
+static bool host_fallback_from_environment = false;
+static bool fallback_notice_printed = false;
+
+#define PW_GPU_MIB ((size_t)1024 * 1024)
+
+// Accept only complete, nonnegative decimal integers and prevent conversion
+// overflow before multiplying MiB. Invalid overrides do not hide valid defaults.
+static bool parse_unsigned(const char *s, const size_t maximum, size_t *value) {
+  if (s == NULL) {
+    return false;
+  }
+  while (isspace((unsigned char)*s)) {
+    s++;
+  }
+  if (!isdigit((unsigned char)*s)) {
+    return false;
+  }
+  errno = 0;
+  char *end;
+  const unsigned long long parsed = strtoull(s, &end, 10);
+  if (errno == ERANGE || parsed > maximum) {
+    return false;
+  }
+  while (isspace((unsigned char)*end)) {
+    end++;
+  }
+  if (*end != '\0') {
+    return false;
+  }
+  *value = (size_t)parsed;
+  return true;
+}
 
 /*******************************************************************************
  * \brief Reads a boolean environment switch ("0", "no", "false", "off" = off).
@@ -92,17 +141,146 @@ static bool env_flag(const char *name, const bool default_value) {
   return true;
 }
 
+static void read_memory_environment(void) {
+  if (memory_environment_read) {
+    return;
+  }
+  memory_environment_read = true;
+  const char *rank_names[] = {"OMPI_COMM_WORLD_RANK", "PMI_RANK", "SLURM_PROCID",
+                              "MPI_LOCALRANKID"};
+  size_t rank = 0, mb;
+  for (size_t i = 0; i < sizeof(rank_names) / sizeof(rank_names[0]); i++) {
+    if (parse_unsigned(getenv(rank_names[i]), INT_MAX, &rank)) {
+      break;
+    }
+  }
+  char name[80];
+  snprintf(name, sizeof(name), "CP2K_GPU_MEM_LIMIT_MB_RANK%zu", rank);
+  memory_limit_from_environment =
+      parse_unsigned(getenv(name), SIZE_MAX / PW_GPU_MIB, &mb) ||
+      parse_unsigned(getenv("CP2K_GPU_MEM_LIMIT_MB"), SIZE_MAX / PW_GPU_MIB, &mb);
+  if (memory_limit_from_environment) {
+    max_gpu_memory_bytes = mb * PW_GPU_MIB;
+  }
+  const char *fallback = getenv("CP2K_GPU_HOST_FALLBACK");
+  host_fallback_from_environment = (fallback != NULL && fallback[0] != '\0');
+  if (host_fallback_from_environment) {
+    host_fallback_enabled = env_flag("CP2K_GPU_HOST_FALLBACK", true);
+  }
+}
+
+static void device_malloc(void **ptr, const size_t bytes) {
+  assert(bytes <= SIZE_MAX - current_gpu_allocated_bytes);
+  offloadMalloc(ptr, bytes);
+  current_gpu_allocated_bytes += bytes;
+  if (current_gpu_allocated_bytes > peak_gpu_allocated_bytes) {
+    peak_gpu_allocated_bytes = current_gpu_allocated_bytes;
+  }
+}
+
+static void device_free(void *ptr, const size_t bytes) {
+  if (ptr != NULL) {
+    assert(bytes <= current_gpu_allocated_bytes);
+    offloadFree(ptr);
+    current_gpu_allocated_bytes -= bytes;
+  }
+}
+
 /*******************************************************************************
  * \brief Frees the device memory of a grid cache entry and empties the slot.
  ******************************************************************************/
 static void grid_cache_clear_entry(grid_cache_entry *e) {
-  if (e->map_dev != NULL) {
-    offloadFree(e->map_dev);
+  if (e->map_dev != NULL || e->g_dev != NULL) {
+    // Uploads are asynchronous, including entries reclaimed during preparation.
+    offloadStreamSynchronize(stream);
   }
-  if (e->g_dev != NULL) {
-    offloadFree(e->g_dev);
-  }
+  device_free(e->map_dev, sizeof(int) * (size_t)e->ngpts * (size_t)e->nmaps);
+  device_free(e->g_dev, 3 * sizeof(double) * (size_t)e->ngpts);
   memset(e, 0, sizeof(grid_cache_entry));
+}
+
+static int check_and_reclaim_memory(const size_t required_bytes) {
+  read_memory_environment();
+  if (max_gpu_memory_bytes == 0) {
+    return required_bytes <= SIZE_MAX - current_gpu_allocated_bytes;
+  }
+  while (current_gpu_allocated_bytes > max_gpu_memory_bytes ||
+         required_bytes > max_gpu_memory_bytes - current_gpu_allocated_bytes) {
+    grid_cache_entry *oldest = NULL;
+    for (int i = 0; i < PW_GPU_GRID_CACHE_SIZE; i++) {
+      grid_cache_entry *e = &grid_cache[i];
+      if (e->grid_id != 0 && e != protected_grid_entry &&
+          (oldest == NULL || e->last_use < oldest->last_use)) {
+        oldest = e;
+      }
+    }
+    if (oldest == NULL) {
+      return 0;
+    }
+    grid_cache_clear_entry(oldest);
+  }
+  return 1;
+}
+
+static int memory_limit_exceeded(void) {
+  if (is_initialized) {
+    offloadStreamSynchronize(stream);
+  }
+  if (!host_fallback_enabled) {
+    fprintf(stderr, "[PW_GPU] Memory limit reached (%zu MB); host fallback is disabled.\n",
+            max_gpu_memory_bytes / PW_GPU_MIB);
+    abort();
+  }
+  if (!fallback_notice_printed) {
+    fprintf(stderr, "[PW_GPU] Memory limit reached (%zu MB), falling back to host.\n",
+            max_gpu_memory_bytes / PW_GPU_MIB);
+    fallback_notice_printed = true;
+  }
+  return 0;
+}
+
+static void release_work_buffers(void) {
+  offloadStreamSynchronize(stream);
+  device_free(buffer_dev_1, allocated_buffer_size);
+  device_free(buffer_dev_2, allocated_buffer_size);
+  device_free(ghatmap_dev, allocated_map_size);
+  device_free(gbuf_dev, allocated_gbuf_size);
+  buffer_dev_1 = buffer_dev_2 = gbuf_dev = NULL;
+  ghatmap_dev = NULL;
+  allocated_buffer_size = allocated_map_size = allocated_gbuf_size = 0;
+}
+
+void pw_gpu_set_memory_limit(const int limit_mb) {
+  assert(omp_get_num_threads() == 1);
+  read_memory_environment();
+  if (!memory_limit_from_environment) {
+    if (limit_mb < 0 || (size_t)limit_mb > SIZE_MAX / PW_GPU_MIB) {
+      fprintf(stderr, "[PW_GPU] Invalid GPU memory limit.\n");
+      abort();
+    }
+    max_gpu_memory_bytes = (size_t)limit_mb * PW_GPU_MIB;
+  }
+  if (is_initialized) {
+    offload_activate_chosen_device();
+    if (!check_and_reclaim_memory(0)) {
+      // Calls are synchronous at the public boundary, so idle scratch can be
+      // released when a caller lowers the limit between transformations.
+      release_work_buffers();
+    }
+  }
+}
+
+void pw_gpu_set_host_fallback(const int enable) {
+  read_memory_environment();
+  if (!host_fallback_from_environment) {
+    host_fallback_enabled = (enable != 0);
+  }
+}
+
+void pw_gpu_get_allocated_bytes(size_t *allocated_bytes, size_t *peak_bytes) {
+  read_memory_environment();
+  *allocated_bytes = current_gpu_allocated_bytes;
+  *peak_bytes = peak_gpu_allocated_bytes;
 }
 
 /*******************************************************************************
@@ -111,6 +289,7 @@ static void grid_cache_clear_entry(grid_cache_entry *e) {
  ******************************************************************************/
 void pw_gpu_init(void) {
   assert(omp_get_num_threads() == 1);
+  read_memory_environment();
   if (is_initialized) {
     // fprintf(stderr, "Error: pw_gpu was already initialized.\n");
     // TODO abort();
@@ -119,14 +298,10 @@ void pw_gpu_init(void) {
   memset(cache, 0, sizeof(cache_entry) * PW_GPU_CACHE_SIZE);
   cache_oldest_entry = 0;
 
-  allocated_buffer_size = 1; // start small
-  allocated_map_size = 1;
-  allocated_gbuf_size = 1;
+  // Lazy allocation keeps initialization within even the smallest budget.
+  allocated_buffer_size = allocated_map_size = allocated_gbuf_size = 0;
+  current_gpu_allocated_bytes = peak_gpu_allocated_bytes = 0;
   offload_activate_chosen_device();
-  offloadMalloc((void **)&buffer_dev_1, allocated_buffer_size);
-  offloadMalloc((void **)&buffer_dev_2, allocated_buffer_size);
-  offloadMalloc((void **)&ghatmap_dev, allocated_map_size);
-  offloadMalloc((void **)&gbuf_dev, allocated_gbuf_size);
 
   memset(grid_cache, 0, sizeof(grid_cache_entry) * PW_GPU_GRID_CACHE_SIZE);
   grid_cache_clock = 0;
@@ -141,6 +316,7 @@ void pw_gpu_init(void) {
  * \brief Returns the runtime switches (bit 0: map cache, bit 1: fused XC).
  ******************************************************************************/
 int pw_gpu_get_options(void) {
+  read_memory_environment();
   if (!is_initialized) {
     return 0;
   }
@@ -151,6 +327,7 @@ int pw_gpu_get_options(void) {
  * \brief Returns 1 if the fused XC gradient/divergence/filter paths are on.
  ******************************************************************************/
 int pw_gpu_fused_xc_enabled(void) {
+  read_memory_environment();
   return (is_initialized && opt_fused_xc) ? 1 : 0;
 }
 
@@ -192,6 +369,8 @@ void pw_gpu_finalize(void) {
     // TODO abort();
     return;
   }
+  offload_activate_chosen_device();
+  offloadStreamSynchronize(stream);
   for (int i = 0; i < PW_GPU_CACHE_SIZE; i++) {
     if (cache[i].plan != NULL) {
       offload_fftDestroy(*cache[i].plan);
@@ -201,10 +380,8 @@ void pw_gpu_finalize(void) {
   for (int i = 0; i < PW_GPU_GRID_CACHE_SIZE; i++) {
     grid_cache_clear_entry(&grid_cache[i]);
   }
-  offloadFree(buffer_dev_1);
-  offloadFree(buffer_dev_2);
-  offloadFree(ghatmap_dev);
-  offloadFree(gbuf_dev);
+  release_work_buffers();
+  assert(current_gpu_allocated_bytes == 0);
   offloadStreamDestroy(stream);
   is_initialized = false;
 }
@@ -213,33 +390,52 @@ void pw_gpu_finalize(void) {
  * \brief Checks size of device buffers and re-allocates them if necessary.
  * \author Ole Schuett
  ******************************************************************************/
-static void ensure_memory_sizes(const size_t requested_buffer_size,
-                                const size_t requested_map_size) {
+static int pw_gpu_ensure_buffer_c(const size_t requested_buffer_size,
+                                  const size_t requested_map_size) {
   assert(is_initialized);
+  const size_t buffer_growth = requested_buffer_size > allocated_buffer_size
+                                  ? requested_buffer_size - allocated_buffer_size
+                                  : 0;
+  const size_t map_growth = requested_map_size > allocated_map_size
+                               ? requested_map_size - allocated_map_size
+                               : 0;
+  if (buffer_growth > (SIZE_MAX - map_growth) / 2 ||
+      !check_and_reclaim_memory(2 * buffer_growth + map_growth)) {
+    return memory_limit_exceeded();
+  }
+  if (buffer_growth != 0 || map_growth != 0) {
+    offloadStreamSynchronize(stream);
+  }
   if (requested_buffer_size > allocated_buffer_size) {
-    offloadFree(buffer_dev_1);
-    offloadFree(buffer_dev_2);
-    offloadMalloc((void **)&buffer_dev_1, requested_buffer_size);
-    offloadMalloc((void **)&buffer_dev_2, requested_buffer_size);
+    device_free(buffer_dev_1, allocated_buffer_size);
+    device_free(buffer_dev_2, allocated_buffer_size);
+    device_malloc((void **)&buffer_dev_1, requested_buffer_size);
+    device_malloc((void **)&buffer_dev_2, requested_buffer_size);
     allocated_buffer_size = requested_buffer_size;
   }
   if (requested_map_size > allocated_map_size) {
-    offloadFree(ghatmap_dev);
-    offloadMalloc((void **)&ghatmap_dev, requested_map_size);
+    device_free(ghatmap_dev, allocated_map_size);
+    device_malloc((void **)&ghatmap_dev, requested_map_size);
     allocated_map_size = requested_map_size;
   }
+  return 1;
 }
 
 /*******************************************************************************
  * \brief Checks size of the compact device scratch buffer.
  ******************************************************************************/
-static void ensure_gbuf_size(const size_t requested_size) {
+static int pw_gpu_ensure_gbuf_c(const size_t requested_size) {
   assert(is_initialized);
   if (requested_size > allocated_gbuf_size) {
-    offloadFree(gbuf_dev);
-    offloadMalloc((void **)&gbuf_dev, requested_size);
+    if (!check_and_reclaim_memory(requested_size - allocated_gbuf_size)) {
+      return memory_limit_exceeded();
+    }
+    offloadStreamSynchronize(stream);
+    device_free(gbuf_dev, allocated_gbuf_size);
+    device_malloc((void **)&gbuf_dev, requested_size);
     allocated_gbuf_size = requested_size;
   }
+  return 1;
 }
 
 /*******************************************************************************
@@ -247,8 +443,8 @@ static void ensure_gbuf_size(const size_t requested_size) {
  *        The upload is enqueued on the pw_gpu stream, i.e. it is ordered
  *        before all subsequent kernels that use the map.
  ******************************************************************************/
-static grid_cache_entry *grid_cache_get(const int grid_id, const int *map_host,
-                                        const int ngpts, const int nmaps) {
+static grid_cache_entry *grid_cache_lookup_or_upload(
+    const int grid_id, const int *map_host, const int ngpts, const int nmaps) {
   assert(is_initialized);
   assert(grid_id > 0);
   grid_cache_entry *hit = NULL;
@@ -278,7 +474,11 @@ static grid_cache_entry *grid_cache_get(const int grid_id, const int *map_host,
     }
     grid_cache_clear_entry(hit);
     const size_t map_size = sizeof(int) * (size_t)nmaps * (size_t)ngpts;
-    offloadMalloc((void **)&hit->map_dev, map_size);
+    if (!check_and_reclaim_memory(map_size)) {
+      memory_limit_exceeded();
+      return NULL;
+    }
+    device_malloc((void **)&hit->map_dev, map_size);
     offloadMemcpyAsyncHtoD(hit->map_dev, map_host, map_size, stream);
     hit->grid_id = grid_id;
     hit->ngpts = ngpts;
@@ -294,15 +494,26 @@ static grid_cache_entry *grid_cache_get(const int grid_id, const int *map_host,
  ******************************************************************************/
 static const double *grid_cache_get_g(grid_cache_entry *e,
                                       const double *g_host) {
+  if (e == NULL) {
+    return NULL;
+  }
   if (e->g_dev != NULL && e->g_host == g_host) {
     return e->g_dev;
   }
   if (e->g_dev != NULL) {
-    offloadFree(e->g_dev);
+    offloadStreamSynchronize(stream);
+    device_free(e->g_dev, 3 * sizeof(double) * (size_t)e->ngpts);
     e->g_dev = NULL;
   }
   const size_t g_size = 3 * sizeof(double) * (size_t)e->ngpts;
-  offloadMalloc((void **)&e->g_dev, g_size);
+  protected_grid_entry = e;
+  const int fits = check_and_reclaim_memory(g_size);
+  protected_grid_entry = NULL;
+  if (!fits) {
+    memory_limit_exceeded();
+    return NULL;
+  }
+  device_malloc((void **)&e->g_dev, g_size);
   offloadMemcpyAsyncHtoD(e->g_dev, g_host, g_size, stream);
   e->g_host = g_host;
   return e->g_dev;
@@ -316,10 +527,13 @@ static const int *get_map_dev(const int grid_id, const int *map_host,
                               const int ngpts, const int nmaps,
                               const size_t legacy_map_size) {
   if (opt_map_cache && grid_id > 0 && nmaps >= 1) {
-    return grid_cache_get(grid_id, map_host, ngpts, nmaps)->map_dev;
+    grid_cache_entry *e = grid_cache_lookup_or_upload(grid_id, map_host, ngpts, nmaps);
+    return e == NULL ? NULL : e->map_dev;
   }
   // Legacy behaviour: upload the map into the shared buffer for every call.
-  ensure_memory_sizes(0, legacy_map_size);
+  if (!pw_gpu_ensure_buffer_c(0, legacy_map_size)) {
+    return NULL;
+  }
   offloadMemcpyAsyncHtoD(ghatmap_dev, map_host, legacy_map_size, stream);
   return ghatmap_dev;
 }
@@ -436,7 +650,12 @@ void pw_gpu_cfffg_cached(const double *din, double *zout, const int *ghatmap,
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
   const size_t map_size = sizeof(int) * ngpts;
-  ensure_memory_sizes(buffer_size, 0);
+  const int *map_dev = NULL;
+  if (!pw_gpu_ensure_buffer_c(buffer_size, 0) ||
+      (map_dev = get_map_dev(grid_id, ghatmap, ngpts, nmaps, map_size)) == NULL) {
+    host_cfffg(din, zout, ghatmap, npts, ngpts, scale);
+    return;
+  }
 
   // Upload REAL input and convert to COMPLEX on device.
   offloadMemcpyAsyncHtoD(buffer_dev_1, din, buffer_size / 2, stream);
@@ -446,7 +665,6 @@ void pw_gpu_cfffg_cached(const double *din, double *zout, const int *ghatmap,
   fft_3d(OFFLOAD_FFT_FORWARD, npts[2], npts[1], npts[0], buffer_dev_2);
 
   // Get map (cached or uploaded) and run gather on the device.
-  const int *map_dev = get_map_dev(grid_id, ghatmap, ngpts, nmaps, map_size);
   pw_gpu_launch_gather(buffer_dev_1, buffer_dev_2, scale, ngpts, map_dev,
                        stream);
 
@@ -485,13 +703,17 @@ void pw_gpu_sfffc_cached(const double *zin, double *dout, const int *ghatmap,
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
   const size_t map_size = sizeof(int) * nmaps * ngpts;
-  ensure_memory_sizes(buffer_size, 0);
+  const int *map_dev = NULL;
+  if (!pw_gpu_ensure_buffer_c(buffer_size, 0) ||
+      (map_dev = get_map_dev(grid_id, ghatmap, ngpts, nmaps, map_size)) == NULL) {
+    host_sfffc(zin, dout, ghatmap, npts, ngpts, nmaps, scale);
+    return;
+  }
 
   // Upload COMPLEX inputs to device.
   offloadMemcpyAsyncHtoD(buffer_dev_1, zin, 2 * sizeof(double) * ngpts, stream);
 
   // Get map (cached or uploaded) and run scatter on the device.
-  const int *map_dev = get_map_dev(grid_id, ghatmap, ngpts, nmaps, map_size);
   offloadMemsetAsync(buffer_dev_2, 0, buffer_size, stream);
   pw_gpu_launch_scatter(buffer_dev_2, buffer_dev_1, scale, ngpts, nmaps,
                         map_dev, stream);
@@ -544,10 +766,15 @@ void pw_gpu_sfffc_grad3(const double *zin, double *dout_1, double *dout_2,
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
   const size_t gbuf_size = 2 * sizeof(double) * ngpts;
-  ensure_memory_sizes(buffer_size, 0);
-  ensure_gbuf_size(gbuf_size);
-  grid_cache_entry *e = grid_cache_get(grid_id, ghatmap, ngpts, nmaps);
-  const double *g_dev = grid_cache_get_g(e, g);
+  grid_cache_entry *e = NULL;
+  const double *g_dev = NULL;
+  if (!pw_gpu_ensure_buffer_c(buffer_size, 0) ||
+      !pw_gpu_ensure_gbuf_c(gbuf_size) ||
+      (e = grid_cache_lookup_or_upload(grid_id, ghatmap, ngpts, nmaps)) == NULL ||
+      (g_dev = grid_cache_get_g(e, g)) == NULL) {
+    host_grad3(zin, dout, ghatmap, g, npts, ngpts, nmaps);
+    return;
+  }
 
   // Upload COMPLEX input once.
   offloadMemcpyAsyncHtoD(gbuf_dev, zin, gbuf_size, stream);
@@ -593,10 +820,15 @@ void pw_gpu_cfffg_div3(const double *din_1, const double *din_2,
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
   const size_t gbuf_size = 2 * sizeof(double) * ngpts;
-  ensure_memory_sizes(buffer_size, 0);
-  ensure_gbuf_size(gbuf_size);
-  grid_cache_entry *e = grid_cache_get(grid_id, ghatmap, ngpts, nmaps);
-  const double *g_dev = grid_cache_get_g(e, g);
+  grid_cache_entry *e = NULL;
+  const double *g_dev = NULL;
+  if (!pw_gpu_ensure_buffer_c(buffer_size, 0) ||
+      !pw_gpu_ensure_gbuf_c(gbuf_size) ||
+      (e = grid_cache_lookup_or_upload(grid_id, ghatmap, ngpts, nmaps)) == NULL ||
+      (g_dev = grid_cache_get_g(e, g)) == NULL) {
+    host_div3(din, dout, ghatmap, g, npts, ngpts, nmaps, scale);
+    return;
+  }
 
   // pw_zero(vxc_g)
   offloadMemsetAsync(gbuf_dev, 0, gbuf_size, stream);
@@ -638,8 +870,12 @@ void pw_gpu_filter_r3d(double *data, const int *ghatmap, const int *npts,
 
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
-  ensure_memory_sizes(buffer_size, 0);
-  grid_cache_entry *e = grid_cache_get(grid_id, ghatmap, ngpts, nmaps);
+  grid_cache_entry *e = NULL;
+  if (!pw_gpu_ensure_buffer_c(buffer_size, 0) ||
+      (e = grid_cache_lookup_or_upload(grid_id, ghatmap, ngpts, nmaps)) == NULL) {
+    host_filter(data, ghatmap, npts, ngpts, nmaps, scale);
+    return;
+  }
 
   offloadMemcpyAsyncHtoD(buffer_dev_1, data, buffer_size / 2, stream);
   pw_gpu_launch_real_to_complex(buffer_dev_1, buffer_dev_2, nrpts, stream);
@@ -671,7 +907,10 @@ void pw_gpu_cff(const double *din, double *zout, const int *npts) {
   // Allocate device memory.
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
-  ensure_memory_sizes(buffer_size, 0);
+  if (!pw_gpu_ensure_buffer_c(buffer_size, 0)) {
+    host_real_fft(din, zout, npts, -1, 2);
+    return;
+  }
 
   // Upload REAL input and convert to COMPLEX on device.
   offloadMemcpyAsyncHtoD(buffer_dev_1, din, buffer_size / 2, stream);
@@ -705,7 +944,10 @@ void pw_gpu_ffc(const double *zin, double *dout, const int *npts) {
   // Allocate device memory.
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
-  ensure_memory_sizes(buffer_size, 0);
+  if (!pw_gpu_ensure_buffer_c(buffer_size, 0)) {
+    host_real_fft(zin, dout, npts, 1, 2);
+    return;
+  }
 
   // Upload COMPLEX input to device.
   offloadMemcpyAsyncHtoD(buffer_dev_1, zin, buffer_size, stream);
@@ -739,7 +981,10 @@ void pw_gpu_cf(const double *din, double *zout, const int *npts) {
   // Allocate device memory.
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
-  ensure_memory_sizes(buffer_size, 0);
+  if (!pw_gpu_ensure_buffer_c(buffer_size, 0)) {
+    host_real_fft(din, zout, npts, -1, 1);
+    return;
+  }
 
   // Upload REAL input and convert to COMPLEX on device.
   offloadMemcpyAsyncHtoD(buffer_dev_1, din, buffer_size / 2, stream);
@@ -770,7 +1015,10 @@ void pw_gpu_fc(const double *zin, double *dout, const int *npts) {
   // Allocate device memory.
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
-  ensure_memory_sizes(buffer_size, 0);
+  if (!pw_gpu_ensure_buffer_c(buffer_size, 0)) {
+    host_real_fft(zin, dout, npts, 1, 1);
+    return;
+  }
 
   // Upload COMPLEX input to device.
   offloadMemcpyAsyncHtoD(buffer_dev_1, zin, buffer_size, stream);
@@ -801,7 +1049,10 @@ void pw_gpu_f(const double *zin, double *zout, const int dir, const int n,
   // Allocate device memory.
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
-  ensure_memory_sizes(buffer_size, 0);
+  if (!pw_gpu_ensure_buffer_c(buffer_size, 0)) {
+    host_fft_1d(dir > 0 ? -1 : 1, n, m, zin, zout);
+    return;
+  }
 
   // Upload COMPLEX input to device.
   offloadMemcpyAsyncHtoD(buffer_dev_1, zin, buffer_size, stream);
@@ -838,7 +1089,10 @@ void pw_gpu_fg(const double *zin, double *zout, const int *ghatmap,
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
   const size_t map_size = sizeof(int) * ngpts;
-  ensure_memory_sizes(buffer_size, map_size);
+  if (!pw_gpu_ensure_buffer_c(buffer_size, map_size)) {
+    host_fg(zin, zout, ghatmap, npts[0], mmax, ngpts, scale);
+    return;
+  }
 
   // Upload COMPLEX inputs to device.
   offloadMemcpyAsyncHtoD(buffer_dev_1, zin, buffer_size, stream);
@@ -877,7 +1131,10 @@ void pw_gpu_sf(const double *zin, double *zout, const int *ghatmap,
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
   const size_t map_size = sizeof(int) * nmaps * ngpts;
-  ensure_memory_sizes(buffer_size, map_size);
+  if (!pw_gpu_ensure_buffer_c(buffer_size, map_size)) {
+    host_sf(zin, zout, ghatmap, npts[0], mmax, ngpts, nmaps, scale);
+    return;
+  }
 
   // Upload COMPLEX inputs to device.
   offloadMemcpyAsyncHtoD(buffer_dev_1, zin, 2 * sizeof(double) * ngpts, stream);

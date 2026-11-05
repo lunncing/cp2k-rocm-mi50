@@ -27,7 +27,8 @@ MODULE pw_gpu
    USE ISO_C_BINDING,                   ONLY: C_DOUBLE,&
                                               C_INT,&
                                               C_LOC,&
-                                              C_PTR
+                                              C_PTR,&
+                                              C_SIZE_T
    USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
    USE fft_tools,                       ONLY: &
         cube_transpose_1, cube_transpose_2, fft_scratch_sizes, fft_scratch_type, get_fft_scratch, &
@@ -51,6 +52,7 @@ MODULE pw_gpu
    PUBLIC :: pw_gpu_r3dc1d_3d_ps
    PUBLIC :: pw_gpu_c1dr3d_3d_ps
    PUBLIC :: pw_gpu_init, pw_gpu_finalize
+   PUBLIC :: pw_gpu_set_memory_limit, pw_gpu_set_host_fallback, pw_gpu_get_allocated_bytes
    PUBLIC :: pw_gpu_fused_xc_available
    PUBLIC :: pw_gpu_gradient_c1d_r3d
    PUBLIC :: pw_gpu_divergence_r3d
@@ -60,6 +62,72 @@ MODULE pw_gpu
    LOGICAL, PARAMETER, PRIVATE :: debug_this_module = .FALSE.
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Sets the per-rank budget in MiB (zero means unlimited). Environment overrides take precedence.
+!> \param limit_mb Memory budget.
+! **************************************************************************************************
+   SUBROUTINE pw_gpu_set_memory_limit(limit_mb)
+      INTEGER, INTENT(IN)                                :: limit_mb
+
+      INTERFACE
+         SUBROUTINE pw_gpu_set_memory_limit_c(limit_mb) BIND(C, name="pw_gpu_set_memory_limit")
+            IMPORT :: C_INT
+            INTEGER(KIND=C_INT), VALUE                   :: limit_mb
+         END SUBROUTINE pw_gpu_set_memory_limit_c
+      END INTERFACE
+
+      CPASSERT(limit_mb >= 0)
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      CALL pw_gpu_set_memory_limit_c(INT(limit_mb, KIND=C_INT))
+#else
+      MARK_USED(limit_mb)
+#endif
+   END SUBROUTINE pw_gpu_set_memory_limit
+
+! **************************************************************************************************
+!> \brief Enables CPU processing when the plane-wave device memory budget is exhausted.
+!> \param enable Whether host fallback is allowed.
+! **************************************************************************************************
+   SUBROUTINE pw_gpu_set_host_fallback(enable)
+      LOGICAL, INTENT(IN)                                :: enable
+
+      INTERFACE
+         SUBROUTINE pw_gpu_set_host_fallback_c(enable) BIND(C, name="pw_gpu_set_host_fallback")
+            IMPORT :: C_INT
+            INTEGER(KIND=C_INT), VALUE                   :: enable
+         END SUBROUTINE pw_gpu_set_host_fallback_c
+      END INTERFACE
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      CALL pw_gpu_set_host_fallback_c(MERGE(1_C_INT, 0_C_INT, enable))
+#else
+      MARK_USED(enable)
+#endif
+   END SUBROUTINE pw_gpu_set_host_fallback
+
+! **************************************************************************************************
+!> \brief Queries explicitly allocated plane-wave device buffers, excluding opaque FFT workspaces.
+!> \param allocated_bytes Current allocation.
+!> \param peak_bytes Peak allocation since GPU initialization.
+! **************************************************************************************************
+   SUBROUTINE pw_gpu_get_allocated_bytes(allocated_bytes, peak_bytes)
+      INTEGER(KIND=C_SIZE_T), INTENT(OUT)                :: allocated_bytes, peak_bytes
+
+      INTERFACE
+         SUBROUTINE pw_gpu_get_allocated_bytes_c(allocated_bytes, peak_bytes) &
+            BIND(C, name="pw_gpu_get_allocated_bytes")
+            IMPORT :: C_SIZE_T
+            INTEGER(KIND=C_SIZE_T), INTENT(OUT)          :: allocated_bytes, peak_bytes
+         END SUBROUTINE pw_gpu_get_allocated_bytes_c
+      END INTERFACE
+
+      allocated_bytes = 0_C_SIZE_T
+      peak_bytes = 0_C_SIZE_T
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      CALL pw_gpu_get_allocated_bytes_c(allocated_bytes, peak_bytes)
+#endif
+   END SUBROUTINE pw_gpu_get_allocated_bytes
 
 ! **************************************************************************************************
 !> \brief Allocates resources on the gpu device for gpu fft acceleration

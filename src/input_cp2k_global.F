@@ -64,11 +64,15 @@ MODULE input_cp2k_global
                                               section_add_subsection,&
                                               section_create,&
                                               section_release,&
-                                              section_type
+                                              section_type,&
+                                              section_vals_type,&
+                                              section_vals_val_get
    USE input_val_types,                 ONLY: char_t,&
                                               integer_t,&
                                               logical_t
    USE kinds,                           ONLY: dp
+   USE pw_gpu,                          ONLY: pw_gpu_set_host_fallback,&
+                                              pw_gpu_set_memory_limit
    USE string_utilities,                ONLY: s2a
    USE timings,                         ONLY: default_timings_level
 #include "./base/base_uses.f90"
@@ -79,9 +83,27 @@ MODULE input_cp2k_global
    LOGICAL, PRIVATE, PARAMETER :: debug_this_module = .TRUE.
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'input_cp2k_global'
 
-   PUBLIC :: create_global_section
+   PUBLIC :: create_global_section, read_global_section
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Applies the plane-wave GPU settings from a parsed GLOBAL section.
+!>        C initialization also reads environment overrides without this hook.
+!> \param global_section Parsed GLOBAL section.
+! **************************************************************************************************
+   SUBROUTINE read_global_section(global_section)
+      TYPE(section_vals_type), INTENT(IN)               :: global_section
+
+      INTEGER                                            :: max_gpu_memory_mb
+      LOGICAL                                            :: host_fallback
+
+      CALL section_vals_val_get(global_section, "GRID%MAX_GPU_MEMORY_MB", i_val=max_gpu_memory_mb)
+      CALL section_vals_val_get(global_section, "GRID%HOST_FALLBACK", l_val=host_fallback)
+      CPASSERT(max_gpu_memory_mb >= 0)
+      CALL pw_gpu_set_memory_limit(max_gpu_memory_mb)
+      CALL pw_gpu_set_host_fallback(host_fallback)
+   END SUBROUTINE read_global_section
 
 ! **************************************************************************************************
 !> \brief section to hold global settings for the whole program
@@ -798,7 +820,7 @@ CONTAINS
       CALL section_create(section, __LOCATION__, name="GRID", &
                           description="Configuration options for the grid library, "// &
                           "which performs e.g. the collocate and integrate of the GPW method.", &
-                          n_keywords=1, n_subsections=0, repeats=.FALSE.)
+                          n_keywords=5, n_subsections=0, repeats=.FALSE.)
 
       NULLIFY (keyword)
       CALL keyword_create(keyword, __LOCATION__, name="BACKEND", &
@@ -820,6 +842,19 @@ CONTAINS
                           "and its results are compared with those from the selected backend. "// &
                           "If the two results differ by too much then the calculation is aborted.", &
                           default_l_val=.FALSE., lone_keyword_l_val=.TRUE.)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="MAX_GPU_MEMORY_MB", &
+                          description="Maximum GPU memory budget in MB per rank for plane-wave calculations", &
+                          usage="MAX_GPU_MEMORY_MB 0", type_of_var=integer_t, default_i_val=0)
+      CALL section_add_keyword(section, keyword)
+      CALL keyword_release(keyword)
+
+      CALL keyword_create(keyword, __LOCATION__, name="HOST_FALLBACK", &
+                          description="Allow plane-wave GPU routines to fall back to host memory/CPU "// &
+                          "when GPU memory limit is exceeded", &
+                          type_of_var=logical_t, default_l_val=.TRUE., lone_keyword_l_val=.TRUE.)
       CALL section_add_keyword(section, keyword)
       CALL keyword_release(keyword)
 
