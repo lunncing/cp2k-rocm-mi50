@@ -98,6 +98,17 @@ void pw_gpu_launch_xc_cutoff(double *, const double *, size_t, double, double,
 // final scalar. Keeping the corrections avoids losing cancellation accuracy.
 void pw_gpu_launch_xc_reduce(const double *, double *, size_t, offloadStream_t);
 
+// Device-resident PW chain (see pw_gpu_res_ops.h). out may alias a.
+void pw_gpu_launch_res_cmul(double *out, const double *a, const double *w,
+                            int width, size_t n, offloadStream_t stream);
+// p[i] = Re(conj(a_i) b_i), reduced afterwards with pw_gpu_launch_xc_reduce.
+void pw_gpu_launch_res_cdot_terms(const double *a, const double *b, double *p,
+                                  size_t n, offloadStream_t stream);
+// Gathers the pw_res_sample_count(n) fingerprint elements of x (width doubles
+// per element) into out.
+void pw_gpu_launch_res_sample(const double *x, double *out, size_t n, int width,
+                              offloadStream_t stream);
+
 // Full VRAM pipeline. exc_out is the unscaled sum of energy density; the
 // Fortran wrapper multiplies it by dvol. Outputs are untouched on failure.
 // The basic entry uses epsilon_rho as the gradient cutoff, without filtering
@@ -127,6 +138,34 @@ int pw_gpu_remap_copy_c(const double *x, double *y, size_t nx, size_t ny, int cx
 int pw_gpu_remap_axpy_c(const double *x, double *y, size_t nx, size_t ny, int cx,
                         int cy, const int *gidx, int scatter, double alpha,
                         double beta);
+// Device residency of the PW chain (pw_gpu_internal.c; Fortran in pw_gpu.F).
+// 1 = done, 0 = not done with all host outputs untouched (Hartree steps: the
+// chain is abandoned and the caller recomputes it on the original path).
+int pw_gpu_res_enabled_c(int what);
+void pw_gpu_res_invalidate_c(void);
+int pw_gpu_res_density_c(int nlevels, void *const *r_host, const int *npts,
+    const int *ngpts, const int *nmaps, const int *grid_id, void *const *maps,
+    void *const *gidx, const double *scale, const int *t_npts, int t_ngpts,
+    int t_nmaps, int t_grid_id, const int *t_map, double *rho_g_host,
+    double *rho_r_host);
+int pw_gpu_res_potential_c(const double *v_host, int nlevels, void *const *r_host,
+    const int *npts, const int *ngpts, const int *nmaps, const int *grid_id,
+    void *const *maps, void *const *gidx, const double *rscale, int aux,
+    double fwd_scale);
+int pw_gpu_res_vtot_prepare_c(const double *vh_host, const double *vxc_host,
+    size_t n, double dvol);
+int pw_gpu_res_vtot_commit_c(const double *vtot_host, size_t n);
+int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host,
+    const double *infl_host, double *rho_tot_host, size_t ngpts, size_t nprefix,
+    const int *npts);
+int pw_gpu_res_hartree_modify_c(double g0_delta, int have_g0, const double *g,
+    const double *gsq, const double *r, const double *radii, const double *cv,
+    size_t first, size_t n, size_t natoms, size_t nradii, double gcut2, double vol);
+int pw_gpu_res_hartree_energy_c(double *dot);
+int pw_gpu_res_hartree_finish_c(double *v_h_r_host, const int *npts, int ngpts,
+    int nmaps, int grid_id, const int *ghatmap, double dvol);
+void pw_gpu_res_hartree_cancel_c(void);
+
 // Hartree: g(3,n), r(3,natoms), cv(nradii,natoms). The caller selects the
 // contiguous nonzero-G prefix up to GCUT and applies the separate G=0 term.
 int modify_hartree_pot_gpu_c(double *v, const double *g, const double *gsq,

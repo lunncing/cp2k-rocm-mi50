@@ -47,7 +47,8 @@ MODULE cp_ddapc_util
                                               pw_copy,&
                                               pw_transfer
    USE pw_pool_types,                   ONLY: pw_pool_type
-   USE pw_gpu,                          ONLY: modify_hartree_pot_gpu
+   USE pw_gpu,                          ONLY: modify_hartree_pot_gpu,&
+                                              pw_gpu_res_hartree_modify
    USE pw_types,                        ONLY: pw_c1d_gs_type,&
                                               pw_r3d_rs_type
    USE qs_charges_types,                ONLY: qs_charges_type
@@ -219,7 +220,7 @@ CONTAINS
                                                             iparticle, iparticle0, ispin, iw, j, &
                                                             myid, n_rep_val, ndim, nparticles, &
                                                             num_gauss, pmax, pmin
-      LOGICAL                                            :: need_f
+      LOGICAL                                            :: need_f, use_ext
       REAL(KIND=dp)                                      :: c1, c3, ch_dens, gcut, pfact, rcmin, Vol
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: AmI_bv, AmI_cv, bv, cv, cvT_AmI, &
                                                             cvT_AmI_dAmj, dAmj_qv, qtot, qv
@@ -276,10 +277,15 @@ CONTAINS
       END IF
       CALL pw_env_get(pw_env=pw_env, &
                       auxbas_pw_pool=auxbas_pool)
-      CALL auxbas_pool%create_pw(rho_tot_g)
+      ! The charge fit only reads the density: an external density on the same grid is used in
+      ! place (the copy was a full pass over the grid; with forces the original path is kept).
+      use_ext = .FALSE.
+      IF (PRESENT(ext_rho_tot_g) .AND. .NOT. need_f) &
+         use_ext = ASSOCIATED(ext_rho_tot_g%pw_grid, auxbas_pool%pw_grid)
+      IF (.NOT. use_ext) CALL auxbas_pool%create_pw(rho_tot_g)
       IF (PRESENT(ext_rho_tot_g)) THEN
          ! If provided use the input density in g-space
-         CALL pw_transfer(ext_rho_tot_g, rho_tot_g)
+         IF (.NOT. use_ext) CALL pw_transfer(ext_rho_tot_g, rho_tot_g)
          type_of_density = Itype_of_density
       ELSE
          IF (PRESENT(density_type)) THEN
@@ -315,7 +321,11 @@ CONTAINS
       Vol = rho_r(1)%pw_grid%vol
       ch_dens = 0.0_dp
       ! should use pw_integrate
-      IF (rho_tot_g%pw_grid%have_g0) ch_dens = REAL(rho_tot_g%array(1), KIND=dp)
+      IF (use_ext) THEN
+         IF (ext_rho_tot_g%pw_grid%have_g0) ch_dens = REAL(ext_rho_tot_g%array(1), KIND=dp)
+      ELSE
+         IF (rho_tot_g%pw_grid%have_g0) ch_dens = REAL(rho_tot_g%array(1), KIND=dp)
+      END IF
       CALL logger%para_env%sum(ch_dens)
       !
       ! Get Input Parameters
@@ -355,10 +365,17 @@ CONTAINS
       CALL timeset(routineN//"-charges", handle2)
       bv(:) = 0.0_dp
       cv(:) = 1.0_dp/Vol
-      CALL build_b_vector(bv, cp_ddapc_env%gfunc, cp_ddapc_env%w, &
-                          particle_set, radii, rho_tot_g, gcut)
-      bv(:) = bv(:)/Vol
-      CALL rho_tot_g%pw_grid%para%group%sum(bv)
+      IF (use_ext) THEN
+         CALL build_b_vector(bv, cp_ddapc_env%gfunc, cp_ddapc_env%w, &
+                             particle_set, radii, ext_rho_tot_g, gcut)
+         bv(:) = bv(:)/Vol
+         CALL ext_rho_tot_g%pw_grid%para%group%sum(bv)
+      ELSE
+         CALL build_b_vector(bv, cp_ddapc_env%gfunc, cp_ddapc_env%w, &
+                             particle_set, radii, rho_tot_g, gcut)
+         bv(:) = bv(:)/Vol
+         CALL rho_tot_g%pw_grid%para%group%sum(bv)
+      END IF
       c1 = DOT_PRODUCT(cv, MATMUL(cp_ddapc_env%AmI, bv)) - ch_dens
       c1 = c1/cp_ddapc_env%c0
       qv(:) = -MATMUL(cp_ddapc_env%AmI, (bv - c1*cv))
@@ -521,7 +538,7 @@ CONTAINS
          CALL cp_print_key_finished_output(iw, logger, density_fit_section, &
                                            "PROGRAM_RUN_INFO")
       END IF
-      CALL auxbas_pool%give_back_pw(rho_tot_g)
+      IF (.NOT. use_ext) CALL auxbas_pool%give_back_pw(rho_tot_g)
       CALL timestop(handle)
    END SUBROUTINE get_ddapc
 
@@ -612,25 +629,30 @@ CONTAINS
 !> \param AmI ...
 !> \param radii ...
 !> \param charges ...
+!> \param device_done If present, the correction is applied to the device-resident Hartree
+!>        potential of the residency chain (pw_gpu_res_hartree_*) instead of v_hartree_gspace, whose
+!>        array is then not accessed; .FALSE. if that was not possible.
 !> \par History
 !>      08.2005 created [tlaino]
 !> \author Teodoro Laino
 ! **************************************************************************************************
    SUBROUTINE modify_hartree_pot(v_hartree_gspace, density_fit_section, &
-                                 particle_set, M, AmI, radii, charges)
+                                 particle_set, M, AmI, radii, charges, device_done)
       TYPE(pw_c1d_gs_type), INTENT(IN)                   :: v_hartree_gspace
       TYPE(section_vals_type), POINTER                   :: density_fit_section
       TYPE(particle_type), DIMENSION(:), POINTER         :: particle_set
       REAL(KIND=dp), DIMENSION(:, :), POINTER            :: M, AmI
       REAL(KIND=dp), DIMENSION(:), POINTER               :: radii, charges
+      LOGICAL, INTENT(OUT), OPTIONAL                     :: device_done
 
       CHARACTER(len=*), PARAMETER :: routineN = 'modify_hartree_pot'
 
       COMPLEX(KIND=dp)                                   :: g_corr, phase
       INTEGER                                            :: handle, idim, ig, igauss, iparticle
-      REAL(kind=dp)                                      :: arg, fac, fac2, g2, gcut, gcut2, gfunc, &
-                                                            gvec(3), rc, rc2, rvec(3), sfac, Vol, w
+      REAL(kind=dp)                                      :: arg, fac, fac2, g0_delta, g2, gcut, gcut2, &
+                                                            gfunc, gvec(3), rc, rc2, rvec(3), sfac, Vol, w
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: cv, uv
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: device_positions
 #if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
       INTEGER                                            :: first, last
       REAL(KIND=dp), ALLOCATABLE                          :: positions(:, :)
@@ -650,6 +672,19 @@ CONTAINS
          fac2 = DOT_PRODUCT(cv, MATMUL(AmI, uv))
          cv(:) = uv - cv*fac2/fac
          cv(:) = MATMUL(AmI, cv)
+         IF (PRESENT(device_done)) THEN
+            g0_delta = 0.0_dp
+            IF (pw_grid%have_g0) g0_delta = sfac*fac2/fac
+            ALLOCATE (device_positions(3, SIZE(particle_set)))
+            DO iparticle = 1, SIZE(particle_set)
+               device_positions(:, iparticle) = particle_set(iparticle)%r
+            END DO
+            device_done = pw_gpu_res_hartree_modify(g0_delta, v_hartree_gspace%pw_grid, device_positions, &
+                                                    radii, cv, gcut2, Vol)
+            DEALLOCATE (device_positions)
+            CALL timestop(handle)
+            RETURN
+         END IF
          IF (pw_grid%have_g0) v_hartree_gspace%array(1) = v_hartree_gspace%array(1) + sfac*fac2/fac
 #if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
          first = pw_grid%first_gne0

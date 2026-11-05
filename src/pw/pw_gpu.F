@@ -27,6 +27,7 @@ MODULE pw_gpu
    USE ISO_C_BINDING,                   ONLY: C_DOUBLE,&
                                               C_INT,&
                                               C_LOC,&
+                                              C_NULL_PTR,&
                                               C_PTR,&
                                               C_SIZE_T
    USE cp_log_handling,                 ONLY: cp_logger_get_default_io_unit
@@ -60,6 +61,16 @@ MODULE pw_gpu
    PUBLIC :: pw_gpu_filter_r3d
    PUBLIC :: pw_gpu_copy, pw_gpu_axpy, pw_gpu_remap_copy, pw_gpu_remap_axpy
    PUBLIC :: modify_hartree_pot_gpu, pbe_lda_eval_gpu
+   PUBLIC :: pw_gpu_res_enabled, pw_gpu_res_invalidate
+   PUBLIC :: pw_gpu_res_density, pw_gpu_res_potential
+   PUBLIC :: pw_gpu_res_hartree_begin, pw_gpu_res_hartree_modify, pw_gpu_res_hartree_energy, &
+             pw_gpu_res_hartree_finish, pw_gpu_res_hartree_cancel
+   PUBLIC :: pw_gpu_res_vtot_prepare, pw_gpu_res_vtot_commit
+   PUBLIC :: pw_gpu_res_density_id, pw_gpu_res_hartree_id, pw_gpu_res_xcin_id, pw_gpu_res_pot_id
+
+   ! Residency features, see pw_gpu_res_enabled.
+   INTEGER, PARAMETER :: pw_gpu_res_density_id = 1, pw_gpu_res_hartree_id = 2, &
+                         pw_gpu_res_xcin_id = 3, pw_gpu_res_pot_id = 4
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'pw_gpu'
    LOGICAL, PARAMETER, PRIVATE :: debug_this_module = .FALSE.
@@ -325,6 +336,9 @@ CONTAINS
       IF (unit_nr > 0) THEN
          WRITE (unit_nr, '(T2,A,T41,A,L1,A,L1)') "PW_GPU| resident-XC patch options:", &
             "MAP_CACHE=", BTEST(opts, 0), "  FUSED_XC=", BTEST(opts, 1)
+         WRITE (unit_nr, '(T2,A,T41,A,L1,A,L1,A,L1,A,L1)') "PW_GPU| residency (stage 1):", &
+            "DENSITY=", BTEST(opts, 2), " HARTREE=", BTEST(opts, 3), " XCIN=", BTEST(opts, 4), &
+            " POT=", BTEST(opts, 5)
       END IF
 #else
       ! Nothing to do.
@@ -1437,6 +1451,555 @@ CONTAINS
 
       CALL timestop(handle)
    END SUBROUTINE pw_gpu_filter_r3d
+
+! **************************************************************************************************
+!> \brief Device residency of the PW chain density -> Hartree/DDAPC -> XC -> potential.
+!>        Every routine returns .FALSE. (with all outputs untouched) when the operation is not
+!>        supported or disabled; the caller then executes the original code.
+!>        Switches (environment): CP2K_PW_GPU_RES, CP2K_PW_GPU_RES_{DENSITY,HARTREE,XCIN,POT}.
+! **************************************************************************************************
+
+! **************************************************************************************************
+!> \brief Whether a residency feature (pw_gpu_res_* constants) is enabled at run time.
+!> \param what ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION pw_gpu_res_enabled(what) RESULT(res)
+      INTEGER, INTENT(IN)                                :: what
+      LOGICAL                                            :: res
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTERFACE
+         FUNCTION pw_gpu_res_enabled_c(what) BIND(C, name="pw_gpu_res_enabled_c") RESULT(r)
+            IMPORT :: C_INT
+            INTEGER(KIND=C_INT), VALUE                   :: what
+            INTEGER(KIND=C_INT)                          :: r
+         END FUNCTION pw_gpu_res_enabled_c
+      END INTERFACE
+
+      res = pw_gpu_res_enabled_c(INT(what, C_INT)) /= 0_C_INT
+#else
+      MARK_USED(what)
+      res = .FALSE.
+#endif
+   END FUNCTION pw_gpu_res_enabled
+
+! **************************************************************************************************
+!> \brief Forgets all device copies (they would also be rejected by their fingerprints).
+! **************************************************************************************************
+   SUBROUTINE pw_gpu_res_invalidate()
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTERFACE
+         SUBROUTINE pw_gpu_res_invalidate_c() BIND(C, name="pw_gpu_res_invalidate_c")
+         END SUBROUTINE pw_gpu_res_invalidate_c
+      END INTERFACE
+
+      CALL pw_gpu_res_invalidate_c()
+#endif
+   END SUBROUTINE pw_gpu_res_invalidate
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+! **************************************************************************************************
+!> \brief A replicated, non-spherical grid with a contiguous one- or two-sided g_hatmap.
+!> \param grid ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION res_grid_ok(grid) RESULT(ok)
+      TYPE(pw_grid_type), POINTER                        :: grid
+      LOGICAL                                            :: ok
+
+      ok = .FALSE.
+      IF (.NOT. ASSOCIATED(grid)) RETURN
+      IF (grid%para%mode /= PW_MODE_LOCAL .OR. grid%spherical) RETURN
+      IF (.NOT. ASSOCIATED(grid%gsq) .OR. .NOT. ASSOCIATED(grid%g_hatmap)) RETURN
+      IF (SIZE(grid%gsq) < 1 .OR. SIZE(grid%g_hatmap, 1) /= SIZE(grid%gsq)) RETURN
+      IF (SIZE(grid%g_hatmap, 2) /= 1 .AND. SIZE(grid%g_hatmap, 2) /= 2) RETURN
+      IF (grid%ngpts_cut_local /= SIZE(grid%gsq)) RETURN
+      IF (ANY(grid%npts <= 0) .OR. grid%id_nr <= 0) RETURN
+      ok = .TRUE.
+   END FUNCTION res_grid_ok
+
+! **************************************************************************************************
+!> \brief A real-space array covering the whole FFT box of grid.
+!> \param pw ...
+!> \param grid ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION res_rs_ok(pw, grid) RESULT(ok)
+      TYPE(pw_r3d_rs_type), INTENT(IN)                   :: pw
+      TYPE(pw_grid_type), POINTER                        :: grid
+      LOGICAL                                            :: ok
+
+      ok = .FALSE.
+      IF (.NOT. ASSOCIATED(pw%array) .OR. .NOT. ASSOCIATED(pw%pw_grid, grid)) RETURN
+      IF (.NOT. IS_CONTIGUOUS(pw%array)) RETURN
+      IF (ANY(SHAPE(pw%array) /= grid%npts)) RETURN
+      ok = .TRUE.
+   END FUNCTION res_rs_ok
+
+! **************************************************************************************************
+!> \brief A reciprocal-space array holding exactly the G vectors of grid.
+!> \param pw ...
+!> \param grid ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION res_gs_ok(pw, grid) RESULT(ok)
+      TYPE(pw_c1d_gs_type), INTENT(IN)                   :: pw
+      TYPE(pw_grid_type), POINTER                        :: grid
+      LOGICAL                                            :: ok
+
+      ok = .FALSE.
+      IF (.NOT. ASSOCIATED(pw%array) .OR. .NOT. ASSOCIATED(pw%pw_grid, grid)) RETURN
+      IF (.NOT. IS_CONTIGUOUS(pw%array)) RETURN
+      IF (SIZE(pw%array) /= SIZE(grid%gsq)) RETURN
+      ok = .TRUE.
+   END FUNCTION res_gs_ok
+#endif
+
+! **************************************************************************************************
+!> \brief density_rs2pw (pw_interp branch) on the GPU, bitwise equal to
+!>          pw_zero(rho_gspace); DO l: pw_transfer(mgrid_rspace(l), mgrid_gspace(l));
+!>          pw_axpy(mgrid_gspace(l), rho_gspace); END DO; pw_transfer(rho_gspace, rho)
+!>        mgrid_gspace only supplies the grids; its arrays are not written.
+!> \param mgrid_rspace ...
+!> \param mgrid_gspace ...
+!> \param rho ...
+!> \param rho_gspace ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION pw_gpu_res_density(mgrid_rspace, mgrid_gspace, rho, rho_gspace) RESULT(done)
+      TYPE(pw_r3d_rs_type), DIMENSION(:), INTENT(IN)     :: mgrid_rspace
+      TYPE(pw_c1d_gs_type), DIMENSION(:), INTENT(IN)     :: mgrid_gspace
+      TYPE(pw_r3d_rs_type), INTENT(INOUT)                :: rho
+      TYPE(pw_c1d_gs_type), INTENT(INOUT)                :: rho_gspace
+      LOGICAL                                            :: done
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTEGER, PARAMETER                                 :: max_levels = 16
+
+      INTEGER                                            :: l, nlevels
+      INTEGER(KIND=C_INT), DIMENSION(3*max_levels)       :: npts
+      INTEGER(KIND=C_INT), DIMENSION(max_levels)         :: grid_id, ngpts, nmaps
+      REAL(KIND=C_DOUBLE), DIMENSION(max_levels)         :: scale
+      TYPE(C_PTR), DIMENSION(max_levels)                 :: gidx, maps, r_host
+      TYPE(pw_grid_type), POINTER                        :: grid, target_grid
+      INTERFACE
+         FUNCTION pw_gpu_res_density_c(nlevels, r_host, npts, ngpts, nmaps, grid_id, maps, gidx, &
+                                       scale, t_npts, t_ngpts, t_nmaps, t_grid_id, t_map, rho_g, rho_r) &
+            BIND(C, name="pw_gpu_res_density_c") RESULT(res)
+            IMPORT :: C_PTR, C_INT, C_DOUBLE
+            INTEGER(KIND=C_INT), VALUE                   :: nlevels
+            TYPE(C_PTR), DIMENSION(*), INTENT(IN)        :: r_host
+            INTEGER(KIND=C_INT), DIMENSION(*), INTENT(IN) :: npts, ngpts, nmaps, grid_id
+            TYPE(C_PTR), DIMENSION(*), INTENT(IN)        :: maps, gidx
+            REAL(KIND=C_DOUBLE), DIMENSION(*), INTENT(IN) :: scale
+            INTEGER(KIND=C_INT), DIMENSION(*), INTENT(IN) :: t_npts
+            INTEGER(KIND=C_INT), VALUE                   :: t_ngpts, t_nmaps, t_grid_id
+            TYPE(C_PTR), VALUE                           :: t_map, rho_g, rho_r
+            INTEGER(KIND=C_INT)                          :: res
+         END FUNCTION pw_gpu_res_density_c
+      END INTERFACE
+
+      done = .FALSE.
+      nlevels = SIZE(mgrid_rspace)
+      IF (nlevels < 1 .OR. nlevels > max_levels .OR. SIZE(mgrid_gspace) /= nlevels) RETURN
+      IF (.NOT. pw_gpu_res_enabled(pw_gpu_res_density_id)) RETURN
+      target_grid => rho_gspace%pw_grid
+      IF (.NOT. res_grid_ok(target_grid)) RETURN
+      IF (.NOT. res_gs_ok(rho_gspace, target_grid) .OR. .NOT. res_rs_ok(rho, target_grid)) RETURN
+      DO l = 1, nlevels
+         grid => mgrid_gspace(l)%pw_grid
+         IF (.NOT. res_grid_ok(grid)) RETURN
+         IF (.NOT. res_rs_ok(mgrid_rspace(l), grid)) RETURN
+         IF (ASSOCIATED(grid, target_grid)) THEN
+            gidx(l) = C_NULL_PTR
+         ELSE
+            ! pw_axpy branch rho_gspace(gidx(i)) += mgrid_gspace(i): the level references the
+            ! target grid and has fewer G vectors.
+            IF (grid%reference /= target_grid%id_nr .OR. target_grid%reference == grid%id_nr) RETURN
+            IF (SIZE(grid%gsq) >= SIZE(target_grid%gsq)) RETURN
+            IF (.NOT. ASSOCIATED(grid%gidx)) RETURN
+            IF (SIZE(grid%gidx) < SIZE(grid%gsq) .OR. .NOT. IS_CONTIGUOUS(grid%gidx)) RETURN
+            gidx(l) = C_LOC(grid%gidx(1))
+         END IF
+         npts(3*l - 2:3*l) = INT(grid%npts, C_INT)
+         ngpts(l) = INT(SIZE(grid%gsq), C_INT)
+         nmaps(l) = INT(SIZE(grid%g_hatmap, 2), C_INT)
+         grid_id(l) = INT(grid%id_nr, C_INT)
+         maps(l) = C_LOC(grid%g_hatmap(1, 1))
+         r_host(l) = C_LOC(mgrid_rspace(l)%array)
+         scale(l) = 1.0_dp/REAL(mgrid_rspace(l)%pw_grid%ngpts, KIND=dp)
+      END DO
+      done = pw_gpu_res_density_c(INT(nlevels, C_INT), r_host, npts, ngpts, nmaps, grid_id, maps, gidx, &
+                                  scale, INT(target_grid%npts, C_INT), INT(SIZE(target_grid%gsq), C_INT), &
+                                  INT(SIZE(target_grid%g_hatmap, 2), C_INT), INT(target_grid%id_nr, C_INT), &
+                                  C_LOC(target_grid%g_hatmap(1, 1)), C_LOC(rho_gspace%array), &
+                                  C_LOC(rho%array)) /= 0_C_INT
+#else
+      MARK_USED(mgrid_rspace)
+      MARK_USED(mgrid_gspace)
+      MARK_USED(rho)
+      MARK_USED(rho_gspace)
+      done = .FALSE.
+#endif
+   END FUNCTION pw_gpu_res_density
+
+! **************************************************************************************************
+!> \brief potential_pw2rs (pw_interp branch) on the GPU, bitwise equal to
+!>          pw_transfer(v_rspace, G); DO l /= aux: pw_copy(G, G_l); pw_transfer(G_l, mgrid_rspace(l));
+!>          mgrid_rspace(l) = dvol_l/dvol_aux*mgrid_rspace(l); pw_copy(v_rspace, mgrid_rspace(aux))
+!> \param v_rspace ...
+!> \param mgrid_rspace ...
+!> \param aux the auxiliary (finest) level
+!> \return ...
+! **************************************************************************************************
+   FUNCTION pw_gpu_res_potential(v_rspace, mgrid_rspace, aux) RESULT(done)
+      TYPE(pw_r3d_rs_type), INTENT(IN)                   :: v_rspace
+      TYPE(pw_r3d_rs_type), DIMENSION(:), INTENT(INOUT)  :: mgrid_rspace
+      INTEGER, INTENT(IN)                                :: aux
+      LOGICAL                                            :: done
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTEGER, PARAMETER                                 :: max_levels = 16
+
+      INTEGER                                            :: l, nlevels
+      INTEGER(KIND=C_INT), DIMENSION(3*max_levels)       :: npts
+      INTEGER(KIND=C_INT), DIMENSION(max_levels)         :: grid_id, ngpts, nmaps
+      REAL(KIND=C_DOUBLE), DIMENSION(max_levels)         :: rscale
+      TYPE(C_PTR), DIMENSION(max_levels)                 :: gidx, maps, r_host
+      TYPE(pw_grid_type), POINTER                        :: aux_grid, grid
+      INTERFACE
+         FUNCTION pw_gpu_res_potential_c(v_host, nlevels, r_host, npts, ngpts, nmaps, grid_id, maps, &
+                                         gidx, rscale, aux, fwd_scale) &
+            BIND(C, name="pw_gpu_res_potential_c") RESULT(res)
+            IMPORT :: C_PTR, C_INT, C_DOUBLE
+            TYPE(C_PTR), VALUE                           :: v_host
+            INTEGER(KIND=C_INT), VALUE                   :: nlevels
+            TYPE(C_PTR), DIMENSION(*), INTENT(IN)        :: r_host
+            INTEGER(KIND=C_INT), DIMENSION(*), INTENT(IN) :: npts, ngpts, nmaps, grid_id
+            TYPE(C_PTR), DIMENSION(*), INTENT(IN)        :: maps, gidx
+            REAL(KIND=C_DOUBLE), DIMENSION(*), INTENT(IN) :: rscale
+            INTEGER(KIND=C_INT), VALUE                   :: aux
+            REAL(KIND=C_DOUBLE), VALUE                   :: fwd_scale
+            INTEGER(KIND=C_INT)                          :: res
+         END FUNCTION pw_gpu_res_potential_c
+      END INTERFACE
+
+      done = .FALSE.
+      nlevels = SIZE(mgrid_rspace)
+      IF (nlevels < 1 .OR. nlevels > max_levels .OR. aux < 1 .OR. aux > nlevels) RETURN
+      IF (.NOT. pw_gpu_res_enabled(pw_gpu_res_pot_id)) RETURN
+      aux_grid => mgrid_rspace(aux)%pw_grid
+      IF (.NOT. res_grid_ok(aux_grid)) RETURN
+      IF (.NOT. res_rs_ok(v_rspace, aux_grid)) RETURN
+      DO l = 1, nlevels
+         grid => mgrid_rspace(l)%pw_grid
+         IF (.NOT. res_grid_ok(grid)) RETURN
+         IF (.NOT. res_rs_ok(mgrid_rspace(l), grid)) RETURN
+         gidx(l) = C_NULL_PTR
+         rscale(l) = 1.0_dp
+         IF (l /= aux) THEN
+            ! pw_copy branch G_l(i) = G(gidx_l(i)): the level references the auxiliary grid.
+            IF (ASSOCIATED(grid, aux_grid)) RETURN
+            IF (grid%reference /= aux_grid%id_nr) RETURN
+            IF (SIZE(grid%gsq) > SIZE(aux_grid%gsq)) RETURN
+            IF (.NOT. ASSOCIATED(grid%gidx)) RETURN
+            IF (SIZE(grid%gidx) < SIZE(grid%gsq) .OR. .NOT. IS_CONTIGUOUS(grid%gidx)) RETURN
+            gidx(l) = C_LOC(grid%gidx(1))
+            rscale(l) = mgrid_rspace(l)%pw_grid%dvol/mgrid_rspace(aux)%pw_grid%dvol
+         END IF
+         npts(3*l - 2:3*l) = INT(grid%npts, C_INT)
+         ngpts(l) = INT(SIZE(grid%gsq), C_INT)
+         nmaps(l) = INT(SIZE(grid%g_hatmap, 2), C_INT)
+         grid_id(l) = INT(grid%id_nr, C_INT)
+         maps(l) = C_LOC(grid%g_hatmap(1, 1))
+         r_host(l) = C_LOC(mgrid_rspace(l)%array)
+      END DO
+      done = pw_gpu_res_potential_c(C_LOC(v_rspace%array), INT(nlevels, C_INT), r_host, npts, ngpts, &
+                                    nmaps, grid_id, maps, gidx, rscale, INT(aux - 1, C_INT), &
+                                    1.0_dp/REAL(v_rspace%pw_grid%ngpts, KIND=dp)) /= 0_C_INT
+#else
+      MARK_USED(v_rspace)
+      MARK_USED(mgrid_rspace)
+      MARK_USED(aux)
+      done = .FALSE.
+#endif
+   END FUNCTION pw_gpu_res_potential
+
+! **************************************************************************************************
+!> \brief Hartree/DDAPC chain, step 1: rho_tot = rho_core + rho_g and v_H = rho_tot*influence on
+!>        the device (as calc_rho_tot_gspace, pw_poisson_solve). Only rho_tot(1:nprefix) is written
+!>        to the host, for the DDAPC charge fit and the G=0 charge.
+!> \param rho_core ...
+!> \param rho_g ...
+!> \param influence ...
+!> \param rho_tot ...
+!> \param nprefix ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION pw_gpu_res_hartree_begin(rho_core, rho_g, influence, rho_tot, nprefix) RESULT(done)
+      TYPE(pw_c1d_gs_type), INTENT(IN)                   :: rho_core, rho_g, influence
+      TYPE(pw_c1d_gs_type), INTENT(INOUT)                :: rho_tot
+      INTEGER, INTENT(IN)                                :: nprefix
+      LOGICAL                                            :: done
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      TYPE(pw_grid_type), POINTER                        :: grid
+      INTERFACE
+         FUNCTION pw_gpu_res_hartree_begin_c(core, rho_g, infl, rho_tot, ngpts, nprefix, npts) &
+            BIND(C, name="pw_gpu_res_hartree_begin_c") RESULT(res)
+            IMPORT :: C_PTR, C_INT, C_SIZE_T
+            TYPE(C_PTR), VALUE                           :: core, rho_g, infl, rho_tot
+            INTEGER(KIND=C_SIZE_T), VALUE                :: ngpts, nprefix
+            INTEGER(KIND=C_INT), DIMENSION(*), INTENT(IN) :: npts
+            INTEGER(KIND=C_INT)                          :: res
+         END FUNCTION pw_gpu_res_hartree_begin_c
+      END INTERFACE
+
+      done = .FALSE.
+      IF (.NOT. pw_gpu_res_enabled(pw_gpu_res_hartree_id)) RETURN
+      grid => rho_tot%pw_grid
+      IF (.NOT. res_grid_ok(grid)) RETURN
+      IF (.NOT. res_gs_ok(rho_tot, grid) .OR. .NOT. res_gs_ok(rho_core, grid)) RETURN
+      IF (.NOT. res_gs_ok(rho_g, grid) .OR. .NOT. res_gs_ok(influence, grid)) RETURN
+      IF (nprefix < 1 .OR. nprefix > SIZE(grid%gsq)) RETURN
+      done = pw_gpu_res_hartree_begin_c(C_LOC(rho_core%array), C_LOC(rho_g%array), C_LOC(influence%array), &
+                                        C_LOC(rho_tot%array), INT(SIZE(grid%gsq), C_SIZE_T), &
+                                        INT(nprefix, C_SIZE_T), INT(grid%npts, C_INT)) /= 0_C_INT
+#else
+      MARK_USED(rho_core)
+      MARK_USED(rho_g)
+      MARK_USED(influence)
+      MARK_USED(rho_tot)
+      MARK_USED(nprefix)
+      done = .FALSE.
+#endif
+   END FUNCTION pw_gpu_res_hartree_begin
+
+! **************************************************************************************************
+!> \brief Hartree/DDAPC chain, step 2 (modify_hartree_pot on the device): v_H(1) += g0_delta and
+!>        the DDAPC correction for first_gne0 <= ig, |G|^2 <= gcut2 (same kernel as the host-pointer
+!>        modify_hartree_pot_gpu).
+!> \param g0_delta ...
+!> \param grid ...
+!> \param positions ...
+!> \param radii ...
+!> \param cv ...
+!> \param gcut2 ...
+!> \param vol ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION pw_gpu_res_hartree_modify(g0_delta, grid, positions, radii, cv, gcut2, vol) RESULT(done)
+      REAL(KIND=dp), INTENT(IN)                          :: g0_delta
+      TYPE(pw_grid_type), INTENT(IN)                     :: grid
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN), TARGET :: positions
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN), TARGET    :: radii, cv
+      REAL(KIND=dp), INTENT(IN)                          :: gcut2, vol
+      LOGICAL                                            :: done
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTEGER                                            :: first, n
+      REAL(KIND=dp), DIMENSION(1), TARGET                :: dummy
+      TYPE(C_PTR)                                        :: p_cv, p_g, p_gsq, p_r, p_radii
+      INTERFACE
+         FUNCTION pw_gpu_res_hartree_modify_c(g0_delta, have_g0, g, gsq, r, radii, cv, first, n, natoms, &
+                                              nradii, gcut2, vol) &
+            BIND(C, name="pw_gpu_res_hartree_modify_c") RESULT(res)
+            IMPORT :: C_PTR, C_INT, C_SIZE_T, C_DOUBLE
+            REAL(KIND=C_DOUBLE), VALUE                   :: g0_delta
+            INTEGER(KIND=C_INT), VALUE                   :: have_g0
+            TYPE(C_PTR), VALUE                           :: g, gsq, r, radii, cv
+            INTEGER(KIND=C_SIZE_T), VALUE                :: first, n, natoms, nradii
+            REAL(KIND=C_DOUBLE), VALUE                   :: gcut2, vol
+            INTEGER(KIND=C_INT)                          :: res
+         END FUNCTION pw_gpu_res_hartree_modify_c
+      END INTERFACE
+
+      done = .FALSE.
+      IF (.NOT. ASSOCIATED(grid%g) .OR. .NOT. ASSOCIATED(grid%gsq)) RETURN
+      IF (SIZE(positions, 1) /= 3 .OR. SIZE(cv) /= SIZE(positions, 2)*SIZE(radii)) RETURN
+      IF (.NOT. IS_CONTIGUOUS(positions) .OR. .NOT. IS_CONTIGUOUS(radii) .OR. .NOT. IS_CONTIGUOUS(cv)) RETURN
+      first = grid%first_gne0
+      n = MAX(0, MIN(grid%ngpts_cut_local, SIZE(grid%gsq)) - first + 1)
+      dummy(1) = 0.0_dp
+      p_g = C_LOC(dummy)
+      p_gsq = C_LOC(dummy)
+      IF (n > 0) THEN
+         p_g = C_LOC(grid%g(1, first))
+         p_gsq = C_LOC(grid%gsq(first))
+      END IF
+      p_r = C_LOC(dummy)
+      p_radii = C_LOC(dummy)
+      p_cv = C_LOC(dummy)
+      IF (SIZE(positions) > 0) p_r = C_LOC(positions(1, 1))
+      IF (SIZE(radii) > 0) p_radii = C_LOC(radii(1))
+      IF (SIZE(cv) > 0) p_cv = C_LOC(cv(1))
+      done = pw_gpu_res_hartree_modify_c(g0_delta, MERGE(1_C_INT, 0_C_INT, grid%have_g0), p_g, p_gsq, &
+                                         p_r, p_radii, p_cv, INT(MAX(first - 1, 0), C_SIZE_T), &
+                                         INT(n, C_SIZE_T), INT(SIZE(positions, 2), C_SIZE_T), &
+                                         INT(SIZE(radii), C_SIZE_T), gcut2, vol) /= 0_C_INT
+#else
+      MARK_USED(g0_delta)
+      MARK_USED(grid)
+      MARK_USED(positions)
+      MARK_USED(radii)
+      MARK_USED(cv)
+      MARK_USED(gcut2)
+      MARK_USED(vol)
+      done = .FALSE.
+#endif
+   END FUNCTION pw_gpu_res_hartree_modify
+
+! **************************************************************************************************
+!> \brief Hartree/DDAPC chain, step 3: dot = Re SUM(CONJG(rho_tot)*v_H) (deterministic, compensated;
+!>        pw_integral_ab multiplies by the volume).
+!> \param dot ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION pw_gpu_res_hartree_energy(dot) RESULT(done)
+      REAL(KIND=dp), INTENT(OUT)                         :: dot
+      LOGICAL                                            :: done
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTERFACE
+         FUNCTION pw_gpu_res_hartree_energy_c(dot) BIND(C, name="pw_gpu_res_hartree_energy_c") RESULT(res)
+            IMPORT :: C_INT, C_DOUBLE
+            REAL(KIND=C_DOUBLE), INTENT(OUT)             :: dot
+            INTEGER(KIND=C_INT)                          :: res
+         END FUNCTION pw_gpu_res_hartree_energy_c
+      END INTERFACE
+
+      dot = 0.0_dp
+      done = pw_gpu_res_hartree_energy_c(dot) /= 0_C_INT
+#else
+      dot = 0.0_dp
+      done = .FALSE.
+#endif
+   END FUNCTION pw_gpu_res_hartree_energy
+
+! **************************************************************************************************
+!> \brief Hartree/DDAPC chain, step 4: v_hartree_rspace = dvol*FFT^-1[v_H] (pw_transfer, pw_scale);
+!>        the result stays resident for the potential sum.
+!> \param v_hartree_rspace ...
+!> \param gs_grid the grid of v_H
+!> \return ...
+! **************************************************************************************************
+   FUNCTION pw_gpu_res_hartree_finish(v_hartree_rspace, gs_grid) RESULT(done)
+      TYPE(pw_r3d_rs_type), INTENT(INOUT)                :: v_hartree_rspace
+      TYPE(pw_grid_type), POINTER                        :: gs_grid
+      LOGICAL                                            :: done
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTERFACE
+         FUNCTION pw_gpu_res_hartree_finish_c(v_r, npts, ngpts, nmaps, grid_id, map, dvol) &
+            BIND(C, name="pw_gpu_res_hartree_finish_c") RESULT(res)
+            IMPORT :: C_PTR, C_INT, C_DOUBLE
+            TYPE(C_PTR), VALUE                           :: v_r
+            INTEGER(KIND=C_INT), DIMENSION(*), INTENT(IN) :: npts
+            INTEGER(KIND=C_INT), VALUE                   :: ngpts, nmaps, grid_id
+            TYPE(C_PTR), VALUE                           :: map
+            REAL(KIND=C_DOUBLE), VALUE                   :: dvol
+            INTEGER(KIND=C_INT)                          :: res
+         END FUNCTION pw_gpu_res_hartree_finish_c
+      END INTERFACE
+
+      done = .FALSE.
+      IF (.NOT. res_grid_ok(gs_grid)) RETURN
+      IF (.NOT. res_rs_ok(v_hartree_rspace, gs_grid)) RETURN
+      done = pw_gpu_res_hartree_finish_c(C_LOC(v_hartree_rspace%array), INT(gs_grid%npts, C_INT), &
+                                         INT(SIZE(gs_grid%gsq), C_INT), INT(SIZE(gs_grid%g_hatmap, 2), C_INT), &
+                                         INT(gs_grid%id_nr, C_INT), C_LOC(gs_grid%g_hatmap(1, 1)), &
+                                         v_hartree_rspace%pw_grid%dvol) /= 0_C_INT
+#else
+      MARK_USED(v_hartree_rspace)
+      MARK_USED(gs_grid)
+      done = .FALSE.
+#endif
+   END FUNCTION pw_gpu_res_hartree_finish
+
+! **************************************************************************************************
+!> \brief Abandons a started Hartree/DDAPC chain.
+! **************************************************************************************************
+   SUBROUTINE pw_gpu_res_hartree_cancel()
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTERFACE
+         SUBROUTINE pw_gpu_res_hartree_cancel_c() BIND(C, name="pw_gpu_res_hartree_cancel_c")
+         END SUBROUTINE pw_gpu_res_hartree_cancel_c
+      END INTERFACE
+
+      CALL pw_gpu_res_hartree_cancel_c()
+#endif
+   END SUBROUTINE pw_gpu_res_hartree_cancel
+
+! **************************************************************************************************
+!> \brief To be called right before pw_axpy(v_h, vxc, 1.0_dp, dvol): forms the same sum in the
+!>        resident Vxc grid. Returns .FALSE. if Vxc is not resident.
+!> \param v_h ...
+!> \param vxc ...
+!> \param dvol ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION pw_gpu_res_vtot_prepare(v_h, vxc, dvol) RESULT(done)
+      TYPE(pw_r3d_rs_type), INTENT(IN)                   :: v_h, vxc
+      REAL(KIND=dp), INTENT(IN)                          :: dvol
+      LOGICAL                                            :: done
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTERFACE
+         FUNCTION pw_gpu_res_vtot_prepare_c(vh, vxc, n, dvol) BIND(C, name="pw_gpu_res_vtot_prepare_c") &
+            RESULT(res)
+            IMPORT :: C_PTR, C_INT, C_SIZE_T, C_DOUBLE
+            TYPE(C_PTR), VALUE                           :: vh, vxc
+            INTEGER(KIND=C_SIZE_T), VALUE                :: n
+            REAL(KIND=C_DOUBLE), VALUE                   :: dvol
+            INTEGER(KIND=C_INT)                          :: res
+         END FUNCTION pw_gpu_res_vtot_prepare_c
+      END INTERFACE
+
+      done = .FALSE.
+      IF (.NOT. pw_gpu_res_enabled(pw_gpu_res_pot_id)) RETURN
+      IF (.NOT. ASSOCIATED(v_h%array) .OR. .NOT. ASSOCIATED(vxc%array)) RETURN
+      IF (.NOT. ASSOCIATED(v_h%pw_grid, vxc%pw_grid)) RETURN
+      IF (.NOT. IS_CONTIGUOUS(v_h%array) .OR. .NOT. IS_CONTIGUOUS(vxc%array)) RETURN
+      IF (ANY(SHAPE(v_h%array) /= SHAPE(vxc%array))) RETURN
+      done = pw_gpu_res_vtot_prepare_c(C_LOC(v_h%array), C_LOC(vxc%array), SIZE(vxc%array, KIND=C_SIZE_T), &
+                                       dvol) /= 0_C_INT
+#else
+      MARK_USED(v_h)
+      MARK_USED(vxc)
+      MARK_USED(dvol)
+      done = .FALSE.
+#endif
+   END FUNCTION pw_gpu_res_vtot_prepare
+
+! **************************************************************************************************
+!> \brief To be called right after that pw_axpy: keeps the device sum if it equals the host result.
+!> \param vtot ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION pw_gpu_res_vtot_commit(vtot) RESULT(done)
+      TYPE(pw_r3d_rs_type), INTENT(IN)                   :: vtot
+      LOGICAL                                            :: done
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTERFACE
+         FUNCTION pw_gpu_res_vtot_commit_c(vtot, n) BIND(C, name="pw_gpu_res_vtot_commit_c") RESULT(res)
+            IMPORT :: C_PTR, C_INT, C_SIZE_T
+            TYPE(C_PTR), VALUE                           :: vtot
+            INTEGER(KIND=C_SIZE_T), VALUE                :: n
+            INTEGER(KIND=C_INT)                          :: res
+         END FUNCTION pw_gpu_res_vtot_commit_c
+      END INTERFACE
+
+      done = .FALSE.
+      IF (.NOT. ASSOCIATED(vtot%array)) RETURN
+      IF (.NOT. IS_CONTIGUOUS(vtot%array)) RETURN
+      done = pw_gpu_res_vtot_commit_c(C_LOC(vtot%array), SIZE(vtot%array, KIND=C_SIZE_T)) /= 0_C_INT
+#else
+      MARK_USED(vtot)
+      done = .FALSE.
+#endif
+   END FUNCTION pw_gpu_res_vtot_commit
 
 END MODULE pw_gpu
 

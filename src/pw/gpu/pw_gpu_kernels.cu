@@ -383,6 +383,51 @@ void pw_gpu_launch_xc_reduce(const double *values, double *partial, size_t n,
       values, partial, n, columns);
 }
 
+#include "pw_gpu_res_ops.h"
+
+__global__ void pw_gpu_res_cmul_kernel(double *out, const double *a,
+                                       const double *w, int width, size_t n) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x)
+    pw_res_cmul_elem(out, a, w, width, i);
+}
+
+__global__ void pw_gpu_res_cdot_terms_kernel(const double *a, const double *b,
+                                             double *p, size_t n) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x)
+    p[i] = pw_res_cdot_term(a, b, i);
+}
+
+__global__ void pw_gpu_res_sample_kernel(const double *x, double *out,
+                                         size_t n, int width, size_t count) {
+  for (size_t k = (size_t)blockIdx.x * blockDim.x + threadIdx.x; k < count;
+       k += (size_t)blockDim.x * gridDim.x) {
+    const size_t e = pw_res_sample_index(k, n);
+    for (int c = 0; c < width; c++)
+      out[(size_t)width * k + c] = x[(size_t)width * e + c];
+  }
+}
+
+void pw_gpu_launch_res_cmul(double *out, const double *a, const double *w,
+                            int width, size_t n, offloadStream_t s) {
+  if (n) pw_gpu_res_cmul_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      out, a, w, width, n);
+}
+
+void pw_gpu_launch_res_cdot_terms(const double *a, const double *b, double *p,
+                                  size_t n, offloadStream_t s) {
+  if (n) pw_gpu_res_cdot_terms_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      a, b, p, n);
+}
+
+void pw_gpu_launch_res_sample(const double *x, double *out, size_t n, int width,
+                              offloadStream_t s) {
+  const size_t count = pw_res_sample_count(n);
+  if (count) pw_gpu_res_sample_kernel<<<pw_grid_blocks(count), PW_GPU_MAP_THREADS, 0, s>>>(
+      x, out, n, width, count);
+}
+
 #endif // defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
 
 // EOF

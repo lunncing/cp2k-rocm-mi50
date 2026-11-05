@@ -85,6 +85,9 @@ typedef struct {
   const double *g_host;
   int *map_dev;
   double *g_dev; // only allocated when a fused derivative path needs it
+  const int *gidx_host; // reference-grid index (one-based), multigrid paths
+  int *gidx_dev;
+  int gidx_bound;       // validated upper bound of the gidx entries
   unsigned long last_use;
 } grid_cache_entry;
 
@@ -100,9 +103,74 @@ static size_t allocated_gbuf_size;
 
 // Four real grids: three gradients (later divergence inputs) and dE/drho.
 // The two shared complex buffers hold rho/norm and FFT/e0/dE/dnorm by lifetime.
-static double *xc_dev;
+// The grids are two allocations (grids 0-1 and 2-3) so that the resident
+// density can be downloaded from one while the other is written.
+static double *xc_dev, *xc_dev_hi;
 static size_t allocated_xc_size;
 static bool protected_xc_buffer = false;
+
+/*******************************************************************************
+ * \brief Device residency of PW arrays between calls (density -> Hartree ->
+ *        XC -> potential). A slot mirrors one host array. The host array
+ *        always stays valid; the device copy is only used after its host
+ *        pointer, size and sampled bit pattern (pw_gpu_res_ops.h) match.
+ *        Borrowed slots live in the XC grids and are tied to xc_epoch, which
+ *        changes whenever those grids are reallocated, freed or overwritten.
+ *        Owned slots are optional allocations, evicted before any mandatory
+ *        scratch and only created when they fit the budget and free memory.
+ ******************************************************************************/
+enum {
+  RES_RHO_G = 0, // borrowed: xc_dev[0, 2 ngpts)
+  RES_RHO_R,     // borrowed: xc_dev_hi[0, nr)
+  RES_VXC,       // borrowed: xc_dev[0, nr); Vxc, later dvol*Vxc + V_H
+  RES_V_H_R,     // owned
+  RES_RHO_CORE,  // owned
+  RES_INFL,      // owned, real part of the influence function
+  RES_NSLOTS
+};
+enum { RES_INVALID = 0, RES_VALID, RES_PENDING };
+typedef struct {
+  const void *host;
+  size_t n;           // elements
+  int width;          // doubles per element on the device
+  int host_width;     // doubles per element on the host (INFL: 2 vs 1)
+  double *dev;
+  size_t owned_bytes; // 0 for borrowed slots
+  unsigned long epoch;
+  int state;
+  bool vtot;          // RES_VXC holds dvol*Vxc + V_H instead of Vxc
+  double *samples;    // host copy of the fingerprint values
+  size_t sample_capacity;
+  unsigned long hits, misses;
+} res_slot;
+static res_slot res[RES_NSLOTS];
+static const char *const res_names[RES_NSLOTS] = {"RHO_G", "RHO_R", "VXC",
+                                                  "V_H_R", "RHO_CORE", "INFL"};
+static unsigned long xc_epoch = 1;      // borrowed slot generation
+static unsigned long scratch_epoch = 1; // changes with every shared scratch use
+static unsigned res_pinned = 0;         // owned slots in use (never evicted)
+static double *res_small_dev = NULL;    // small scratch (samples, DDAPC data)
+static size_t res_small_bytes = 0;
+static bool opt_res = true, opt_res_density = true, opt_res_hartree = true;
+static bool opt_res_xcin = true, opt_res_pot = true, opt_res_verify = false;
+static bool opt_res_stats = true;
+static size_t res_reserve_bytes = (size_t)1536 * 1024 * 1024;
+static struct {
+  unsigned long density, density_fail, hartree, hartree_fail, potential,
+      potential_fail, vtot, vtot_fail, xc_in;
+  size_t upload_saved;
+} res_stats;
+// Hartree/DDAPC chain state between its Fortran-driven steps.
+static struct {
+  bool pending;
+  unsigned long epoch;
+  size_t ngpts;
+  int g0_done, modify_done;
+} res_hartree;
+static void res_evict_all(void);
+static bool res_evict_one(void);
+static void res_invalidate_borrowed(void);
+static void res_print_stats(void);
 
 // Runtime switches, read once in pw_gpu_init().
 static bool opt_map_cache = true; // CP2K_PW_GPU_MAP_CACHE
@@ -230,21 +298,31 @@ static void release_double_buffers(void) {
  * \brief Frees the device memory of a grid cache entry and empties the slot.
  ******************************************************************************/
 static void grid_cache_clear_entry(grid_cache_entry *e) {
-  if (e->map_dev != NULL || e->g_dev != NULL) {
+  if (e->map_dev != NULL || e->g_dev != NULL || e->gidx_dev != NULL) {
     // Uploads are asynchronous, including entries reclaimed during preparation.
     offloadStreamSynchronize(stream);
   }
   device_free(e->map_dev, sizeof(int) * (size_t)e->ngpts * (size_t)e->nmaps);
   device_free(e->g_dev, 3 * sizeof(double) * (size_t)e->ngpts);
+  device_free(e->gidx_dev, sizeof(int) * (size_t)e->ngpts);
   memset(e, 0, sizeof(grid_cache_entry));
+}
+
+// Size of the first of the two XC grid allocations, in whole doubles.
+static size_t xc_lo_bytes(const size_t total) {
+  return (total / 2 + sizeof(double) - 1) / sizeof(double) * sizeof(double);
 }
 
 static void release_xc_buffer(void) {
   if (xc_dev == NULL) return;
   offloadStreamSynchronize(stream);
-  device_free(xc_dev, allocated_xc_size);
-  xc_dev = NULL;
+  offloadStreamSynchronize(stream_copy);
+  const size_t lo = xc_lo_bytes(allocated_xc_size);
+  device_free(xc_dev, lo);
+  device_free(xc_dev_hi, allocated_xc_size - lo);
+  xc_dev = xc_dev_hi = NULL;
   allocated_xc_size = 0;
+  res_invalidate_borrowed();
 }
 
 static int check_and_reclaim_memory(const size_t required_bytes) {
@@ -256,6 +334,9 @@ static int check_and_reclaim_memory(const size_t required_bytes) {
          required_bytes > max_gpu_memory_bytes - current_gpu_allocated_bytes) {
     if (allocated_buffer_size_b != 0) {
       release_double_buffers();
+      continue;
+    }
+    if (res_evict_one()) {
       continue;
     }
     if (xc_dev != NULL && !protected_xc_buffer) {
@@ -301,6 +382,9 @@ static void release_work_buffers(void) {
   offloadStreamSynchronize(stream_copy);
   release_double_buffers();
   release_xc_buffer();
+  res_evict_all();
+  scratch_epoch++;
+  res_hartree.pending = false;
   device_free(buffer_dev_1, allocated_buffer_size);
   device_free(buffer_dev_2, allocated_buffer_size);
   device_free(ghatmap_dev, allocated_map_size);
@@ -369,6 +453,27 @@ void pw_gpu_init(void) {
   grid_cache_clock = 0;
   opt_map_cache = env_flag("CP2K_PW_GPU_MAP_CACHE", true);
   opt_fused_xc = env_flag("CP2K_PW_GPU_FUSED_XC", true);
+  opt_res = env_flag("CP2K_PW_GPU_RES", true);
+  opt_res_density = opt_res && env_flag("CP2K_PW_GPU_RES_DENSITY", true);
+  opt_res_hartree = opt_res && env_flag("CP2K_PW_GPU_RES_HARTREE", true);
+  opt_res_xcin = opt_res && env_flag("CP2K_PW_GPU_RES_XCIN", true);
+  opt_res_pot = opt_res && env_flag("CP2K_PW_GPU_RES_POT", true);
+  opt_res_verify = opt_res && env_flag("CP2K_PW_GPU_RES_VERIFY", false);
+  opt_res_stats = opt_res && env_flag("CP2K_PW_GPU_RES_STATS", true);
+  {
+    size_t mb;
+    if (parse_unsigned(getenv("CP2K_PW_GPU_RES_RESERVE_MB"), SIZE_MAX / PW_GPU_MIB, &mb)) {
+      res_reserve_bytes = mb * PW_GPU_MIB;
+    }
+  }
+  memset(res, 0, sizeof(res));
+  memset(&res_stats, 0, sizeof(res_stats));
+  memset(&res_hartree, 0, sizeof(res_hartree));
+  res_pinned = 0;
+  res_small_dev = NULL;
+  res_small_bytes = 0;
+  xc_epoch++;
+  scratch_epoch++;
 
   offloadStreamCreate(&stream);
   offloadStreamCreate(&stream_copy);
@@ -380,14 +485,17 @@ void pw_gpu_init(void) {
 }
 
 /*******************************************************************************
- * \brief Returns the runtime switches (bit 0: map cache, bit 1: fused XC).
+ * \brief Returns the runtime switches (bit 0: map cache, bit 1: fused XC,
+ *        bits 2-5: residency of density, Hartree, XC input, potential).
  ******************************************************************************/
 int pw_gpu_get_options(void) {
   read_memory_environment();
   if (!is_initialized) {
     return 0;
   }
-  return (opt_map_cache ? 1 : 0) + (opt_fused_xc ? 2 : 0);
+  return (opt_map_cache ? 1 : 0) + (opt_fused_xc ? 2 : 0) +
+         (opt_res_density ? 4 : 0) + (opt_res_hartree ? 8 : 0) +
+         (opt_res_xcin ? 16 : 0) + (opt_res_pot ? 32 : 0);
 }
 
 /*******************************************************************************
@@ -449,6 +557,12 @@ void pw_gpu_finalize(void) {
     grid_cache_clear_entry(&grid_cache[i]);
   }
   release_work_buffers();
+  res_print_stats();
+  for (int i = 0; i < RES_NSLOTS; i++) {
+    free(res[i].samples);
+    res[i].samples = NULL;
+    res[i].sample_capacity = 0;
+  }
   assert(current_gpu_allocated_bytes == 0);
   for (int i = 0; i < 2; i++) {
     offloadEventDestroy(event_compute_done[i]);
@@ -467,6 +581,7 @@ static int pw_gpu_ensure_buffer_c(const size_t requested_buffer_size,
                                   const size_t requested_map_size,
                                   const bool double_buffer) {
   assert(is_initialized);
+  scratch_epoch++; // every user of the shared scratch passes through here
   const size_t buffer_growth = requested_buffer_size > allocated_buffer_size
                                   ? requested_buffer_size - allocated_buffer_size
                                   : 0;
@@ -517,6 +632,7 @@ static int pw_gpu_ensure_buffer_c(const size_t requested_buffer_size,
  ******************************************************************************/
 static int pw_gpu_ensure_gbuf_c(const size_t requested_size) {
   assert(is_initialized);
+  scratch_epoch++;
   if (requested_size > allocated_gbuf_size) {
     if (!check_and_reclaim_memory(requested_size - allocated_gbuf_size)) {
       return memory_limit_exceeded();
@@ -538,10 +654,318 @@ static int pw_gpu_ensure_xc_c(const size_t requested_size) {
   if (!fits) return memory_limit_exceeded();
   if (growth) {
     release_xc_buffer();
-    device_malloc((void **)&xc_dev, requested_size);
+    const size_t lo = xc_lo_bytes(requested_size);
+    device_malloc((void **)&xc_dev, lo);
+    if (requested_size > lo) {
+      device_malloc((void **)&xc_dev_hi, requested_size - lo);
+    }
     allocated_xc_size = requested_size;
+    xc_epoch++;
   }
   return 1;
+}
+
+/*******************************************************************************
+ * \brief Residency core: slot bookkeeping, fingerprints and optional memory.
+ ******************************************************************************/
+#include "pw_gpu_res_ops.h"
+
+static void res_invalidate(const int id) {
+  res[id].state = RES_INVALID;
+  res[id].vtot = false;
+}
+
+static void res_invalidate_borrowed(void) {
+  xc_epoch++;
+  for (int id = 0; id <= RES_VXC; id++) {
+    res_invalidate(id);
+  }
+}
+
+static void res_free_owned(const int id) {
+  res_slot *s = &res[id];
+  if (s->owned_bytes != 0) {
+    offloadStreamSynchronize(stream);
+    offloadStreamSynchronize(stream_copy);
+    device_free(s->dev, s->owned_bytes);
+    s->dev = NULL;
+    s->owned_bytes = 0;
+  }
+  res_invalidate(id);
+}
+
+static void res_free_small(void) {
+  if (res_small_dev != NULL) {
+    offloadStreamSynchronize(stream);
+    offloadStreamSynchronize(stream_copy);
+    device_free(res_small_dev, res_small_bytes);
+    res_small_dev = NULL;
+    res_small_bytes = 0;
+  }
+}
+
+// Owned slots are the cheapest data to recreate: evict them before any
+// scratch that an operation requires. Pinned slots are in use right now.
+static bool res_evict_one(void) {
+  static const int order[] = {RES_INFL, RES_RHO_CORE, RES_V_H_R};
+  for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+    const int id = order[i];
+    if (res[id].owned_bytes != 0 && (res_pinned & (1u << id)) == 0) {
+      res_free_owned(id);
+      return true;
+    }
+  }
+  return false;
+}
+
+static void res_evict_all(void) {
+  for (int id = RES_V_H_R; id < RES_NSLOTS; id++) {
+    res_free_owned(id);
+  }
+  res_free_small();
+  res_invalidate_borrowed();
+}
+
+// Free device memory as reported by the runtime (false: unknown).
+static bool res_device_free_memory(size_t *free_bytes) {
+#if defined(PW_GPU_TEST_FREE_MEMORY)
+  *free_bytes = PW_GPU_TEST_FREE_MEMORY();
+  return true;
+#elif defined(__OFFLOAD_HIP)
+  size_t total;
+  return hipMemGetInfo(free_bytes, &total) == hipSuccess;
+#elif defined(__OFFLOAD_CUDA)
+  size_t total;
+  return cudaMemGetInfo(free_bytes, &total) == cudaSuccess;
+#else
+  (void)free_bytes;
+  return false;
+#endif
+}
+
+// An optional slot never evicts anything, stays within the explicit budget and
+// leaves res_reserve_bytes of free device memory to the FFT and other libraries.
+static bool res_ensure_owned(const int id, const size_t bytes) {
+  res_slot *s = &res[id];
+  if (s->owned_bytes == bytes && s->dev != NULL) {
+    return true;
+  }
+  res_free_owned(id);
+  if (bytes == 0) {
+    return false;
+  }
+  read_memory_environment();
+  if (max_gpu_memory_bytes != 0) {
+    if (current_gpu_allocated_bytes > max_gpu_memory_bytes ||
+        bytes > max_gpu_memory_bytes - current_gpu_allocated_bytes) {
+      return false;
+    }
+  } else if (bytes > SIZE_MAX - current_gpu_allocated_bytes) {
+    return false;
+  }
+  size_t free_bytes;
+  if (res_device_free_memory(&free_bytes) &&
+      (free_bytes < res_reserve_bytes || bytes > free_bytes - res_reserve_bytes)) {
+    return false;
+  }
+  device_malloc((void **)&s->dev, bytes);
+  s->owned_bytes = bytes;
+  return true;
+}
+
+// Small mandatory scratch (fingerprints, DDAPC parameters). NULL on failure.
+static double *res_small(const size_t doubles) {
+  if (doubles > SIZE_MAX / sizeof(double) - PW_GPU_MIB) {
+    memory_limit_exceeded();
+    return NULL;
+  }
+  const size_t bytes = doubles * sizeof(double);
+  if (bytes <= res_small_bytes) {
+    return res_small_dev;
+  }
+  res_free_small();
+  const size_t rounded = (bytes + PW_GPU_MIB - 1) / PW_GPU_MIB * PW_GPU_MIB;
+  if (!check_and_reclaim_memory(rounded)) {
+    memory_limit_exceeded();
+    return NULL;
+  }
+  device_malloc((void **)&res_small_dev, rounded);
+  res_small_bytes = rounded;
+  return res_small_dev;
+}
+
+static bool res_bits_equal(const double a, const double b) {
+  return memcmp(&a, &b, sizeof(double)) == 0;
+}
+
+static bool res_sample_buffer(res_slot *s, const size_t doubles) {
+  if (doubles > s->sample_capacity) {
+    double *p = realloc(s->samples, doubles * sizeof(double));
+    if (p == NULL) {
+      return false;
+    }
+    s->samples = p;
+    s->sample_capacity = doubles;
+  }
+  return true;
+}
+
+// The fingerprint of a host array laid out like slot s.
+static void res_gather_host(const res_slot *s, const double *h, double *out) {
+  const size_t count = pw_res_sample_count(s->n);
+  for (size_t k = 0; k < count; k++) {
+    const size_t e = pw_res_sample_index(k, s->n);
+    for (int c = 0; c < s->width; c++) {
+      out[(size_t)s->width * k + c] = h[(size_t)s->host_width * e + c];
+    }
+  }
+}
+
+static bool res_samples_match(const res_slot *s, const double *h) {
+  const size_t count = pw_res_sample_count(s->n);
+  int mismatch = 0;
+#pragma omp parallel for reduction(| : mismatch) if (count > 4096)
+  for (size_t k = 0; k < count; k++) {
+    const size_t e = pw_res_sample_index(k, s->n);
+    for (int c = 0; c < s->width; c++) {
+      if (!res_bits_equal(s->samples[(size_t)s->width * k + c],
+                          h[(size_t)s->host_width * e + c])) {
+        mismatch = 1;
+      }
+    }
+    // A compact real copy of a complex array assumes zero imaginary parts.
+    if (s->host_width == 2 && s->width == 1 &&
+        !res_bits_equal(h[2 * e + 1], 0.0)) {
+      mismatch = 1;
+    }
+  }
+  return mismatch == 0;
+}
+
+// CP2K_PW_GPU_RES_VERIFY: compare the complete device copy (diagnostics).
+static bool res_verify_full(const res_slot *s, const double *h) {
+  const size_t doubles = s->n * (size_t)s->width;
+  double *copy = malloc(doubles * sizeof(double) + 1);
+  if (copy == NULL) {
+    return false;
+  }
+  offloadMemcpyAsyncDtoH(copy, s->dev, doubles * sizeof(double), stream);
+  offloadStreamSynchronize(stream);
+  bool ok = true;
+  for (size_t e = 0; e < s->n && ok; e++) {
+    for (int c = 0; c < s->width; c++) {
+      ok = ok && res_bits_equal(copy[(size_t)s->width * e + c],
+                                h[(size_t)s->host_width * e + c]);
+    }
+    if (s->host_width == 2 && s->width == 1) {
+      ok = ok && res_bits_equal(h[2 * e + 1], 0.0);
+    }
+  }
+  free(copy);
+  if (!ok) {
+    fprintf(stderr, "[PW_GPU] Residency verification failed for %s.\n",
+            res_names[s - res]);
+  }
+  return ok;
+}
+
+// Records that slot id now mirrors host (whose content equals the device).
+static void res_register(const int id, const void *host, const size_t n,
+                         const int width, const int host_width, double *dev) {
+  res_slot *s = &res[id];
+  s->host = host;
+  s->n = n;
+  s->width = width;
+  s->host_width = host_width;
+  if (s->owned_bytes == 0) {
+    s->dev = dev;
+  }
+  assert(s->dev == dev);
+  s->epoch = xc_epoch;
+  s->vtot = false;
+  s->state = RES_INVALID;
+  if (n != 0 && res_sample_buffer(s, pw_res_sample_count(n) * (size_t)width)) {
+    res_gather_host(s, host, s->samples);
+    s->state = RES_VALID;
+  }
+}
+
+// Device copy of a host array, or NULL if it is not (exactly) resident.
+static double *res_lookup(const int id, const void *host, const size_t n,
+                          const bool vtot) {
+  res_slot *s = &res[id];
+  if (!opt_res || host == NULL) {
+    return NULL;
+  }
+  bool ok = s->state == RES_VALID && s->host == host && s->n == n &&
+            s->dev != NULL && s->vtot == vtot &&
+            (s->owned_bytes != 0 || s->epoch == xc_epoch);
+  ok = ok && res_samples_match(s, host);
+  ok = ok && (!opt_res_verify || res_verify_full(s, host));
+  if (ok) {
+    s->hits++;
+    res_stats.upload_saved += n * (size_t)s->width * sizeof(double);
+    return s->dev;
+  }
+  s->misses++;
+  if (s->host == host) {
+    res_invalidate(id);
+  }
+  return NULL;
+}
+
+static void res_print_stats(void) {
+  if (!opt_res_stats || (res_stats.density + res_stats.hartree +
+                         res_stats.potential + res_stats.xc_in +
+                         res_stats.density_fail + res_stats.hartree_fail +
+                         res_stats.potential_fail) == 0) {
+    return;
+  }
+  fprintf(stderr,
+          "[PW_GPU] residency: density %lu (fallback %lu), hartree %lu "
+          "(fallback %lu), xc-input %lu, vtot %lu (fallback %lu), potential "
+          "%lu (fallback %lu), uploads avoided %.1f GB\n",
+          res_stats.density, res_stats.density_fail, res_stats.hartree,
+          res_stats.hartree_fail, res_stats.xc_in, res_stats.vtot,
+          res_stats.vtot_fail, res_stats.potential, res_stats.potential_fail,
+          (double)res_stats.upload_saved / 1e9);
+  fprintf(stderr, "[PW_GPU] residency slots (hits/misses):");
+  for (int id = 0; id < RES_NSLOTS; id++) {
+    fprintf(stderr, " %s %lu/%lu", res_names[id], res[id].hits, res[id].misses);
+  }
+  fprintf(stderr, "\n");
+}
+
+/*******************************************************************************
+ * \brief Public switches and invalidation for the Fortran orchestration.
+ *        what: 1 density, 2 Hartree, 3 XC input, 4 potential/V_TOT.
+ ******************************************************************************/
+int pw_gpu_res_enabled_c(const int what) {
+  if (!is_initialized || !opt_res) {
+    return 0;
+  }
+  switch (what) {
+  case 1:
+    return opt_res_density;
+  case 2:
+    return opt_res_hartree;
+  case 3:
+    return opt_res_xcin;
+  case 4:
+    return opt_res_pot;
+  default:
+    return 0;
+  }
+}
+
+void pw_gpu_res_invalidate_c(void) {
+  if (!is_initialized) {
+    return;
+  }
+  for (int id = 0; id < RES_NSLOTS; id++) {
+    res_invalidate(id);
+  }
+  res_hartree.pending = false;
 }
 
 // Reserve the complete operation before uploading or changing any output.
@@ -798,6 +1222,46 @@ static const double *grid_cache_get_g(grid_cache_entry *e,
 }
 
 /*******************************************************************************
+ * \brief Returns the device copy of the reference-grid index gidx(ngpts) of a
+ *        grid. All entries are checked once to lie in [1, bound].
+ ******************************************************************************/
+static const int *grid_cache_get_gidx(grid_cache_entry *e, const int *gidx_host,
+                                      const int bound) {
+  if (e == NULL || gidx_host == NULL) {
+    return NULL;
+  }
+  if (e->ngpts <= 0) {
+    return NULL;
+  }
+  if (e->gidx_dev != NULL && e->gidx_host == gidx_host && e->gidx_bound == bound) {
+    return e->gidx_dev;
+  }
+  if (e->gidx_dev != NULL) {
+    offloadStreamSynchronize(stream);
+    device_free(e->gidx_dev, sizeof(int) * (size_t)e->ngpts);
+    e->gidx_dev = NULL;
+  }
+  for (int i = 0; i < e->ngpts; i++) {
+    if (gidx_host[i] < 1 || gidx_host[i] > bound) {
+      return NULL;
+    }
+  }
+  const size_t size = sizeof(int) * (size_t)e->ngpts;
+  protected_grid_entry = e;
+  const int fits = check_and_reclaim_memory(size);
+  protected_grid_entry = NULL;
+  if (!fits) {
+    memory_limit_exceeded();
+    return NULL;
+  }
+  device_malloc((void **)&e->gidx_dev, size);
+  offloadMemcpyAsyncHtoD(e->gidx_dev, gidx_host, size, stream);
+  e->gidx_host = gidx_host;
+  e->gidx_bound = bound;
+  return e->gidx_dev;
+}
+
+/*******************************************************************************
  * \brief Returns a device pointer to g_hatmap. Uses the grid cache if enabled,
  *        otherwise uploads legacy_map_size bytes into the shared map buffer.
  ******************************************************************************/
@@ -956,13 +1420,25 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
   protected_grid_entry = NULL;
   if (!fits) return 0;
   const int *map_dev = entry == NULL ? NULL : entry->map_dev;
-  double *grad_dev[3] = {xc_dev, xc_dev + nr, xc_dev + 2 * nr};
-  double *vrho_dev = xc_dev + 3 * nr;
+  double *grad_dev[3] = {xc_dev, xc_dev + nr, xc_dev_hi};
+  double *vrho_dev = xc_dev_hi + nr;
   double *rho_dev = buffer_dev_1, *norm_dev = buffer_dev_1 + nr;
   double *e0_dev = buffer_dev_2, *vnorm_dev = buffer_dev_2 + nr;
 
-  if (ngpts) offloadMemcpyAsyncHtoD(gbuf_dev, zin_rho_g, gbuf_size, stream);
-  offloadMemcpyAsyncHtoD(rho_dev, din_rho_r, real_size, stream);
+  // Densities left in the XC grids by pw_gpu_res_density_c replace the
+  // uploads. Uploads are issued first, then the device copies; the XC grids
+  // are overwritten afterwards, which ends the residency of both densities.
+  const double *res_g = (ngpts && opt_res_xcin)
+      ? res_lookup(RES_RHO_G, zin_rho_g, (size_t)ngpts, false) : NULL;
+  const double *res_r = opt_res_xcin ? res_lookup(RES_RHO_R, din_rho_r, nr, false) : NULL;
+  if (ngpts && res_g == NULL)
+    offloadMemcpyAsyncHtoD(gbuf_dev, zin_rho_g, gbuf_size, stream);
+  if (res_r == NULL) offloadMemcpyAsyncHtoD(rho_dev, din_rho_r, real_size, stream);
+  if (res_g != NULL)
+    pw_gpu_launch_copy(res_g, gbuf_dev, (size_t)ngpts, (size_t)ngpts, 2, 2, 1.0, stream);
+  if (res_r != NULL) pw_gpu_launch_copy(res_r, rho_dev, nr, nr, 1, 1, 1.0, stream);
+  if (res_g != NULL || res_r != NULL) res_stats.xc_in++;
+  res_invalidate_borrowed();
   for (int d = 0; d < 3; d++) {
     offloadMemsetAsync(buffer_dev_2, 0, buffer_size, stream);
     if (ngpts)
@@ -1032,6 +1508,8 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
   offloadMemcpyAsyncDtoH(exc_out, norm_dev, sizeof(double), stream);
   offloadStreamSynchronize(stream);
   if (!opt_map_cache) pw_gpu_grid_invalidate(grid_id);
+  // Vxc stays in the first XC grid for pw_gpu_res_vtot_prepare_c.
+  if (opt_res_pot) res_register(RES_VXC, dout_vxc_r, nr, 1, 1, dout_dev);
   return 1;
 }
 
@@ -1043,6 +1521,595 @@ int pw_gpu_xc_full_pipeline_c(const double *zin_rho_g, const double *din_rho_r,
   return pw_gpu_xc_full_pipeline_configured_c(zin_rho_g, din_rho_r, dout_vxc_r,
       exc_out, ghatmap, g, npts, ngpts, nmaps, scale, grid_id, epsilon_rho,
       kappa, beta, mu, scale_ec, scale_ex, epsilon_rho, 0.0, 0);
+}
+
+/*******************************************************************************
+ * \brief Number of points of an FFT grid; false if it is empty or too large
+ *        for the int-indexed conversion kernels.
+ ******************************************************************************/
+static bool res_grid_points(const int *npts, size_t *nr) {
+  size_t n = 1;
+  for (int d = 0; d < 3; d++) {
+    if (npts[d] <= 0 || n > (size_t)(INT_MAX / 2) / (size_t)npts[d]) {
+      return false;
+    }
+    n *= (size_t)npts[d];
+  }
+  *nr = n;
+  return true;
+}
+
+#define PW_GPU_RES_MAX_LEVELS 16
+
+static bool res_imag_zero(const double *h, const size_t n) {
+  int bad = 0;
+#pragma omp parallel for reduction(| : bad)
+  for (size_t i = 0; i < n; i++) {
+    uint64_t bits;
+    memcpy(&bits, &h[2 * i + 1], sizeof(bits));
+    bad |= bits != 0;
+  }
+  return bad == 0;
+}
+
+static void res_host_copy(double *dst, const double *src, const size_t n) {
+  if (dst == src || n == 0) {
+    return;
+  }
+  const size_t block = 1 << 18;
+  const size_t nblocks = (n + block - 1) / block;
+#pragma omp parallel for schedule(static)
+  for (size_t b = 0; b < nblocks; b++) {
+    const size_t lo = b * block, len = n - lo < block ? n - lo : block;
+    memcpy(dst + lo, src + lo, len * sizeof(double));
+  }
+}
+
+/*******************************************************************************
+ * \brief density_rs2pw (pw_interp) on the device:
+ *          rho_g = 0; for each level l: rho_g += P_l gather(scale_l FFT[r_l]);
+ *          rho_r = Re FFT^-1[scatter(rho_g)]
+ *        P_l is the identity (gidx[l] == NULL, same grid as rho_g) or the
+ *        scatter through the one-based reference index gidx[l]. The sequence
+ *        of rounded operations is that of the original pw_transfer/pw_axpy
+ *        loop. Both results are downloaded; they stay resident in the XC
+ *        grids for the Hartree chain and the XC pipeline.
+ *        Returns 0 with all host outputs untouched if anything is unsupported.
+ ******************************************************************************/
+static int res_density(const int nlevels, void *const *r_host, const int *npts,
+                       const int *ngpts, const int *nmaps, const int *grid_id,
+                       void *const *maps, void *const *gidx, const double *scale,
+                       const int *t_npts, const int t_ngpts, const int t_nmaps,
+                       const int t_grid_id, const int *t_map, double *rho_g_host,
+                       double *rho_r_host) {
+  if (!is_initialized || !opt_res_density || !opt_map_cache ||
+      omp_get_num_threads() != 1) {
+    return 0;
+  }
+  if (nlevels < 1 || nlevels > PW_GPU_RES_MAX_LEVELS || rho_g_host == NULL ||
+      rho_r_host == NULL || t_map == NULL || t_ngpts <= 0 ||
+      (t_nmaps != 1 && t_nmaps != 2) || t_grid_id <= 0) {
+    return 0;
+  }
+  size_t t_nr, nr[PW_GPU_RES_MAX_LEVELS], roff[PW_GPU_RES_MAX_LEVELS];
+  if (!res_grid_points(t_npts, &t_nr) || (size_t)t_ngpts > t_nr) {
+    return 0;
+  }
+  size_t nr_max = t_nr, ng_max = (size_t)t_ngpts, total = 0;
+  for (int l = 0; l < nlevels; l++) {
+    if (!res_grid_points(npts + 3 * l, &nr[l]) || ngpts[l] <= 0 ||
+        (size_t)ngpts[l] > nr[l] || (nmaps[l] != 1 && nmaps[l] != 2) ||
+        grid_id[l] <= 0 || r_host[l] == NULL || maps[l] == NULL) {
+      return 0;
+    }
+    if (gidx[l] == NULL) {
+      if (grid_id[l] != t_grid_id || ngpts[l] != t_ngpts) return 0;
+    } else if (ngpts[l] >= t_ngpts) {
+      return 0;
+    }
+    roff[l] = total;
+    total += nr[l];
+    nr_max = nr[l] > nr_max ? nr[l] : nr_max;
+    ng_max = (size_t)ngpts[l] > ng_max ? (size_t)ngpts[l] : ng_max;
+  }
+  if (total > 2 * nr_max) {
+    return 0; // all real inputs must fit into one complex buffer
+  }
+  offload_activate_chosen_device();
+  if (!pw_gpu_ensure_buffer_c(2 * sizeof(double) * nr_max, 0, false) ||
+      !pw_gpu_ensure_gbuf_c(2 * sizeof(double) * ng_max) ||
+      !pw_gpu_ensure_xc_c(4 * sizeof(double) * t_nr)) {
+    res_stats.density_fail++;
+    return 0;
+  }
+  double *rho_g_dev = xc_dev, *rho_r_dev = xc_dev_hi;
+  res_invalidate_borrowed(); // the XC grids are overwritten below
+  protected_xc_buffer = true; // grid cache uploads must not release them
+
+  for (int l = 0; l < nlevels; l++) {
+    offloadMemcpyAsyncHtoD(buffer_dev_1 + roff[l], r_host[l],
+                           sizeof(double) * nr[l], stream);
+  }
+  offloadMemsetAsync(rho_g_dev, 0, 2 * sizeof(double) * (size_t)t_ngpts, stream);
+  for (int l = 0; l < nlevels; l++) {
+    grid_cache_entry *e =
+        grid_cache_lookup_or_upload(grid_id[l], maps[l], ngpts[l], nmaps[l]);
+    const int *gidx_dev = NULL;
+    if (e != NULL && gidx[l] != NULL) {
+      gidx_dev = grid_cache_get_gidx(e, gidx[l], t_ngpts);
+    }
+    if (e == NULL || (gidx[l] != NULL && gidx_dev == NULL)) {
+      offloadStreamSynchronize(stream);
+      res_stats.density_fail++;
+      return 0;
+    }
+    pw_gpu_launch_real_to_complex(buffer_dev_1 + roff[l], buffer_dev_2,
+                                  (int)nr[l], stream);
+    fft_3d(OFFLOAD_FFT_FORWARD, npts[3 * l + 2], npts[3 * l + 1], npts[3 * l],
+           buffer_dev_2);
+    pw_gpu_launch_gather(gbuf_dev, buffer_dev_2, scale[l], ngpts[l], e->map_dev,
+                         stream);
+    if (gidx_dev == NULL) {
+      pw_gpu_launch_axpy(gbuf_dev, rho_g_dev, (size_t)ngpts[l], (size_t)ngpts[l],
+                         2, 2, 1.0, 1.0, stream);
+    } else {
+      pw_gpu_launch_remap_axpy(gbuf_dev, rho_g_dev, gidx_dev, (size_t)ngpts[l],
+                               2, 2, 1, 1.0, 1.0, stream);
+    }
+  }
+  grid_cache_entry *t =
+      grid_cache_lookup_or_upload(t_grid_id, t_map, t_ngpts, t_nmaps);
+  if (t == NULL) {
+    offloadStreamSynchronize(stream);
+    res_stats.density_fail++;
+    return 0;
+  }
+  offloadMemsetAsync(buffer_dev_2, 0, 2 * sizeof(double) * t_nr, stream);
+  pw_gpu_launch_scatter(buffer_dev_2, rho_g_dev, 1.0, t_ngpts, t_nmaps,
+                        t->map_dev, stream);
+  offloadEventRecord(event_compute_done[0], stream); // rho_g complete and read
+  fft_3d(OFFLOAD_FFT_INVERSE, t_npts[2], t_npts[1], t_npts[0], buffer_dev_2);
+  pw_gpu_launch_complex_to_real(buffer_dev_2, rho_r_dev, (int)t_nr, stream);
+  offloadEventRecord(event_compute_done[1], stream);
+  // The G-space download overlaps the inverse FFT.
+  offloadStreamWaitEvent(stream_copy, event_compute_done[0]);
+  offloadMemcpyAsyncDtoH(rho_g_host, rho_g_dev,
+                         2 * sizeof(double) * (size_t)t_ngpts, stream_copy);
+  offloadStreamWaitEvent(stream_copy, event_compute_done[1]);
+  offloadMemcpyAsyncDtoH(rho_r_host, rho_r_dev, sizeof(double) * t_nr,
+                         stream_copy);
+  offloadStreamSynchronize(stream_copy);
+  offloadStreamSynchronize(stream);
+  res_register(RES_RHO_G, rho_g_host, (size_t)t_ngpts, 2, 2, rho_g_dev);
+  res_register(RES_RHO_R, rho_r_host, t_nr, 1, 1, rho_r_dev);
+  res_stats.density++;
+  return 1;
+}
+
+int pw_gpu_res_density_c(const int nlevels, void *const *r_host, const int *npts,
+                         const int *ngpts, const int *nmaps, const int *grid_id,
+                         void *const *maps, void *const *gidx, const double *scale,
+                         const int *t_npts, const int t_ngpts, const int t_nmaps,
+                         const int t_grid_id, const int *t_map, double *rho_g_host,
+                         double *rho_r_host) {
+  const int done = res_density(nlevels, r_host, npts, ngpts, nmaps, grid_id, maps,
+                               gidx, scale, t_npts, t_ngpts, t_nmaps, t_grid_id,
+                               t_map, rho_g_host, rho_r_host);
+  protected_xc_buffer = false;
+  return done;
+}
+
+/*******************************************************************************
+ * \brief potential_pw2rs (pw_interp) on the device. v_host is the potential on
+ *        the grid of level aux; r_host[aux] receives a copy of it (on the host,
+ *        concurrently with the device work), every other level l
+ *          r_l = rscale_l * Re FFT^-1[scatter(G_l)],  G_l(i) = G(gidx_l(i)),
+ *          G = gather(fwd_scale FFT[v]).
+ *        The resident V_H + dvol*Vxc (pw_gpu_res_vtot_commit_c) replaces the
+ *        upload of v_host when it matches.
+ ******************************************************************************/
+static int res_potential(const double *v_host, const int nlevels,
+                         void *const *r_host, const int *npts, const int *ngpts,
+                         const int *nmaps, const int *grid_id, void *const *maps,
+                         void *const *gidx, const double *rscale, const int aux,
+                         const double fwd_scale) {
+  if (!is_initialized || !opt_res_pot || !opt_map_cache ||
+      omp_get_num_threads() != 1) {
+    return 0;
+  }
+  if (v_host == NULL || nlevels < 1 || nlevels > PW_GPU_RES_MAX_LEVELS ||
+      aux < 0 || aux >= nlevels) {
+    return 0;
+  }
+  size_t nr[PW_GPU_RES_MAX_LEVELS], off[PW_GPU_RES_MAX_LEVELS];
+  size_t nr_max = 0, need = 0;
+  for (int l = 0; l < nlevels; l++) {
+    if (!res_grid_points(npts + 3 * l, &nr[l]) || ngpts[l] <= 0 ||
+        (size_t)ngpts[l] > nr[l] || (nmaps[l] != 1 && nmaps[l] != 2) ||
+        grid_id[l] <= 0 || r_host[l] == NULL || maps[l] == NULL) {
+      return 0;
+    }
+    if (l != aux && (gidx[l] == NULL || ngpts[l] > ngpts[aux])) {
+      return 0;
+    }
+    nr_max = nr[l] > nr_max ? nr[l] : nr_max;
+    if (l != aux) {
+      need += 2 * (size_t)ngpts[l] > nr[l] ? 2 * (size_t)ngpts[l] : nr[l];
+    }
+  }
+  offload_activate_chosen_device();
+  if (!pw_gpu_ensure_buffer_c(2 * sizeof(double) * nr_max, 0, false) ||
+      !pw_gpu_ensure_gbuf_c(2 * sizeof(double) * (size_t)ngpts[aux])) {
+    res_stats.potential_fail++;
+    return 0;
+  }
+  const double *src = res_lookup(RES_VXC, v_host, nr[aux], true);
+  protected_xc_buffer = src != NULL; // grid cache uploads must not release it
+  size_t start = 0;
+  if (src == NULL) {
+    start = nr[aux];
+  }
+  if (start + need > 2 * nr_max) {
+    return 0; // the coarse levels must fit next to the uploaded potential
+  }
+  size_t o = start;
+  for (int l = 0; l < nlevels; l++) {
+    off[l] = o;
+    if (l != aux) {
+      o += 2 * (size_t)ngpts[l] > nr[l] ? 2 * (size_t)ngpts[l] : nr[l];
+    }
+  }
+  if (src == NULL) {
+    offloadMemcpyAsyncHtoD(buffer_dev_1, v_host, sizeof(double) * nr[aux], stream);
+    src = buffer_dev_1;
+  }
+  grid_cache_entry *a =
+      grid_cache_lookup_or_upload(grid_id[aux], maps[aux], ngpts[aux], nmaps[aux]);
+  if (a == NULL) {
+    offloadStreamSynchronize(stream);
+    res_stats.potential_fail++;
+    return 0;
+  }
+  pw_gpu_launch_real_to_complex(src, buffer_dev_2, (int)nr[aux], stream);
+  fft_3d(OFFLOAD_FFT_FORWARD, npts[3 * aux + 2], npts[3 * aux + 1], npts[3 * aux],
+         buffer_dev_2);
+  pw_gpu_launch_gather(gbuf_dev, buffer_dev_2, fwd_scale, ngpts[aux], a->map_dev,
+                       stream);
+  for (int l = 0; l < nlevels; l++) {
+    if (l == aux) continue;
+    grid_cache_entry *e =
+        grid_cache_lookup_or_upload(grid_id[l], maps[l], ngpts[l], nmaps[l]);
+    const int *gidx_dev = grid_cache_get_gidx(e, gidx[l], ngpts[aux]);
+    if (e == NULL || gidx_dev == NULL) {
+      offloadStreamSynchronize(stream);
+      res_stats.potential_fail++;
+      return 0;
+    }
+    double *buf = buffer_dev_1 + off[l];
+    pw_gpu_launch_remap_copy(gbuf_dev, buf, gidx_dev, (size_t)ngpts[l], 2, 2, 0,
+                             1.0, stream);
+    offloadMemsetAsync(buffer_dev_2, 0, 2 * sizeof(double) * nr[l], stream);
+    pw_gpu_launch_scatter(buffer_dev_2, buf, 1.0, ngpts[l], nmaps[l], e->map_dev,
+                          stream);
+    fft_3d(OFFLOAD_FFT_INVERSE, npts[3 * l + 2], npts[3 * l + 1], npts[3 * l],
+           buffer_dev_2);
+    pw_gpu_launch_complex_to_real(buffer_dev_2, buf, (int)nr[l], stream);
+    pw_gpu_launch_copy(buf, buf, nr[l], nr[l], 1, 1, rscale[l], stream);
+  }
+  // The auxiliary level is a plain copy of the host potential (pw_copy).
+  res_host_copy(r_host[aux], v_host, nr[aux]);
+  for (int l = 0; l < nlevels; l++) {
+    if (l != aux) {
+      offloadMemcpyAsyncDtoH(r_host[l], buffer_dev_1 + off[l],
+                             sizeof(double) * nr[l], stream);
+    }
+  }
+  offloadStreamSynchronize(stream);
+  res_stats.potential++;
+  return 1;
+}
+
+int pw_gpu_res_potential_c(const double *v_host, const int nlevels,
+                           void *const *r_host, const int *npts, const int *ngpts,
+                           const int *nmaps, const int *grid_id, void *const *maps,
+                           void *const *gidx, const double *rscale, const int aux,
+                           const double fwd_scale) {
+  const int done = res_potential(v_host, nlevels, r_host, npts, ngpts, nmaps,
+                                 grid_id, maps, gidx, rscale, aux, fwd_scale);
+  protected_xc_buffer = false;
+  return done;
+}
+
+/*******************************************************************************
+ * \brief Before the host executes pw_axpy(v_h, vxc, 1, dvol): forms
+ *          vxc_dev = dvol*vxc_dev + v_h_dev
+ *        with the same kernel and rounding in the resident Vxc grid and keeps
+ *        its fingerprint, which pw_gpu_res_vtot_commit_c compares with the
+ *        host result. Returns 0 (nothing pending) unless Vxc is resident.
+ ******************************************************************************/
+int pw_gpu_res_vtot_prepare_c(const double *vh_host, const double *vxc_host,
+                              const size_t n, const double dvol) {
+  if (!is_initialized || !opt_res_pot || omp_get_num_threads() != 1 || n == 0 ||
+      vh_host == NULL || n > (size_t)INT_MAX) {
+    return 0;
+  }
+  offload_activate_chosen_device();
+  res_slot *s = &res[RES_VXC];
+  protected_xc_buffer = true;
+  double *samples = res_small(pw_res_sample_count(n));
+  protected_xc_buffer = false;
+  double *vxc = samples == NULL ? NULL : res_lookup(RES_VXC, vxc_host, n, false);
+  if (vxc == NULL || !res_sample_buffer(s, pw_res_sample_count(n))) {
+    res_stats.vtot_fail++;
+    return 0;
+  }
+  res_pinned |= 1u << RES_V_H_R;
+  const double *vh = res_lookup(RES_V_H_R, vh_host, n, false);
+  if (vh == NULL) {
+    protected_xc_buffer = true;
+    const int ok = pw_gpu_ensure_buffer_c(sizeof(double) * n, 0, false);
+    protected_xc_buffer = false;
+    if (!ok || s->epoch != xc_epoch) {
+      res_pinned = 0;
+      res_invalidate(RES_VXC);
+      res_stats.vtot_fail++;
+      return 0;
+    }
+    offloadMemcpyAsyncHtoD(buffer_dev_1, vh_host, sizeof(double) * n, stream);
+    vh = buffer_dev_1;
+  }
+  pw_gpu_launch_axpy(vh, vxc, n, n, 1, 1, 1.0, dvol, stream);
+  pw_gpu_launch_res_sample(vxc, samples, n, 1, stream);
+  offloadMemcpyAsyncDtoH(s->samples, samples,
+                         sizeof(double) * pw_res_sample_count(n), stream);
+  offloadStreamSynchronize(stream);
+  res_pinned = 0;
+  s->state = RES_PENDING;
+  s->vtot = true;
+  return 1;
+}
+
+/*******************************************************************************
+ * \brief After the host pw_axpy: the device sum becomes resident if the host
+ *        result agrees at every fingerprint position.
+ ******************************************************************************/
+int pw_gpu_res_vtot_commit_c(const double *vtot_host, const size_t n) {
+  if (!is_initialized) {
+    return 0;
+  }
+  res_slot *s = &res[RES_VXC];
+  bool ok = s->state == RES_PENDING && s->vtot && s->host == vtot_host &&
+            s->n == n && s->epoch == xc_epoch && s->dev != NULL;
+  ok = ok && res_samples_match(s, vtot_host);
+  ok = ok && (!opt_res_verify || res_verify_full(s, vtot_host));
+  if (!ok) {
+    res_invalidate(RES_VXC);
+    res_stats.vtot_fail++;
+    return 0;
+  }
+  s->state = RES_VALID;
+  res_stats.vtot++;
+  return 1;
+}
+
+/*******************************************************************************
+ * \brief Hartree/DDAPC chain, driven from cp_ddapc.F in four steps:
+ *          begin : rho_tot = rho_core + rho_g        (buffer_dev_2)
+ *                  prefix of rho_tot -> host         (DDAPC charge fit)
+ *                  v_H = rho_tot * influence         (gbuf)
+ *          modify: G=0 term and DDAPC correction of v_H on the device
+ *          energy: Re sum conj(rho_tot) v_H          (deterministic sum)
+ *          finish: v_H_r = dvol * Re FFT^-1[scatter(v_H)] -> host, resident
+ *        The steps share the scratch buffers. Any other PW GPU call in between
+ *        changes scratch_epoch, after which the remaining steps return 0 and
+ *        the caller recomputes everything on the original path.
+ ******************************************************************************/
+static int res_hartree_fail(void) {
+  if (res_hartree.pending) {
+    offloadStreamSynchronize(stream);
+  }
+  res_hartree.pending = false;
+  res_pinned = 0;
+  res_stats.hartree_fail++;
+  return 0;
+}
+
+static bool res_hartree_ready(void) {
+  return is_initialized && res_hartree.pending &&
+         res_hartree.epoch == scratch_epoch && omp_get_num_threads() == 1;
+}
+
+int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host,
+                               const double *infl_host, double *rho_tot_host,
+                               const size_t ngpts, const size_t nprefix,
+                               const int *npts) {
+  res_hartree.pending = false;
+  if (!is_initialized || !opt_res_hartree || !opt_map_cache ||
+      omp_get_num_threads() != 1) {
+    return 0;
+  }
+  size_t nr;
+  if (core_host == NULL || rho_g_host == NULL || infl_host == NULL ||
+      rho_tot_host == NULL || npts == NULL || !res_grid_points(npts, &nr) ||
+      ngpts == 0 || ngpts > nr || nprefix == 0 || nprefix > ngpts) {
+    return 0;
+  }
+  offload_activate_chosen_device();
+  const size_t zbytes = 2 * sizeof(double) * ngpts;
+  if (!pw_gpu_ensure_buffer_c(2 * sizeof(double) * nr, 0, false) ||
+      !pw_gpu_ensure_gbuf_c(zbytes)) {
+    res_stats.hartree_fail++;
+    return 0;
+  }
+  double *rho_tot = buffer_dev_2, *v_h = gbuf_dev;
+
+  // rho_tot = pw_copy(rho_core); pw_axpy(rho_g, rho_tot)
+  double *core = res_lookup(RES_RHO_CORE, core_host, ngpts, false);
+  if (core == NULL && res_ensure_owned(RES_RHO_CORE, zbytes)) {
+    core = res[RES_RHO_CORE].dev;
+    offloadMemcpyAsyncHtoD(core, core_host, zbytes, stream);
+    res_register(RES_RHO_CORE, core_host, ngpts, 2, 2, core);
+  }
+  res_pinned |= 1u << RES_RHO_CORE;
+  if (core != NULL) {
+    pw_gpu_launch_copy(core, rho_tot, ngpts, ngpts, 2, 2, 1.0, stream);
+  } else {
+    offloadMemcpyAsyncHtoD(rho_tot, core_host, zbytes, stream);
+  }
+  const double *rg = res_lookup(RES_RHO_G, rho_g_host, ngpts, false);
+  if (rg == NULL) {
+    offloadMemcpyAsyncHtoD(v_h, rho_g_host, zbytes, stream);
+    rg = v_h;
+  }
+  pw_gpu_launch_axpy(rg, rho_tot, ngpts, ngpts, 2, 2, 1.0, 1.0, stream);
+
+  // v_H = rho_tot * influence. A real influence function is kept compactly.
+  int width = 1;
+  double *infl = res_lookup(RES_INFL, infl_host, ngpts, false);
+  if (infl == NULL) {
+    offloadMemcpyAsyncHtoD(buffer_dev_1, infl_host, zbytes, stream);
+    bool compact = res_ensure_owned(RES_INFL, sizeof(double) * ngpts);
+    if (compact && !res_imag_zero(infl_host, ngpts)) {
+      res_free_owned(RES_INFL);
+      compact = false;
+    }
+    if (compact) {
+      infl = res[RES_INFL].dev;
+      pw_gpu_launch_copy(buffer_dev_1, infl, ngpts, ngpts, 2, 1, 1.0, stream);
+      res_register(RES_INFL, infl_host, ngpts, 1, 2, infl);
+    } else {
+      infl = buffer_dev_1;
+      width = 2;
+    }
+  }
+  pw_gpu_launch_res_cmul(v_h, rho_tot, infl, width, ngpts, stream);
+  offloadMemcpyAsyncDtoH(rho_tot_host, rho_tot, 2 * sizeof(double) * nprefix,
+                         stream);
+  offloadStreamSynchronize(stream);
+  res_pinned = 0;
+  res_hartree.pending = true;
+  res_hartree.epoch = scratch_epoch;
+  res_hartree.ngpts = ngpts;
+  return 1;
+}
+
+int pw_gpu_res_hartree_modify_c(const double g0_delta, const int have_g0,
+                                const double *g, const double *gsq,
+                                const double *r, const double *radii,
+                                const double *cv, const size_t first,
+                                const size_t n, const size_t natoms,
+                                const size_t nradii, const double gcut2,
+                                const double vol) {
+  if (!res_hartree_ready()) {
+    return res_hartree_fail();
+  }
+  // The sorted-G loop of modify_hartree_pot exits at the first |G|^2 > GCUT^2.
+  size_t active = 0;
+  while (active < n && !(gsq[active] > gcut2)) {
+    active++;
+  }
+  if (first > res_hartree.ngpts || active > res_hartree.ngpts - first ||
+      (nradii != 0 && natoms > SIZE_MAX / nradii / 8)) {
+    return res_hartree_fail();
+  }
+  const size_t counts[6] = {2, 3 * active, active, 3 * natoms, nradii,
+                            natoms * nradii};
+  size_t total = 0;
+  for (int i = 0; i < 6; i++) {
+    total += counts[i];
+  }
+  double *small = res_small(total);
+  if (small == NULL) {
+    return res_hartree_fail();
+  }
+  static double g0_term[2];
+  g0_term[0] = g0_delta;
+  g0_term[1] = 0.0; // complex + real in Fortran adds (delta, 0)
+  const double *host[6] = {g0_term, g, gsq, r, radii, cv};
+  double *dev[6];
+  size_t offset = 0;
+  for (int i = 0; i < 6; i++) {
+    dev[i] = small + offset;
+    offset += counts[i];
+    if (counts[i] != 0 && (i == 0 || i > 2 || active != 0)) {
+      offloadMemcpyAsyncHtoD(dev[i], host[i], sizeof(double) * counts[i], stream);
+    }
+  }
+  if (have_g0) {
+    pw_gpu_launch_axpy(dev[0], gbuf_dev, 1, 1, 2, 2, 1.0, 1.0, stream);
+  }
+  if (active != 0) {
+    pw_gpu_launch_modify_hartree(gbuf_dev + 2 * first, dev[1], dev[2], dev[3],
+                                 dev[4], dev[5], active, natoms, nradii, gcut2,
+                                 vol, stream);
+  }
+  // The host arguments may be released by the caller after the return.
+  offloadStreamSynchronize(stream);
+  return 1;
+}
+
+int pw_gpu_res_hartree_energy_c(double *dot) {
+  if (!res_hartree_ready() || dot == NULL) {
+    return res_hartree_fail();
+  }
+  const size_t n = res_hartree.ngpts;
+  double *terms = buffer_dev_1, *partial = buffer_dev_1 + n;
+  pw_gpu_launch_res_cdot_terms(buffer_dev_2, gbuf_dev, terms, n, stream);
+  size_t remaining = n;
+  double *sum_in = terms, *sum_out = partial;
+  do {
+    pw_gpu_launch_xc_reduce(sum_in, sum_out, remaining, stream);
+    remaining = pw_gpu_xc_reduce_size(remaining);
+    double *swap = sum_in;
+    sum_in = sum_out;
+    sum_out = swap;
+  } while (remaining > 1);
+  offloadMemcpyAsyncDtoH(dot, sum_in, sizeof(double), stream);
+  offloadStreamSynchronize(stream);
+  return 1;
+}
+
+int pw_gpu_res_hartree_finish_c(double *v_h_r_host, const int *npts,
+                                const int ngpts, const int nmaps,
+                                const int grid_id, const int *ghatmap,
+                                const double dvol) {
+  size_t nr;
+  if (!res_hartree_ready() || v_h_r_host == NULL || ghatmap == NULL ||
+      !res_grid_points(npts, &nr) || ngpts <= 0 ||
+      (size_t)ngpts != res_hartree.ngpts || (nmaps != 1 && nmaps != 2) ||
+      grid_id <= 0) {
+    return res_hartree_fail();
+  }
+  grid_cache_entry *e = grid_cache_lookup_or_upload(grid_id, ghatmap, ngpts, nmaps);
+  if (e == NULL || !res_hartree_ready()) {
+    return res_hartree_fail();
+  }
+  double *dst = buffer_dev_1;
+  const bool resident = opt_res_pot && res_ensure_owned(RES_V_H_R, sizeof(double) * nr);
+  if (resident) {
+    dst = res[RES_V_H_R].dev;
+  }
+  offloadMemsetAsync(buffer_dev_2, 0, 2 * sizeof(double) * nr, stream);
+  pw_gpu_launch_scatter(buffer_dev_2, gbuf_dev, 1.0, ngpts, nmaps, e->map_dev,
+                        stream);
+  fft_3d(OFFLOAD_FFT_INVERSE, npts[2], npts[1], npts[0], buffer_dev_2);
+  pw_gpu_launch_complex_to_real(buffer_dev_2, dst, (int)nr, stream);
+  pw_gpu_launch_copy(dst, dst, nr, nr, 1, 1, dvol, stream); // pw_scale
+  offloadMemcpyAsyncDtoH(v_h_r_host, dst, sizeof(double) * nr, stream);
+  offloadStreamSynchronize(stream);
+  if (resident) {
+    res_register(RES_V_H_R, v_h_r_host, nr, 1, 1, dst);
+  }
+  res_hartree.pending = false;
+  res_stats.hartree++;
+  return 1;
+}
+
+void pw_gpu_res_hartree_cancel_c(void) {
+  if (is_initialized && res_hartree.pending) {
+    offloadStreamSynchronize(stream);
+  }
+  res_hartree.pending = false;
 }
 
 /*******************************************************************************
