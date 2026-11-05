@@ -1,0 +1,644 @@
+!--------------------------------------------------------------------------------------------------!
+!   CP2K: A general program to perform molecular dynamics simulations                              !
+!   Copyright 2000-2026 CP2K developers group <https://cp2k.org>                                   !
+!                                                                                                  !
+!   SPDX-License-Identifier: GPL-2.0-or-later                                                      !
+!--------------------------------------------------------------------------------------------------!
+
+! **************************************************************************************************
+!> \brief Wrapper for ELPA
+!> \author Ole Schuett
+! **************************************************************************************************
+MODULE cp_fm_elpa
+   USE cp_log_handling, ONLY: cp_to_string
+   USE machine, ONLY: m_cpuid, &
+                      MACHINE_X86, &
+                      MACHINE_CPU_GENERIC, &
+                      MACHINE_X86_SSE4, &
+                      MACHINE_X86_AVX, &
+                      MACHINE_X86_AVX2
+   USE cp_blacs_env, ONLY: cp_blacs_env_type
+   USE cp_fm_basic_linalg, ONLY: cp_fm_uplo_to_full
+   USE cp_fm_diag_utils, ONLY: cp_fm_redistribute_start, &
+                               cp_fm_redistribute_end, &
+                               cp_fm_redistribute_info
+   USE cp_fm_struct, ONLY: cp_fm_struct_get
+   USE cp_fm_types, ONLY: cp_fm_type, &
+                          cp_fm_to_fm, &
+                          cp_fm_release, &
+                          cp_fm_create, &
+                          cp_fm_write_info
+   USE cp_log_handling, ONLY: cp_get_default_logger, &
+                              cp_logger_get_default_io_unit, &
+                              cp_logger_type
+   USE kinds, ONLY: default_string_length, dp
+   USE message_passing, ONLY: mp_comm_type, mp_para_env_type, mp_para_env_release
+   USE OMP_LIB, ONLY: omp_get_max_threads
+#if defined(__HAS_IEEE_EXCEPTIONS)
+   USE ieee_exceptions, ONLY: ieee_get_halting_mode, &
+                              ieee_set_halting_mode, &
+                              IEEE_ALL
+#endif
+#include "../base/base_uses.f90"
+
+#if defined(__ELPA)
+   USE elpa_constants, ONLY: ELPA_SOLVER_1STAGE, ELPA_SOLVER_2STAGE, ELPA_OK, &
+                             ELPA_2STAGE_REAL_INVALID, &
+                             ELPA_2STAGE_REAL_DEFAULT, &
+                             ELPA_2STAGE_REAL_GENERIC, &
+                             ELPA_2STAGE_REAL_GENERIC_SIMPLE, &
+                             ELPA_2STAGE_REAL_BGP, &
+                             ELPA_2STAGE_REAL_BGQ, &
+                             ELPA_2STAGE_REAL_SSE_ASSEMBLY, &
+                             ELPA_2STAGE_REAL_SSE_BLOCK2, &
+                             ELPA_2STAGE_REAL_SSE_BLOCK4, &
+                             ELPA_2STAGE_REAL_SSE_BLOCK6, &
+                             ELPA_2STAGE_REAL_AVX_BLOCK2, &
+                             ELPA_2STAGE_REAL_AVX_BLOCK4, &
+                             ELPA_2STAGE_REAL_AVX_BLOCK6, &
+                             ELPA_2STAGE_REAL_AVX2_BLOCK2, &
+                             ELPA_2STAGE_REAL_AVX2_BLOCK4, &
+                             ELPA_2STAGE_REAL_AVX2_BLOCK6, &
+                             ELPA_2STAGE_REAL_AVX512_BLOCK2, &
+                             ELPA_2STAGE_REAL_AVX512_BLOCK4, &
+                             ELPA_2STAGE_REAL_AVX512_BLOCK6, &
+                             ELPA_2STAGE_REAL_NVIDIA_GPU, &
+                             ELPA_2STAGE_REAL_AMD_GPU, &
+                             ELPA_2STAGE_REAL_INTEL_GPU_SYCL
+
+   USE elpa, ONLY: elpa_t, elpa_init, elpa_uninit, &
+                   elpa_allocate, elpa_deallocate
+#endif
+
+   IMPLICIT NONE
+
+   PRIVATE
+
+   CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'cp_fm_elpa'
+
+#if defined(__ELPA)
+   INTEGER, DIMENSION(21), PARAMETER :: elpa_kernel_ids = [ &
+                                        ELPA_2STAGE_REAL_INVALID, & ! auto
+                                        ELPA_2STAGE_REAL_GENERIC, &
+                                        ELPA_2STAGE_REAL_GENERIC_SIMPLE, &
+                                        ELPA_2STAGE_REAL_BGP, &
+                                        ELPA_2STAGE_REAL_BGQ, &
+                                        ELPA_2STAGE_REAL_SSE_ASSEMBLY, &
+                                        ELPA_2STAGE_REAL_SSE_BLOCK2, &
+                                        ELPA_2STAGE_REAL_SSE_BLOCK4, &
+                                        ELPA_2STAGE_REAL_SSE_BLOCK6, &
+                                        ELPA_2STAGE_REAL_AVX_BLOCK2, &
+                                        ELPA_2STAGE_REAL_AVX_BLOCK4, &
+                                        ELPA_2STAGE_REAL_AVX_BLOCK6, &
+                                        ELPA_2STAGE_REAL_AVX2_BLOCK2, &
+                                        ELPA_2STAGE_REAL_AVX2_BLOCK4, &
+                                        ELPA_2STAGE_REAL_AVX2_BLOCK6, &
+                                        ELPA_2STAGE_REAL_AVX512_BLOCK2, &
+                                        ELPA_2STAGE_REAL_AVX512_BLOCK4, &
+                                        ELPA_2STAGE_REAL_AVX512_BLOCK6, &
+                                        ELPA_2STAGE_REAL_NVIDIA_GPU, &
+                                        ELPA_2STAGE_REAL_AMD_GPU, &
+                                        ELPA_2STAGE_REAL_INTEL_GPU_SYCL]
+
+   CHARACTER(len=14), DIMENSION(SIZE(elpa_kernel_ids)), PARAMETER :: &
+      elpa_kernel_names = [CHARACTER(len=14) :: &
+                           "AUTO", &
+                           "GENERIC", &
+                           "GENERIC_SIMPLE", &
+                           "BGP", &
+                           "BGQ", &
+                           "SSE", &
+                           "SSE_BLOCK2", &
+                           "SSE_BLOCK4", &
+                           "SSE_BLOCK6", &
+                           "AVX_BLOCK2", &
+                           "AVX_BLOCK4", &
+                           "AVX_BLOCK6", &
+                           "AVX2_BLOCK2", &
+                           "AVX2_BLOCK4", &
+                           "AVX2_BLOCK6", &
+                           "AVX512_BLOCK2", &
+                           "AVX512_BLOCK4", &
+                           "AVX512_BLOCK6", &
+                           "NVIDIA_GPU", &
+                           "AMD_GPU", &
+                           "INTEL_GPU"]
+
+   CHARACTER(len=44), DIMENSION(SIZE(elpa_kernel_ids)), PARAMETER :: &
+      elpa_kernel_descriptions = [CHARACTER(len=44) :: &
+                                  "Automatically selected kernel", &
+                                  "Generic kernel", &
+                                  "Simplified generic kernel", &
+                                  "Kernel optimized for IBM BGP", &
+                                  "Kernel optimized for IBM BGQ", &
+                                  "Kernel optimized for x86_64/SSE", &
+                                  "Kernel optimized for x86_64/SSE (block=2)", &
+                                  "Kernel optimized for x86_64/SSE (block=4)", &
+                                  "Kernel optimized for x86_64/SSE (block=6)", &
+                                  "Kernel optimized for Intel AVX (block=2)", &
+                                  "Kernel optimized for Intel AVX (block=4)", &
+                                  "Kernel optimized for Intel AVX (block=6)", &
+                                  "Kernel optimized for Intel AVX2 (block=2)", &
+                                  "Kernel optimized for Intel AVX2 (block=4)", &
+                                  "Kernel optimized for Intel AVX2 (block=6)", &
+                                  "Kernel optimized for Intel AVX-512 (block=2)", &
+                                  "Kernel optimized for Intel AVX-512 (block=4)", &
+                                  "Kernel optimized for Intel AVX-512 (block=6)", &
+                                  "Kernel targeting Nvidia GPUs", &
+                                  "Kernel targeting AMD GPUs", &
+                                  "Kernel targeting Intel GPUs"]
+#else
+   INTEGER, DIMENSION(1), PARAMETER :: elpa_kernel_ids = [-1]
+   CHARACTER(len=14), DIMENSION(1), PARAMETER :: elpa_kernel_names = ["AUTO"]
+   CHARACTER(len=44), DIMENSION(1), PARAMETER :: elpa_kernel_descriptions = ["Automatically selected kernel"]
+#endif
+
+#if defined(__ELPA)
+   INTEGER, SAVE :: elpa_kernel = elpa_kernel_ids(1) ! auto
+   ! elpa_t is abstract; retain the polymorphic solver and its parent environment together.
+   CLASS(elpa_t), POINTER, SAVE :: cached_elpa_obj => NULL()
+   TYPE(mp_para_env_type), POINTER, SAVE :: cached_para_env => NULL()
+   INTEGER, SAVE :: cached_n = 0, cached_nblk = 0, cached_comm = 0, &
+                    cached_neig = 0, cached_n_rows = 0, cached_n_cols = 0, &
+                    cached_myprow = -1, cached_mypcol = -1, &
+                    cached_kernel = ELPA_2STAGE_REAL_INVALID, &
+                    cached_solver = 0, cached_omp_threads = 0
+#endif
+
+   ! elpa_qr_unsafe: disable block size limitations
+   LOGICAL, SAVE :: elpa_qr_unsafe = .TRUE., &
+                    elpa_print = .FALSE., &
+                    elpa_qr = .FALSE.
+
+#if defined(__OFFLOAD_OPENCL)
+   LOGICAL, SAVE :: elpa_one_stage = .TRUE.
+#else
+   LOGICAL, SAVE :: elpa_one_stage = .FALSE.
+#endif
+
+   PUBLIC :: cp_fm_diag_elpa, &
+             set_elpa_kernel, &
+             elpa_one_stage, &
+             elpa_print, &
+             elpa_qr, &
+             elpa_kernel_ids, &
+             elpa_kernel_names, &
+             elpa_kernel_descriptions, &
+             initialize_elpa_library, &
+             finalize_elpa_library
+
+CONTAINS
+
+! **************************************************************************************************
+!> \brief Initialize the ELPA library
+!> \param one_stage ...
+!> \param qr ...
+!> \param should_print flag that determines if additional information
+!>        is printed when the diagonalization routine is called.
+! **************************************************************************************************
+   SUBROUTINE initialize_elpa_library(one_stage, qr, should_print)
+      LOGICAL, INTENT(IN), OPTIONAL                      :: one_stage, qr, should_print
+
+#if defined(__ELPA)
+      IF (elpa_init(20180525) /= ELPA_OK) &
+         CPABORT("The linked ELPA library does not support the required API version")
+      IF (PRESENT(one_stage)) elpa_one_stage = one_stage
+      IF (PRESENT(should_print)) elpa_print = should_print
+      IF (PRESENT(qr)) elpa_qr = qr
+#else
+      MARK_USED(one_stage)
+      MARK_USED(qr)
+      MARK_USED(should_print)
+      CPABORT("Initialization of ELPA library requested but not enabled during build")
+#endif
+   END SUBROUTINE initialize_elpa_library
+
+! **************************************************************************************************
+!> \brief Finalize the ELPA library
+! **************************************************************************************************
+   SUBROUTINE finalize_elpa_library()
+#if defined(__ELPA)
+      CALL release_cached_elpa()
+      CALL elpa_uninit()
+#else
+      CPABORT("Finalization of ELPA library requested but not enabled during build")
+#endif
+   END SUBROUTINE finalize_elpa_library
+
+! **************************************************************************************************
+!> \brief Sets the active ELPA kernel.
+!> \param requested_kernel one of the elpa_kernel_ids
+! **************************************************************************************************
+   SUBROUTINE set_elpa_kernel(requested_kernel)
+      INTEGER, INTENT(IN)                                :: requested_kernel
+
+#if defined(__ELPA)
+      INTEGER                                            :: cpuid
+
+      elpa_kernel = requested_kernel
+
+      ! Resolve AUTO kernel.
+      IF (elpa_kernel == ELPA_2STAGE_REAL_INVALID) THEN
+         cpuid = m_cpuid()
+         IF ((MACHINE_CPU_GENERIC < cpuid) .AND. (cpuid <= MACHINE_X86)) THEN
+            SELECT CASE (cpuid)
+            CASE (MACHINE_X86_SSE4)
+               elpa_kernel = ELPA_2STAGE_REAL_SSE_BLOCK4
+            CASE (MACHINE_X86_AVX)
+               elpa_kernel = ELPA_2STAGE_REAL_AVX_BLOCK4
+            CASE (MACHINE_X86_AVX2)
+               elpa_kernel = ELPA_2STAGE_REAL_AVX2_BLOCK4
+            CASE DEFAULT
+               elpa_kernel = ELPA_2STAGE_REAL_AVX512_BLOCK4
+            END SELECT
+         END IF
+
+         ! Prefer GPU kernel if available.
+#if !defined(__NO_OFFLOAD_ELPA)
+#if defined(__OFFLOAD_CUDA)
+         elpa_kernel = ELPA_2STAGE_REAL_NVIDIA_GPU
+#endif
+#if defined(__OFFLOAD_HIP)
+         elpa_kernel = ELPA_2STAGE_REAL_AMD_GPU
+#endif
+#if defined(__OFFLOAD_OPENCL)
+         elpa_kernel = ELPA_2STAGE_REAL_INTEL_GPU_SYCL
+#endif
+#endif
+         ! If we could not find a suitable kernel then use ELPA_2STAGE_REAL_DEFAULT.
+         IF (elpa_kernel == ELPA_2STAGE_REAL_INVALID) THEN
+            elpa_kernel = ELPA_2STAGE_REAL_DEFAULT
+         END IF
+      END IF
+#else
+      MARK_USED(requested_kernel)
+#endif
+   END SUBROUTINE set_elpa_kernel
+
+! **************************************************************************************************
+!> \brief Driver routine to diagonalize a FM matrix with the ELPA library.
+!> \param matrix the matrix that is diagonalized
+!> \param eigenvectors eigenvectors of the input matrix
+!> \param eigenvalues eigenvalues of the input matrix
+! **************************************************************************************************
+   SUBROUTINE cp_fm_diag_elpa(matrix, eigenvectors, eigenvalues)
+      TYPE(cp_fm_type), INTENT(IN)          :: matrix, eigenvectors
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT) :: eigenvalues
+
+#if defined(__ELPA)
+      CHARACTER(len=*), PARAMETER :: routineN = 'cp_fm_diag_elpa'
+
+      INTEGER                                  :: handle
+      TYPE(cp_fm_type)                         :: eigenvectors_new, matrix_new
+      TYPE(cp_fm_redistribute_info)            :: rdinfo
+
+      CALL timeset(routineN, handle)
+
+      ! Determine if the input matrix needs to be redistributed before diagonalization.
+      ! Heuristics are used to determine the optimal number of CPUs for diagonalization.
+      ! The redistributed matrix is stored in matrix_new, which is just a pointer
+      ! to the original matrix if no redistribution is required.
+      ! With ELPA, we have to make sure that all processor columns have nonzero width
+      CALL cp_fm_redistribute_start(matrix, eigenvectors, matrix_new, eigenvectors_new, &
+                                    caller_is_elpa=.TRUE., redist_info=rdinfo)
+
+      ! Call ELPA on CPUs that hold the new matrix
+      IF (ASSOCIATED(matrix_new%matrix_struct)) &
+         CALL cp_fm_diag_elpa_base(matrix_new, eigenvectors_new, eigenvalues, rdinfo)
+
+      ! Redistribute results and clean up
+      CALL cp_fm_redistribute_end(matrix, eigenvectors, eigenvalues, matrix_new, eigenvectors_new)
+
+      CALL timestop(handle)
+#else
+      eigenvalues = 0
+      MARK_USED(matrix)
+      MARK_USED(eigenvectors)
+
+      CPABORT("CP2K compiled without the ELPA library.")
+#endif
+   END SUBROUTINE cp_fm_diag_elpa
+
+#if defined(__ELPA)
+! **************************************************************************************************
+!> \brief Release the cached solver before its parent communicator or ELPA is finalized.
+! **************************************************************************************************
+   SUBROUTINE release_cached_elpa()
+      INTEGER                                            :: success
+
+      IF (ASSOCIATED(cached_elpa_obj)) THEN
+         CALL elpa_deallocate(cached_elpa_obj, success)
+         CPASSERT(success == ELPA_OK)
+         NULLIFY (cached_elpa_obj)
+      END IF
+      CALL mp_para_env_release(cached_para_env)
+      cached_n = 0
+      cached_nblk = 0
+      cached_comm = 0
+   END SUBROUTINE release_cached_elpa
+
+! **************************************************************************************************
+!> \brief Actual routine that calls ELPA to diagonalize a FM matrix.
+!> \param matrix the matrix that is diagonalized
+!> \param eigenvectors eigenvectors of the input matrix
+!> \param eigenvalues eigenvalues of the input matrix
+!> \param rdinfo ...
+! **************************************************************************************************
+   SUBROUTINE cp_fm_diag_elpa_base(matrix, eigenvectors, eigenvalues, rdinfo)
+
+      TYPE(cp_fm_type), INTENT(IN)                       :: matrix, eigenvectors
+      REAL(KIND=dp), DIMENSION(:), INTENT(OUT)           :: eigenvalues
+      TYPE(cp_fm_redistribute_info), INTENT(IN)          :: rdinfo
+
+      CHARACTER(len=*), PARAMETER :: routineN = 'cp_fm_diag_elpa_base'
+
+      INTEGER                                            :: handle
+
+      CLASS(elpa_t), POINTER                   :: elpa_obj
+      CHARACTER(len=default_string_length)     :: kernel_name
+      TYPE(mp_comm_type) :: group
+      INTEGER                                  :: i, &
+                                                  mypcol, myprow, n, &
+                                                  n_rows, n_cols, &
+                                                  nblk, neig, io_unit, &
+                                                  success, comm, solver, nthreads, rebuild
+      LOGICAL                                  :: use_qr, check_eigenvalues, use_amd_gpu
+      REAL(KIND=dp), DIMENSION(:), ALLOCATABLE :: eval, eval_noqr
+      TYPE(cp_blacs_env_type), POINTER         :: context
+      TYPE(cp_fm_type)                         :: matrix_noqr, eigenvectors_noqr
+      TYPE(cp_logger_type), POINTER            :: logger
+      REAL(KIND=dp), PARAMETER                 :: th = 1.0E-14_dp
+      INTEGER, DIMENSION(:), POINTER           :: ncol_locals
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      LOGICAL, DIMENSION(5)                    :: halt
+#endif
+
+      CALL timeset(routineN, handle)
+      NULLIFY (logger)
+      NULLIFY (ncol_locals)
+
+      check_eigenvalues = .FALSE.
+
+      logger => cp_get_default_logger()
+      io_unit = cp_logger_get_default_io_unit(logger)
+
+      n = matrix%matrix_struct%nrow_global
+      context => matrix%matrix_struct%context
+      group = matrix%matrix_struct%para_env
+
+      myprow = context%mepos(1)
+      mypcol = context%mepos(2)
+
+      ! elpa needs the full matrix
+      CALL cp_fm_uplo_to_full(matrix, eigenvectors)
+
+      CALL cp_fm_struct_get(matrix%matrix_struct, &
+                            local_leading_dimension=n_rows, &
+                            ncol_local=n_cols, &
+                            nrow_block=nblk, &
+                            ncol_locals=ncol_locals)
+
+      ! ELPA will fail in 'solve_tridi', with no useful error message, fail earlier
+      IF (io_unit > 0 .AND. ANY(ncol_locals == 0)) THEN
+         CALL rdinfo%write(io_unit)
+         CALL cp_fm_write_info(matrix, io_unit)
+         CPABORT("ELPA [pre-fail]: Problem contains processor column with zero width.")
+      END IF
+
+      neig = SIZE(eigenvalues, 1)
+      ! Decide if matrix is suitable for ELPA to use QR
+      ! The definition of what is considered a suitable matrix depends on the ELPA version
+      ! The relevant ELPA files to check are
+      !     - Proper matrix order:  src/elpa2/elpa2_template.F90
+      !     - Proper block size:    test/Fortran/test.F90
+      ! Note that the names of these files might change in different ELPA versions
+      ! Matrix order must be even
+      use_qr = elpa_qr .AND. (MODULO(n, 2) == 0)
+      ! Matrix order and block size must be greater than or equal to 64
+      IF (.NOT. elpa_qr_unsafe) &
+         use_qr = use_qr .AND. (n >= 64) .AND. (nblk >= 64)
+
+      ! Check if eigenvalues computed with elpa_qr_unsafe should be verified
+      IF (use_qr .AND. elpa_qr_unsafe .AND. elpa_print) &
+         check_eigenvalues = .TRUE.
+
+      CALL matrix%matrix_struct%para_env%bcast(check_eigenvalues)
+
+      IF (check_eigenvalues) THEN
+         ! Allocate and initialize needed temporaries to compute eigenvalues without ELPA QR
+         ALLOCATE (eval_noqr(n))
+         CALL cp_fm_create(matrix=matrix_noqr, matrix_struct=matrix%matrix_struct)
+         CALL cp_fm_to_fm(matrix, matrix_noqr)
+         CALL cp_fm_create(matrix=eigenvectors_noqr, matrix_struct=eigenvectors%matrix_struct)
+         CALL cp_fm_uplo_to_full(matrix_noqr, eigenvectors_noqr)
+      END IF
+
+      IF (io_unit > 0 .AND. elpa_print) THEN
+         WRITE (UNIT=io_unit, FMT="(/,T2,A)") &
+            "ELPA| Matrix diagonalization information"
+
+         ! Find name for given kernel id.
+         ! In case of ELPA_2STAGE_REAL_DEFAULT was used it might not be in our elpa_kernel_ids list.
+         kernel_name = "id: "//TRIM(ADJUSTL(cp_to_string(elpa_kernel)))
+         DO i = 1, SIZE(elpa_kernel_ids)
+            IF (elpa_kernel_ids(i) == elpa_kernel) THEN
+               kernel_name = elpa_kernel_names(i)
+            END IF
+         END DO
+
+         WRITE (UNIT=io_unit, FMT="(T2,A,T71,I10)") &
+            "ELPA| Matrix order (NA) ", n, &
+            "ELPA| Matrix block size (NBLK) ", nblk, &
+            "ELPA| Number of eigenvectors (NEV) ", neig, &
+            "ELPA| Local rows (LOCAL_NROWS) ", n_rows, &
+            "ELPA| Local columns (LOCAL_NCOLS) ", n_cols
+         WRITE (UNIT=io_unit, FMT="(T2,A,T61,A20)") &
+            "ELPA| Kernel ", ADJUSTR(TRIM(kernel_name))
+         IF (elpa_qr) THEN
+            WRITE (UNIT=io_unit, FMT="(T2,A,T78,A3)") &
+               "ELPA| QR step requested ", "YES"
+         ELSE
+            WRITE (UNIT=io_unit, FMT="(T2,A,T79,A2)") &
+               "ELPA| QR step requested ", "NO"
+         END IF
+
+         IF (elpa_qr) THEN
+            IF (use_qr) THEN
+               WRITE (UNIT=io_unit, FMT="(T2,A,T78,A3)") &
+                  "ELPA| Matrix is suitable for QR ", "YES"
+            ELSE
+               WRITE (UNIT=io_unit, FMT="(T2,A,T79,A2)") &
+                  "ELPA| Matrix is suitable for QR ", "NO"
+            END IF
+            IF (.NOT. use_qr) THEN
+               IF (MODULO(n, 2) /= 0) THEN
+                  WRITE (UNIT=io_unit, FMT="(T2,A)") &
+                     "ELPA| Matrix order is NOT even"
+               END IF
+               IF ((nblk < 64) .AND. (.NOT. elpa_qr_unsafe)) THEN
+                  WRITE (UNIT=io_unit, FMT="(T2,A)") &
+                     "ELPA| Matrix block size is NOT 64 or greater"
+               END IF
+            ELSE
+               IF ((nblk < 64) .AND. elpa_qr_unsafe) THEN
+                  WRITE (UNIT=io_unit, FMT="(T2,A)") &
+                     "ELPA| Matrix block size check was bypassed"
+               END IF
+            END IF
+         END IF
+      END IF
+
+      ! the full eigenvalues vector is needed
+      ALLOCATE (eval(n))
+
+      comm = group%get_handle()
+      solver = MERGE(ELPA_SOLVER_1STAGE, ELPA_SOLVER_2STAGE, elpa_one_stage)
+      nthreads = omp_get_max_threads()
+      rebuild = 1
+      IF (ASSOCIATED(cached_elpa_obj)) THEN
+         IF (cached_n == n .AND. cached_nblk == nblk .AND. cached_comm == comm .AND. &
+             cached_neig == neig .AND. cached_n_rows == n_rows .AND. cached_n_cols == n_cols .AND. &
+             cached_myprow == myprow .AND. cached_mypcol == mypcol .AND. &
+             cached_kernel == elpa_kernel .AND. cached_solver == solver .AND. &
+             cached_omp_threads == nthreads) rebuild = 0
+      END IF
+      ! A changed local layout on any rank requires collective setup on all ranks.
+      CALL group%max(rebuild)
+
+      IF (rebuild /= 0) THEN
+         CALL release_cached_elpa()
+         cached_elpa_obj => elpa_allocate(success)
+         CPASSERT(success == ELPA_OK)
+         CPASSERT(ASSOCIATED(cached_elpa_obj))
+         elpa_obj => cached_elpa_obj
+
+         ! Keep the parent alive so MPI cannot recycle its handle while it is cached.
+         cached_para_env => matrix%matrix_struct%para_env
+         CALL cached_para_env%retain()
+
+         CALL elpa_obj%set("na", n, success)
+         CPASSERT(success == ELPA_OK)
+
+         CALL elpa_obj%set("nev", neig, success)
+         CPASSERT(success == ELPA_OK)
+
+         CALL elpa_obj%set("local_nrows", n_rows, success)
+         CPASSERT(success == ELPA_OK)
+
+         CALL elpa_obj%set("local_ncols", n_cols, success)
+         CPASSERT(success == ELPA_OK)
+
+         CALL elpa_obj%set("nblk", nblk, success)
+         CPASSERT(success == ELPA_OK)
+
+         CALL elpa_obj%set("mpi_comm_parent", comm, success)
+         CPASSERT(success == ELPA_OK)
+
+         CALL elpa_obj%set("process_row", myprow, success)
+         CPASSERT(success == ELPA_OK)
+
+         CALL elpa_obj%set("process_col", mypcol, success)
+         CPASSERT(success == ELPA_OK)
+
+         success = elpa_obj%setup()
+         CPASSERT(success == ELPA_OK)
+
+         CALL elpa_obj%set("solver", solver, success)
+         IF (success /= ELPA_OK) &
+            CPABORT("Setting solver for ELPA failed")
+
+         ! Enabling the GPU must happen before setting the kernel. Probe both ROCm flags
+         ! because the accepted options depend on the linked ELPA version and build.
+         use_amd_gpu = elpa_kernel == ELPA_2STAGE_REAL_AMD_GPU
+#if defined(__OFFLOAD_HIP)
+         use_amd_gpu = .TRUE.
+#endif
+         IF (use_amd_gpu) THEN
+            IF (elpa_obj%can_set("gpu", 1) == ELPA_OK) THEN
+               CALL elpa_obj%set("gpu", 1, success)
+               CPASSERT(success == ELPA_OK)
+            END IF
+            IF (elpa_obj%can_set("amd-gpu", 1) == ELPA_OK) THEN
+               CALL elpa_obj%set("amd-gpu", 1, success)
+               CPASSERT(success == ELPA_OK)
+            END IF
+         END IF
+         SELECT CASE (elpa_kernel)
+         CASE (ELPA_2STAGE_REAL_NVIDIA_GPU)
+            CALL elpa_obj%set("nvidia-gpu", 1, success)
+            CPASSERT(success == ELPA_OK)
+         CASE (ELPA_2STAGE_REAL_INTEL_GPU_SYCL)
+            CALL elpa_obj%set("intel-gpu", 1, success)
+            CPASSERT(success == ELPA_OK)
+         END SELECT
+
+         IF (.NOT. elpa_one_stage) THEN
+            CALL elpa_obj%set("real_kernel", elpa_kernel, success)
+            CPWARN_IF(success /= ELPA_OK, "Setting real_kernel for ELPA failed")
+         END IF
+
+         ! Set number of threads only when ELPA was built with OpenMP support.
+         IF (elpa_obj%can_set("omp_threads", nthreads) == ELPA_OK) THEN
+            CALL elpa_obj%set("omp_threads", nthreads, success)
+            CPASSERT(success == ELPA_OK)
+         END IF
+
+         cached_n = n
+         cached_nblk = nblk
+         cached_comm = comm
+         cached_neig = neig
+         cached_n_rows = n_rows
+         cached_n_cols = n_cols
+         cached_myprow = myprow
+         cached_mypcol = mypcol
+         cached_kernel = elpa_kernel
+         cached_solver = solver
+         cached_omp_threads = nthreads
+      END IF
+      elpa_obj => cached_elpa_obj
+
+      ! Reset QR for each solve, including after the diagnostic solve without QR below.
+      IF (.NOT. elpa_one_stage) THEN
+         CALL elpa_obj%set("qr", MERGE(1, 0, use_qr), success)
+         CPASSERT(success == ELPA_OK)
+      END IF
+
+      ! ELPA solver: calculate the Eigenvalues/vectors
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      CALL ieee_get_halting_mode(IEEE_ALL, halt)
+      CALL ieee_set_halting_mode(IEEE_ALL, .FALSE.)
+#endif
+      CALL elpa_obj%eigenvectors(matrix%local_data, eval, eigenvectors%local_data, success)
+#if defined(__HAS_IEEE_EXCEPTIONS)
+      CALL ieee_set_halting_mode(IEEE_ALL, halt)
+#endif
+
+      IF (success /= ELPA_OK) &
+         CPABORT("ELPA failed to diagonalize a matrix")
+
+      IF (check_eigenvalues) THEN
+         ! run again without QR
+         CALL elpa_obj%set("qr", 0, success)
+         CPASSERT(success == ELPA_OK)
+
+         CALL elpa_obj%eigenvectors(matrix_noqr%local_data, eval_noqr, eigenvectors_noqr%local_data, success)
+         IF (success /= ELPA_OK) &
+            CPABORT("ELPA failed to diagonalize a matrix even without QR decomposition")
+
+         IF (ANY(ABS(eval(1:neig) - eval_noqr(1:neig)) > th)) &
+            CPABORT("ELPA failed to calculate Eigenvalues with ELPA's QR decomposition")
+
+         DEALLOCATE (eval_noqr)
+         CALL cp_fm_release(matrix_noqr)
+         CALL cp_fm_release(eigenvectors_noqr)
+      END IF
+
+      eigenvalues(1:neig) = eval(1:neig)
+      DEALLOCATE (eval)
+
+      CALL timestop(handle)
+
+   END SUBROUTINE cp_fm_diag_elpa_base
+#endif
+
+END MODULE cp_fm_elpa
