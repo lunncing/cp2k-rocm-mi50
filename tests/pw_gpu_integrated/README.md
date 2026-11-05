@@ -172,12 +172,15 @@ to the existing memory budget and never overwrites the density.
 
 Before reading, modifying, or returning a lazy array to a pool, call
 `pw_gpu_res_ensure_host(pw)` (or the pointer variant for generic PW methods).
-Repeated calls do not transfer data again. Common PW host operations and CPU XC
-construction synchronize at entry. Borrowed density storage is also synchronized
-before XC overwrites it, memory reclamation frees it, or residency is invalidated;
-deferred access does not extend the lifetime of a host allocation. Consequently,
-these changes remove the eager density download boundary, but do not guarantee
-that a complete SCF step never needs a full density download.
+Repeated calls do not transfer data again. Common PW host operations synchronize
+their inputs, including the copies and standalone gradient used by CPU XC
+construction. Once XC consumes resident densities, borrowed-slot invalidation
+discards their dead contents without downloading them. A later iteration must
+produce new densities; host access after discard cannot recover the previous
+result. Explicit public invalidation at SCF/force boundaries materializes live
+lazy results before invalidating them. Memory reclamation also requests host
+copies before releasing live storage; deferred access does not extend the
+lifetime of a host allocation.
 
 The prepared Hartree/XC potential can be accepted with
 `pw_gpu_res_vtot_skip_host()`. The potential distributor then downloads its fine
@@ -186,11 +189,13 @@ host input before CPU fallback. The legacy prepare/host-AXPY/commit sequence is
 still supported.
 
 Tests cover both modes, one/two-map FFTs, complete density/Hartree/XC/potential
-chains, sampled downloads, cancellation and three reduction levels, exact and
-one-byte-short scratch budgets, explicit and concurrent host access, array
-identity, aliasing, invalidation and reclamation, and all three Fortran offload
-configurations with residency enabled/disabled. CPU mocks cannot establish MI50
-timings or full-system energy agreement; those require a CP2K HIP integration run.
+chains (XC downloads only the potential and energy), sampled downloads,
+cancellation and three reduction levels, exact and one-byte-short scratch budgets,
+explicit and concurrent host access, array identity, aliasing, discard without
+transfers, public invalidation, reclamation, standalone XC gradients, and all three
+Fortran offload configurations with residency enabled/disabled. CPU mocks cannot
+establish MI50 timings or full-system energy agreement; those require a CP2K HIP
+integration run.
 
 ## Source provenance and PBE maintenance
 

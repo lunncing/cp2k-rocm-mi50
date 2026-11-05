@@ -174,6 +174,7 @@ static void res_evict_all(void);
 static bool res_evict_one(void);
 static void res_invalidate_borrowed(void);
 static void res_print_stats(void);
+void pw_gpu_res_ensure_host_c(const int id, void *host_ptr);
 
 // Runtime switches, read once in pw_gpu_init().
 static bool opt_map_cache = true; // CP2K_PW_GPU_MAP_CACHE
@@ -318,7 +319,11 @@ static size_t xc_lo_bytes(const size_t total) {
 
 static void release_xc_buffer(void) {
   if (xc_dev == NULL) return;
-  res_invalidate_borrowed(); // synchronize lazy results before freeing storage
+  // Reclamation may evict live results, unlike reuse after their last consumer.
+  for (int id = 0; id <= RES_VXC; id++) {
+    pw_gpu_res_ensure_host_c(id, (void *)res[id].host);
+  }
+  res_invalidate_borrowed();
   offloadStreamSynchronize(stream);
   offloadStreamSynchronize(stream_copy);
   const size_t lo = xc_lo_bytes(allocated_xc_size);
@@ -706,12 +711,14 @@ void pw_gpu_res_ensure_host_c(const int id, void *host_ptr) {
 }
 
 static void res_invalidate(const int id) {
-  res_sync(id);
+  res[id].dev_authoritative = false;
   res[id].state = RES_INVALID;
   res[id].vtot = false;
 }
 
 static void res_invalidate_borrowed(void) {
+  // The old contents are dead when XC/density reuses these grids. Callers
+  // needing a host copy must request it before dropping the borrowed slots.
   for (int id = 0; id <= RES_VXC; id++) {
     res_invalidate(id);
   }
@@ -966,6 +973,8 @@ static double *res_lookup(const int id, const void *host, const size_t n,
   }
   s->misses++;
   if (s->host == host) {
+    // A layout mismatch can send a live lazy result to a host fallback.
+    pw_gpu_res_ensure_host_c(id, (void *)host);
     res_invalidate(id);
   }
   return NULL;
@@ -1053,7 +1062,9 @@ void pw_gpu_res_invalidate_c(void) {
   if (!is_initialized) {
     return;
   }
+  // The explicit SCF/forces boundary preserves live results for host consumers.
   for (int id = 0; id < RES_NSLOTS; id++) {
+    res_sync(id);
     res_invalidate(id);
   }
   res_hartree.pending = false;
@@ -2380,6 +2391,8 @@ void pw_gpu_sfffc_grad3(const double *zin, double *dout_1, double *dout_2,
     return;
   }
 
+  // CPU XC construction can reach this host-input path with a lazy density.
+  pw_gpu_res_ensure_host_c(RES_RHO_G, (void *)zin);
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
   const size_t gbuf_size = 2 * sizeof(double) * ngpts;

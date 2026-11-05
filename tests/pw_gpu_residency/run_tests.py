@@ -84,7 +84,7 @@ def main():
             n += 1
         print(f"PASS {n} Hermes C mock cases")
         cases = [(name, {"CP2K_PW_GPU_RES_LAZY_DENSITY": "0"}) for name in RES_CASES]
-        cases += [(name, {}) for name in ("lazy_density", "integrate", "chain", "lazy_vtot")]
+        cases += [(name, {}) for name in ("lazy_density", "integrate", "chain", "lazy_vtot", "borrowed")]
         for name, overrides in cases:
             for threads in ("1", "3"):
                 r = subprocess.run([str(exes["test_res"]), name],

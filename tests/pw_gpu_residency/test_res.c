@@ -418,11 +418,17 @@ static void chain(void) {
     same(ref_vh, vh, (size_t)nr, "chain v_h");
     assert(res[RES_RHO_G].hits == 1);
     up = mock_upload_bytes;
+    const size_t down = mock_download_bytes;
     assert(xc_call(rho_g, rho_r, vxc, &exc));
     same(ref_vxc, vxc, (size_t)nr, "chain vxc");
     same(&ref_exc, &exc, 1, "chain exc");
     // Neither density was uploaded again (only the g-vectors, first use).
     assert(mock_upload_bytes - up == sizeof(double) * 3 * (size_t)n);
+    // Consumed densities are discarded; only the potential and energy return.
+    assert(mock_download_bytes - down == sizeof(double) * ((size_t)nr + 1));
+    for (int id = RES_RHO_G; id <= RES_RHO_R; id++) {
+      assert(res[id].state == RES_INVALID && !res[id].dev_authoritative);
+    }
     assert(res[RES_RHO_R].hits == 1 && res[RES_VXC].state == RES_VALID);
     assert(pw_gpu_res_vtot_prepare_c(vh, vxc, (size_t)nr, h.dvol));
     if (opt_res_lazy_density) {
@@ -444,7 +450,11 @@ static void chain(void) {
     same(ref_vtot, vxc, (size_t)nr, "deferred host vtot");
 
     // A commit that disagrees with the device (e.g. an extra host term) is rejected.
+    // XC consumed the previous borrowed densities; create the next iteration.
+    assert(density_fused(r, rho_g, rho_r));
     assert(xc_call(rho_g, rho_r, vxc, &exc));
+    same(ref_vxc, vxc, (size_t)nr, "next iteration vxc");
+    same(&ref_exc, &exc, 1, "next iteration exc");
     assert(pw_gpu_res_vtot_prepare_c(vh, vxc, (size_t)nr, h.dvol));
     for (int i = 0; i < nr; i++) vxc[i] = vxc[i] * h.dvol + vh[i] + 1e-3;
     assert(!pw_gpu_res_vtot_commit_c(vxc, (size_t)nr));
@@ -468,8 +478,8 @@ static void chain(void) {
   }
 }
 
-// The real density FFT returns only samples. Synchronization is selective,
-// idempotent, and happens before invalidation or reclamation can lose data.
+// The real density FFT returns only samples. Explicit host synchronization and
+// public invalidation are idempotent; reclamation preserves live results.
 static void lazy_density(void) {
   for (int nmaps = 1; nmaps <= 2; nmaps++) {
     grids(nmaps);
@@ -514,11 +524,51 @@ static void lazy_density(void) {
     assert(mock_operation_count == 0);
     pw_gpu_res_invalidate_c();
     same(g, ref_g, 2 * (size_t)ng_[0], "lazy invalidate");
+    assert(mock_download_bytes == 2 * sizeof(double) * (size_t)ng_[0]);
+    // The public SCF/forces boundary must materialize both lazy densities.
+    memset(g, 0, sizeof(g));
+    memset(rr, 0, sizeof(rr));
     assert(density_fused(r, g, rr));
+    mock_reset_trace();
+    pw_gpu_res_invalidate_c();
+    assert(mock_download_bytes == sizeof(double) * (2 * (size_t)ng_[0] + (size_t)nr_[0]));
+    same(g, ref_g, 2 * (size_t)ng_[0], "public invalidate g");
+    same(rr, ref_r, (size_t)nr_[0], "public invalidate r");
+    mock_reset_trace();
+    pw_gpu_res_invalidate_c();
+    assert(mock_operation_count == 0);
+    // A mismatched layout still needs the original data for host fallback.
+    assert(density_fused(r, g, rr));
+    mock_reset_trace();
+    assert(!pw_gpu_res_matches_c(RES_RHO_R, rr, (size_t)nr_[0] - 1));
+    assert(mock_download_bytes == sizeof(double) * (size_t)nr_[0]);
+    assert(res[RES_RHO_G].dev_authoritative);
+    same(rr, ref_r, (size_t)nr_[0], "lazy layout fallback");
+    pw_gpu_res_invalidate_c();
+    // Reclamation must preserve a new result, not the previous host values.
+    r[0][0] += 0.5;
+    density_reference(r, ref_g, ref_r);
+    assert(density_fused(r, g, rr));
+    mock_reset_trace();
     release_xc_buffer();
+    assert(mock_download_bytes == sizeof(double) * (2 * (size_t)ng_[0] + (size_t)nr_[0]));
     same(g, ref_g, 2 * (size_t)ng_[0], "lazy reclaim g");
     same(rr, ref_r, (size_t)nr_[0], "lazy reclaim r");
     assert(!pw_gpu_res_integrate_r_c(&sum, 0.125));
+    // CPU XC construction can use the standalone gradient after rejecting the
+    // full pipeline. Its host input must be materialized at that consumer.
+    double grad[3][64], grad_ref[3][64];
+    pw_gpu_sfffc_grad3(ref_g, grad_ref[0], grad_ref[1], grad_ref[2], map_[0],
+                       g_fine, dims[0], ng_[0], nmaps, 1);
+    memset(g, 0, sizeof(g));
+    memset(rr, 0, sizeof(rr));
+    assert(density_fused(r, g, rr));
+    mock_reset_trace();
+    pw_gpu_sfffc_grad3(g, grad[0], grad[1], grad[2], map_[0],
+                       g_fine, dims[0], ng_[0], nmaps, 1);
+    for (int d = 0; d < 3; d++) same(grad[d], grad_ref[d], (size_t)nr_[0], "lazy XC gradient");
+    assert(mock_download_bytes == sizeof(double) * (2 * (size_t)ng_[0] + 3 * (size_t)nr_[0]));
+    assert(!res[RES_RHO_G].dev_authoritative && res[RES_RHO_R].dev_authoritative);
     // Disabling XC input reuse must synchronize before its host uploads.
     assert(density_fused(r, g, rr));
     opt_res_xcin = false;
@@ -673,18 +723,40 @@ static void memory(void) {
   hartree_free(&h);
 }
 
-// The XC grids holding borrowed slots are released under pressure.
+// Reuse discards dead borrowed densities without downloads; memory pressure
+// must still preserve live results before releasing their XC grids.
 static void borrowed(void) {
   grids(1);
   start(0);
   double *r[NLEV];
   for (int l = 0; l < NLEV; l++) r[l] = rarray((size_t)nr_[l]);
   double *rho_g = rarray(2 * (size_t)ng_[0]), *rho_r = rarray((size_t)nr_[0]);
+  double ref_g[128], ref_r[64], host_g[128], host_r[64];
+  density_reference(r, ref_g, ref_r);
+  assert(density_fused(r, rho_g, rho_r));
+  memcpy(host_g, rho_g, 2 * sizeof(double) * (size_t)ng_[0]);
+  memcpy(host_r, rho_r, sizeof(double) * (size_t)nr_[0]);
+  const unsigned long epoch = xc_epoch;
+  mock_reset_trace();
+  res_invalidate_borrowed();
+  assert(xc_epoch != epoch);
+  for (int id = 0; id <= RES_VXC; id++) {
+    assert(res[id].state == RES_INVALID && !res[id].dev_authoritative && !res[id].vtot);
+  }
+  // Discarded slots must not be resurrected or downloaded by later host access.
+  pw_gpu_res_ensure_host_c(RES_RHO_G, rho_g);
+  pw_gpu_res_ensure_host_c(RES_RHO_R, rho_r);
+  pw_gpu_res_invalidate_c();
+  assert(mock_operation_count == 0);
+  same(host_g, rho_g, 2 * (size_t)ng_[0], "discard leaves host g unchanged");
+  same(host_r, rho_r, (size_t)nr_[0], "discard leaves host r unchanged");
   assert(density_fused(r, rho_g, rho_r));
   max_gpu_memory_bytes = mock_limit = current_gpu_allocated_bytes;
   assert(pw_gpu_ensure_gbuf_c(allocated_gbuf_size + 64));
   assert(xc_dev == NULL);
   assert(res_lookup(RES_RHO_G, rho_g, (size_t)ng_[0], false) == NULL);
+  same(ref_g, rho_g, 2 * (size_t)ng_[0], "reclaim preserves g");
+  same(ref_r, rho_r, (size_t)nr_[0], "reclaim preserves r");
   accounting();
   finish();
   for (int l = 0; l < NLEV; l++) free(r[l]);
