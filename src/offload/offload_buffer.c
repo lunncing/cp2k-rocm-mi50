@@ -189,16 +189,18 @@ int offload_grid_bind(offload_buffer *buffer, double *device, const size_t bytes
 // synchronous fallback is also safe for CPU backends and Grid validation.
 void offload_grid_host(offload_buffer *buffer) {
   if (buffer == NULL || !buffer->grid_device_valid) return;
-#if defined(__OFFLOAD)
   double *device = offload_grid_device(buffer, buffer->grid_bytes);
-  assert(device != NULL && buffer->host_buffer != NULL);
-  offload_activate_chosen_device();
-  if (device != buffer->host_buffer) {
+  if (device != NULL && buffer->host_buffer != NULL && buffer->grid_bytes != 0) {
+    offload_activate_chosen_device();
     offloadMemcpyAsyncDtoH(buffer->host_buffer, device, buffer->grid_bytes, 0);
     offloadStreamSynchronize(0);
   }
-#endif
   offload_grid_prepare(buffer, 0);
+}
+
+void offload_device_synchronize(void) {
+  offload_activate_chosen_device();
+  offloadDeviceSynchronize();
 }
 
 // EOF
