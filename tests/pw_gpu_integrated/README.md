@@ -147,6 +147,51 @@ VRAM. Retained XC scratch can be reclaimed by other operations. Opaque FFT-libra
 workspaces and allocations from other CP2K components are outside this budget.
 These mocks do not replace a full CP2K build or CUDA/HIP integration run.
 
+## Stage 2 residency
+
+Run the residency suite (including ASan/UBSan and compiled Fortran bindings) with:
+
+```sh
+python3 tests/pw_gpu_residency/run_tests.py
+```
+
+`CP2K_PW_GPU_RES_LAZY_DENSITY` defaults to `1`. The electron-density collocation
+path downloads device-gathered fingerprints instead of the full real and complex
+arrays. `CP2K_PW_GPU_RES_LAZY_DENSITY=0` restores eager density downloads;
+`CP2K_PW_GPU_RES=0` disables residency entirely. Full verification mode
+(`CP2K_PW_GPU_RES_VERIFY=1`) retains eager density downloads for comparison.
+Derivative/response callers of `density_rs2pw` retain their host-visible contract
+unless they explicitly opt into deferred access.
+
+`pw_gpu_res_integrate_r(rho, total_rho)` checks the array identity and local grid
+before reducing the resident real density with the existing compensated device
+reduction. It downloads one scalar and preserves the electron-charge convention
+(`isign=-1`). An unsupported grid, missing residency, or insufficient reduction
+scratch leaves the CPU integration path available. Reduction scratch is charged
+to the existing memory budget and never overwrites the density.
+
+Before reading, modifying, or returning a lazy array to a pool, call
+`pw_gpu_res_ensure_host(pw)` (or the pointer variant for generic PW methods).
+Repeated calls do not transfer data again. Common PW host operations and CPU XC
+construction synchronize at entry. Borrowed density storage is also synchronized
+before XC overwrites it, memory reclamation frees it, or residency is invalidated;
+deferred access does not extend the lifetime of a host allocation. Consequently,
+these changes remove the eager density download boundary, but do not guarantee
+that a complete SCF step never needs a full density download.
+
+The prepared Hartree/XC potential can be accepted with
+`pw_gpu_res_vtot_skip_host()`. The potential distributor then downloads its fine
+grid directly from the resident sum, and failed device attempts synchronize the
+host input before CPU fallback. The legacy prepare/host-AXPY/commit sequence is
+still supported.
+
+Tests cover both modes, one/two-map FFTs, complete density/Hartree/XC/potential
+chains, sampled downloads, cancellation and three reduction levels, exact and
+one-byte-short scratch budgets, explicit and concurrent host access, array
+identity, aliasing, invalidation and reclamation, and all three Fortran offload
+configurations with residency enabled/disabled. CPU mocks cannot establish MI50
+timings or full-system energy agreement; those require a CP2K HIP integration run.
+
 ## Source provenance and PBE maintenance
 
 The supplied snapshot omitted the specification's two callers. `src/cp_ddapc_util.F`
@@ -155,6 +200,9 @@ and `src/xc/xc_pbe.F` were restored from CP2K upstream commit
 before adding the GPU calls. Their original CPU routines remain the numerical
 references in the tests. Other dependencies of these modules are stubbed, so this
 test suite does not constitute a full CP2K build.
+
+Stage 2 also restores `src/qs_collocate_density.F` from the same upstream commit,
+then adds the resident charge integration call and the deferred-density opt-in.
 
 `pw_gpu_pbe.h` is generated from the energy/first-derivative expression trees of
 `pbe_lda_calc`. Regenerate it with `python3 tests/pw_gpu_integrated/generate_pbe_kernel.py`

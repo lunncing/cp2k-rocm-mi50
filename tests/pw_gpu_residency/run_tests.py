@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PW GPU residency (stage 1) tests against the checked CPU mock (no GPU, no Fortran).
+"""PW GPU residency tests against the checked CPU mock (no GPU required).
 
 Builds the production src/pw/gpu C sources with ASan/UBSan and runs
   * Hermes's C cases from ../pw_gpu_integrated (must keep passing),
@@ -19,12 +19,14 @@ if not (HERMES / "mock_offload.c").is_file():
 sys.path.insert(0, str(HERMES))
 sys.dont_write_bytecode = True
 import run_tests as hermes  # noqa: E402
+from fortran_tests import run_fortran_tests  # noqa: E402
 
 RES_CASES = ["density", "density_rejects", "potential", "hartree", "chain", "memory",
              "borrowed", "samples", "verify"]
 
 
 def main():
+    hermes.source_checks()
     cc = os.environ.get("CC", "gcc").split()
     cxx = os.environ.get("CXX", "g++").split()
     blas = os.environ.get("BLAS_LIBS", "-lblas").split()
@@ -81,13 +83,17 @@ def main():
             assert "AddressSanitizer" not in r.stderr and "runtime error:" not in r.stderr, r.stderr
             n += 1
         print(f"PASS {n} Hermes C mock cases")
-        for name in RES_CASES:
+        cases = [(name, {"CP2K_PW_GPU_RES_LAZY_DENSITY": "0"}) for name in RES_CASES]
+        cases += [(name, {}) for name in ("lazy_density", "integrate", "chain", "lazy_vtot")]
+        for name, overrides in cases:
             for threads in ("1", "3"):
-                r = subprocess.run([str(exes["test_res"]), name], env=env | {"OMP_NUM_THREADS": threads},
+                r = subprocess.run([str(exes["test_res"]), name],
+                                   env=env | overrides | {"OMP_NUM_THREADS": threads},
                                    text=True, capture_output=True, timeout=120)
                 assert r.returncode == 0 and r.stdout.strip() == "PASS", (name, r.stdout, r.stderr)
                 assert "AddressSanitizer" not in r.stderr and "runtime error:" not in r.stderr, r.stderr
-            print(f"PASS residency {name} (OMP=1/3)")
+            print(f"PASS residency {name} ({'eager' if overrides else 'lazy'}, OMP=1/3)")
+        run_fortran_tests(build, cc, flags, inc, blas, env)
 
 
 if __name__ == "__main__":

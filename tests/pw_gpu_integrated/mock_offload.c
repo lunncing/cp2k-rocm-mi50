@@ -493,3 +493,37 @@ void pw_gpu_launch_xc_reduce(const double *values, double *partial, size_t n, of
   touch(values, n * sizeof(double)); touch(partial, pw_gpu_xc_reduce_size(n) * sizeof(double));
   for (size_t i = 0; i < columns; i++) pw_xc_sum_column(values, partial, n, i, columns);
 }
+
+#include "pw_gpu_res_ops.h"
+int mock_res_calls;
+void pw_gpu_launch_res_cmul(double *out, const double *a, const double *w,
+                            int width, size_t n, offloadStream_t s) {
+  if (!n) return;
+  begin_operation(MOCK_GRID_AXPY, s, out, 0);
+  touch(out, 2 * n * sizeof(double)); touch(a, 2 * n * sizeof(double));
+  touch(w, (size_t)width * n * sizeof(double));
+  for (size_t i = 0; i < n; i++) pw_res_cmul_elem(out, a, w, width, i);
+  mock_res_calls++;
+}
+void pw_gpu_launch_res_cdot_terms(const double *a, const double *b, double *p,
+                                  size_t n, offloadStream_t s) {
+  if (!n) return;
+  begin_operation(MOCK_GRID_COPY, s, p, 0);
+  touch(a, 2 * n * sizeof(double)); touch(b, 2 * n * sizeof(double));
+  touch(p, n * sizeof(double));
+  for (size_t i = 0; i < n; i++) p[i] = pw_res_cdot_term(a, b, i);
+  mock_res_calls++;
+}
+void pw_gpu_launch_res_sample(const double *x, double *out, size_t n, int width,
+                              offloadStream_t s) {
+  const size_t count = pw_res_sample_count(n);
+  if (!count) return;
+  begin_operation(MOCK_GRID_COPY, s, out, 0);
+  touch(x, (size_t)width * n * sizeof(double));
+  touch(out, (size_t)width * count * sizeof(double));
+  for (size_t k = 0; k < count; k++) {
+    const size_t e = pw_res_sample_index(k, n);
+    for (int c = 0; c < width; c++) out[(size_t)width * k + c] = x[(size_t)width * e + c];
+  }
+  mock_res_calls++;
+}

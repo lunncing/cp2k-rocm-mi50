@@ -8,6 +8,7 @@
 #:set type2type = lambda v,a,b: v if a[0]==b[0] else ('REAL('+v+',KIND=dp)' if b[0]=='r' &
                  & else 'CMPLX('+v+',0.0_dp,KIND=dp)')
 #define CPABORT(message) ERROR STOP message
+#define MARK_USED(value)
 MODULE grid_fixture
    USE ISO_C_BINDING
    USE ISO_FORTRAN_ENV, ONLY: int64
@@ -103,6 +104,18 @@ CONTAINS
          #:include "axpy.inc"
       #:endfor
    #:endfor
+   ! modify_hartree_pot references the device-resident variant (residency stage 1);
+   ! it is only called with the optional device_done argument, which these tests omit.
+   LOGICAL FUNCTION pw_gpu_res_hartree_modify(g0_delta, grid, positions, radii, cv, gcut2, vol) RESULT(done)
+      REAL(KIND=dp), INTENT(IN) :: g0_delta, gcut2, vol
+      TYPE(grid_type), INTENT(IN) :: grid
+      REAL(KIND=dp), DIMENSION(:, :), INTENT(IN) :: positions
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN) :: radii, cv
+      done = .FALSE.
+      IF (g0_delta == gcut2 .AND. vol < 0.0_dp .AND. grid%id_nr < 0 .AND. SIZE(positions) + SIZE(radii) + &
+          SIZE(cv) < 0) done = .TRUE.
+      ERROR STOP 'pw_gpu_res_hartree_modify is not used by these tests'
+   END FUNCTION
    #:include "pbe_lda_calc.inc"
    #:include "modify_hartree_pot.inc"
 END MODULE

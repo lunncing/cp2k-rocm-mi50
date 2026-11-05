@@ -25,6 +25,8 @@ RANK_NAMES = ("OMPI_COMM_WORLD_RANK", "PMI_RANK", "SLURM_PROCID", "MPI_LOCALRANK
 
 def source_checks() -> None:
     for name in ("src/input_cp2k_global.F", "src/pw/pw_gpu.F", "src/pw/pw_methods.F",
+                 "src/qs_collocate_density.F", "src/qs_ks_utils.F", "src/pw_env/rs_pw_interface.F",
+                 "tests/pw_gpu_residency/test_res_bindings.F",
                  "src/cp_ddapc_util.F", "src/xc/xc_pbe.F", "src/xc/xc.F", "tests/pw_gpu_integrated/test_grid_ops.F",
                  "tests/pw_gpu_integrated/test_pw_integral.F", "tests/pw_gpu_integrated/test_xc_pipeline.F"):
         lines = (ROOT / name).read_text().splitlines()

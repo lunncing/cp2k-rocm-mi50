@@ -9,8 +9,9 @@
 #:set dims = {'1': ':', '3': ':, :, :'}
 #:set shape = {'1': '257', '3': '7, 3, 5'}
 #define CPABORT(message) ERROR STOP message
+#define MARK_USED(value)
 MODULE integral_fixture
-   USE ISO_C_BINDING, ONLY: C_DOUBLE
+   USE ISO_C_BINDING, ONLY: C_DOUBLE, C_INT, C_PTR, C_LOC
    IMPLICIT NONE
    INTEGER, PARAMETER :: dp = C_DOUBLE, HALFSPACE = 1, PW_MODE_DISTRIBUTED = 2
    INTEGER, PARAMETER :: do_accurate_sum = 0, do_standard_sum = 1
@@ -45,6 +46,7 @@ MODULE integral_fixture
       MODULE PROCEDURE accurate_dot_1, accurate_dot_3
    END INTERFACE
 CONTAINS
+   #:include "res_host.inc"
    SUBROUTINE group_sum(self, value)
       CLASS(group_type), INTENT(INOUT) :: self
       REAL(KIND=dp), INTENT(INOUT) :: value

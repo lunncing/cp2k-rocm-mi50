@@ -23,6 +23,7 @@ MODULE rs_pw_interface
    USE pw_env_types,                    ONLY: pw_env_get,&
                                               pw_env_type
    USE pw_gpu,                          ONLY: pw_gpu_res_density,&
+                                              pw_gpu_res_ensure_host,&
                                               pw_gpu_res_potential
    USE pw_methods,                      ONLY: pw_axpy,&
                                               pw_copy,&
@@ -59,21 +60,24 @@ CONTAINS
 !> \param rs_rho ...
 !> \param rho ...
 !> \param rho_gspace ...
+!> \param defer_host Keep electron densities on device until a host consumer requests them.
 !> \note
 !>      should contain all communication in the collocation of the density
 !>      in the case of replicated grids
 ! **************************************************************************************************
-   SUBROUTINE density_rs2pw(pw_env, rs_rho, rho, rho_gspace)
+   SUBROUTINE density_rs2pw(pw_env, rs_rho, rho, rho_gspace, defer_host)
 
       TYPE(pw_env_type), INTENT(IN)                      :: pw_env
       TYPE(realspace_grid_type), DIMENSION(:), &
          INTENT(IN)                                      :: rs_rho
       TYPE(pw_r3d_rs_type), INTENT(INOUT)                :: rho
       TYPE(pw_c1d_gs_type), INTENT(INOUT)                :: rho_gspace
+      LOGICAL, INTENT(IN), OPTIONAL                     :: defer_host
 
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'density_rs2pw'
 
       INTEGER                                            :: handle, igrid_level, interp_kind
+      LOGICAL                                            :: lazy
       TYPE(gridlevel_info_type), POINTER                 :: gridlevel_info
       TYPE(pw_c1d_gs_type), ALLOCATABLE, DIMENSION(:)    :: mgrid_gspace
       TYPE(pw_pool_p_type), DIMENSION(:), POINTER        :: pw_pools
@@ -82,6 +86,8 @@ CONTAINS
          POINTER                                         :: rs_descs
 
       CALL timeset(routineN, handle)
+      lazy = .FALSE.
+      IF (PRESENT(defer_host)) lazy = defer_host
       NULLIFY (gridlevel_info, rs_descs, pw_pools)
       CALL pw_env_get(pw_env, rs_descs=rs_descs, pw_pools=pw_pools)
 
@@ -132,6 +138,12 @@ CONTAINS
                           "interpolator "// &
                           cp_to_string(interp_kind))
          END SELECT
+      END IF
+
+      ! Derivative and response callers keep the original host-visible contract.
+      IF (.NOT. lazy) THEN
+         CALL pw_gpu_res_ensure_host(rho)
+         CALL pw_gpu_res_ensure_host(rho_gspace)
       END IF
 
       ! *** give back the pw multi-grids
@@ -186,6 +198,7 @@ CONTAINS
          ! The same sequence on the GPU; the G-space multigrids never leave the device.
          IF (.NOT. pw_gpu_res_potential(v_rspace, mgrid_rspace(1:gridlevel_info%ngrid_levels), &
                                         auxbas_grid)) THEN
+            CALL pw_gpu_res_ensure_host(v_rspace)
             CALL pw_pools_create_pws(pw_pools, mgrid_gspace)
             CALL pw_transfer(v_rspace, mgrid_gspace(auxbas_grid))
             DO igrid_level = 1, gridlevel_info%ngrid_levels

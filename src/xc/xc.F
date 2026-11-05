@@ -35,7 +35,8 @@ MODULE xc
    USE kinds, ONLY: default_path_length, &
                     dp
    USE mathconstants, ONLY: pi
-   USE pw_gpu, ONLY: pw_gpu_filter_r3d, &
+   USE pw_gpu, ONLY: pw_gpu_res_ensure_host, &
+                     pw_gpu_filter_r3d, &
                      pw_gpu_fused_xc_available, &
                      pw_gpu_xc_full_pipeline, pw_gpu_xc_full_pipeline_available
    USE pw_grid_types, ONLY: PW_MODE_DISTRIBUTED, &
@@ -173,7 +174,7 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER :: routineN = 'xc_rho_set_and_dset_create'
 
-      INTEGER                                            :: handle, nspins
+      INTEGER                                            :: handle, ispin, nspins
       LOGICAL                                            :: lsd
       TYPE(xc_derivative_type), POINTER                  :: deriv_att
       TYPE(cp_sll_xc_deriv_type), POINTER                :: pos
@@ -186,6 +187,14 @@ CONTAINS
       CPASSERT(ASSOCIATED(pw_pool))
 
       nspins = SIZE(rho_r)
+      DO ispin = 1, nspins
+         CALL pw_gpu_res_ensure_host(rho_r(ispin))
+      END DO
+      IF (ASSOCIATED(rho_g)) THEN
+         DO ispin = 1, SIZE(rho_g)
+            CALL pw_gpu_res_ensure_host(rho_g(ispin))
+         END DO
+      END IF
       lsd = (nspins /= 1)
 
       xc_fun_sections => section_vals_get_subs_vals(xc_section, "XC_FUNCTIONAL")

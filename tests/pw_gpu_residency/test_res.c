@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-// Device residency (stage 1) against the original call sequences.
+// Device residency against the original call sequences and lazy host access.
 //
 // The reference for every fused path is the unfused sequence the Fortran code
 // executes: pw_gpu_cfffg_cached / pw_gpu_sfffc_cached (through the same mock
@@ -409,7 +409,7 @@ static void chain(void) {
     // ---- resident chain
     start(0);
     assert(density_fused(r, rho_g, rho_r));
-    same(ref_g, rho_g, 2 * (size_t)n, "chain rho_g");
+    if (!opt_res_lazy_density) same(ref_g, rho_g, 2 * (size_t)n, "chain rho_g");
     free(h.rho_g);
     h.rho_g = rho_g; // the host density array of the SCF
     double tot[2 * 64], vh[64], vxc[64], exc, e;
@@ -425,15 +425,23 @@ static void chain(void) {
     assert(mock_upload_bytes - up == sizeof(double) * 3 * (size_t)n);
     assert(res[RES_RHO_R].hits == 1 && res[RES_VXC].state == RES_VALID);
     assert(pw_gpu_res_vtot_prepare_c(vh, vxc, (size_t)nr, h.dvol));
-    for (int i = 0; i < nr; i++) vxc[i] = vxc[i] * h.dvol;
-    for (int i = 0; i < nr; i++) vxc[i] = vxc[i] + vh[i];
-    assert(pw_gpu_res_vtot_commit_c(vxc, (size_t)nr));
-    same(ref_vtot, vxc, (size_t)nr, "chain vtot");
+    if (opt_res_lazy_density) {
+      assert(pw_gpu_res_vtot_skip_host_c());
+      assert(pw_gpu_res_vtot_skip_host_c());
+      same(ref_vxc, vxc, (size_t)nr, "host AXPY skipped");
+    } else {
+      for (int i = 0; i < nr; i++) vxc[i] = vxc[i] * h.dvol;
+      for (int i = 0; i < nr; i++) vxc[i] = vxc[i] + vh[i];
+      assert(pw_gpu_res_vtot_commit_c(vxc, (size_t)nr));
+      same(ref_vtot, vxc, (size_t)nr, "chain vtot");
+    }
     up = mock_upload_bytes;
     assert(potential_fused(vxc, pot, rscale));
     assert(mock_upload_bytes == up); // V_H + dvol*Vxc was resident
     for (int l = 0; l < NLEV; l++) same(ref_pot[l], pot[l], (size_t)nr_[l], "chain potential");
     assert(res_stats.vtot == 1 && res_stats.potential == 1 && res_stats.xc_in == 1);
+    pw_gpu_res_ensure_host_c(RES_VXC, vxc);
+    same(ref_vtot, vxc, (size_t)nr, "deferred host vtot");
 
     // A commit that disagrees with the device (e.g. an extra host term) is rejected.
     assert(xc_call(rho_g, rho_r, vxc, &exc));
@@ -447,6 +455,7 @@ static void chain(void) {
 
     // Host modification of a resident density invalidates it.
     assert(density_fused(r, rho_g, rho_r));
+    pw_gpu_res_ensure_host_c(RES_RHO_R, rho_r);
     rho_r[0] += 1.0;
     up = mock_upload_bytes;
     assert(xc_call(rho_g, rho_r, vxc, &exc));
@@ -457,6 +466,168 @@ static void chain(void) {
     free(rho_r);
     hartree_free(&h);
   }
+}
+
+// The real density FFT returns only samples. Synchronization is selective,
+// idempotent, and happens before invalidation or reclamation can lose data.
+static void lazy_density(void) {
+  for (int nmaps = 1; nmaps <= 2; nmaps++) {
+    grids(nmaps);
+    start(0);
+    assert(opt_res_lazy_density);
+    double *r[NLEV];
+    for (int l = 0; l < NLEV; l++) r[l] = rarray((size_t)nr_[l]);
+    double g[128] = {0}, rr[64] = {0}, ref_g[128], ref_r[64];
+    density_reference(r, ref_g, ref_r);
+    mock_reset_trace();
+    assert(density_fused(r, g, rr));
+    for (int i = 0; i < 2 * ng_[0]; i++) assert(g[i] == 0.0);
+    for (int i = 0; i < nr_[0]; i++) assert(rr[i] == 0.0);
+    for (size_t i = 0; i < mock_operation_count; i++) {
+      if (mock_operations[i].kind == MOCK_DOWNLOAD)
+        assert(mock_operations[i].buffer == res_small_dev);
+    }
+    assert(res[RES_RHO_G].dev_authoritative && res[RES_RHO_R].dev_authoritative);
+    assert(res_samples_match(&res[RES_RHO_G], ref_g));
+    assert(res_samples_match(&res[RES_RHO_R], ref_r));
+    mock_reset_trace();
+    double sum = -123.0;
+    assert(pw_gpu_res_integrate_r_c(&sum, 0.125));
+    long double reference = 0.0L;
+    for (int i = 0; i < nr_[0]; i++) reference += ref_r[i];
+    assert(fabsl(sum - reference * 0.125L) < 1e-12L);
+    assert(mock_download_bytes == sizeof(double) && mock_upload_bytes == 0);
+    // Wrong ID/pointer and invalid IDs do not materialize either slot.
+    pw_gpu_res_ensure_host_c(RES_RHO_G, rr);
+    pw_gpu_res_ensure_host_c(RES_NSLOTS, g);
+    pw_gpu_res_ensure_host_c(-2, g);
+    pw_gpu_res_ensure_host_c(-1, NULL);
+    assert(res[RES_RHO_G].dev_authoritative && res[RES_RHO_R].dev_authoritative);
+    mock_reset_trace();
+    // Concurrent host consumers of a slice trigger only one download.
+#pragma omp parallel
+    pw_gpu_res_ensure_host_c(-1, rr + 1);
+    assert(mock_download_bytes == sizeof(double) * (size_t)nr_[0]);
+    same(rr, ref_r, (size_t)nr_[0], "lazy real sync");
+    mock_reset_trace();
+    pw_gpu_res_ensure_host_c(-1, rr);
+    assert(mock_operation_count == 0);
+    pw_gpu_res_invalidate_c();
+    same(g, ref_g, 2 * (size_t)ng_[0], "lazy invalidate");
+    assert(density_fused(r, g, rr));
+    release_xc_buffer();
+    same(g, ref_g, 2 * (size_t)ng_[0], "lazy reclaim g");
+    same(rr, ref_r, (size_t)nr_[0], "lazy reclaim r");
+    assert(!pw_gpu_res_integrate_r_c(&sum, 0.125));
+    // Disabling XC input reuse must synchronize before its host uploads.
+    assert(density_fused(r, g, rr));
+    opt_res_xcin = false;
+    double v[64], e, vref[64], eref;
+    assert(xc_call(g, rr, v, &e));
+    assert(xc_call(ref_g, ref_r, vref, &eref));
+    same(v, vref, (size_t)nr_[0], "lazy XC upload fallback");
+    same(&e, &eref, 1, "lazy XC energy");
+    finish();
+    for (int l = 0; l < NLEV; l++) free(r[l]);
+  }
+}
+
+// Large resident arrays exercise partial fingerprinting and three reduction
+// levels without the mock's deliberately slow direct DFT.
+static void integrate(void) {
+  const size_t sizes[] = {1, 255, 256, 257, 17409, 65537, 200003};
+  double total = 987.0;
+  assert(!pw_gpu_res_integrate_r_c(&total, 1.0) && total == 987.0);
+  for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+    const size_t n = sizes[k], bytes = n * sizeof(double);
+    double *values = malloc(bytes), *host = calloc(n, sizeof(double));
+    long double reference = 0.0L;
+    for (size_t i = 0; i < n; i++) {
+      values[i] = i % 4 == 0 ? 1e16 : i % 4 == 1 ? 0.25 : i % 4 == 2 ? -1e16 : 0.5;
+      reference += (long double)values[i];
+    }
+    start(0);
+    assert(pw_gpu_ensure_xc_c(4 * bytes));
+    offloadMemcpyAsyncHtoD(xc_dev_hi, values, bytes, stream);
+    assert(res_sample_buffer(&res[RES_RHO_R], pw_res_sample_count(n)));
+    double *small = res_small(pw_res_sample_count(n));
+    assert(small != NULL);
+    offloadStreamSynchronize(stream);
+    mock_reset_trace();
+    res_register_lazy(RES_RHO_R, host, n, 1, xc_dev_hi, small);
+    offloadStreamSynchronize(stream);
+    assert(mock_download_bytes == pw_res_sample_count(n) * sizeof(double));
+    assert(res_samples_match(&res[RES_RHO_R], values));
+    mock_reset_trace();
+    assert(pw_gpu_res_integrate_r_c(&total, -0.125));
+    assert(fabsl((long double)total + reference * 0.125L) < 1e-12L);
+    assert(mock_download_bytes == sizeof(double) && mock_upload_bytes == 0);
+    assert(host[0] == 0.0 && res[RES_RHO_R].dev_authoritative);
+    assert(!pw_gpu_res_matches_c(RES_RHO_R, values, n));
+    assert(pw_gpu_res_matches_c(RES_RHO_R, host, n));
+    assert(!pw_gpu_res_matches_c(RES_NSLOTS, host, n));
+    assert(!pw_gpu_res_integrate_r_c(NULL, 1.0));
+    assert(!pw_gpu_res_integrate_r_c(&total, NAN));
+    // Exact scratch budget, then one byte short: leave output unchanged and
+    // keep the density available for a CPU fallback with no allocation.
+    res_free_small();
+    max_gpu_memory_bytes = mock_limit = current_gpu_allocated_bytes + PW_GPU_MIB - 1;
+    total = 987.0;
+    assert(!pw_gpu_res_integrate_r_c(&total, 1.0) && total == 987.0);
+    assert(res[RES_RHO_R].dev_authoritative);
+    max_gpu_memory_bytes = mock_limit = current_gpu_allocated_bytes + PW_GPU_MIB;
+    assert(pw_gpu_res_integrate_r_c(&total, -0.125));
+    assert(fabsl((long double)total + reference * 0.125L) < 1e-12L);
+    pw_gpu_res_ensure_host_c(RES_RHO_R, host);
+    same(host, values, n, "reduction preserved rho");
+    host[0] += 16.0;
+    total = 987.0;
+    assert(!pw_gpu_res_integrate_r_c(&total, 1.0) && total == 987.0);
+    finish();
+    free(values); free(host);
+  }
+}
+
+static void lazy_vtot(void) {
+  grids(1);
+  start(0);
+  double rho_g[128] = {0}, rho_r[64], vxc[64], vh[64], exc;
+  double expected[64];
+  double *out[NLEV], *ref[NLEV];
+  const double scales[NLEV] = {1.0, 8.0, 0.5};
+  for (int l = 0; l < NLEV; l++) {
+    out[l] = rarray((size_t)nr_[l]);
+    ref[l] = rarray((size_t)nr_[l]);
+  }
+  for (int i = 0; i < nr_[0]; i++) { rho_r[i] = 0.5; vh[i] = rnd(); }
+  assert(!pw_gpu_res_vtot_skip_host_c());
+  for (int pass = 0; pass < 3; pass++) {
+    assert(xc_call(rho_g, rho_r, vxc, &exc));
+    for (int i = 0; i < nr_[0]; i++) expected[i] = 0.125 * vxc[i] + vh[i];
+    potential_reference(expected, ref, scales);
+    assert(pw_gpu_res_vtot_prepare_c(vh, vxc, (size_t)nr_[0], 0.125));
+    assert(pw_gpu_res_vtot_skip_host_c());
+    if (pass == 0) {
+      opt_res_pot = false; // failed device attempt must leave a usable host input
+      assert(!potential_fused(vxc, out, scales));
+      opt_res_pot = true;
+      same(vxc, expected, (size_t)nr_[0], "lazy potential fallback");
+    } else if (pass == 1) {
+      // The auxiliary output can alias the original potential.
+      double *saved = out[0];
+      out[0] = vxc;
+      assert(potential_fused(vxc, out, scales));
+      for (int l = 0; l < NLEV; l++) same(out[l], ref[l], (size_t)nr_[l], "lazy potential alias");
+      assert(!res[RES_VXC].dev_authoritative);
+      out[0] = saved;
+    } else {
+      // Lowering a live limit releases scratch only after preserving Vtot.
+      pw_gpu_set_memory_limit(1);
+      same(vxc, expected, (size_t)nr_[0], "lazy potential memory pressure");
+    }
+  }
+  finish();
+  for (int l = 0; l < NLEV; l++) { free(out[l]); free(ref[l]); }
 }
 
 // Memory: optional slots are skipped under a budget or without free memory,
@@ -569,6 +740,9 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[1], "borrowed")) borrowed();
   else if (!strcmp(argv[1], "samples")) samples();
   else if (!strcmp(argv[1], "verify")) verify();
+  else if (!strcmp(argv[1], "lazy_density")) lazy_density();
+  else if (!strcmp(argv[1], "integrate")) integrate();
+  else if (!strcmp(argv[1], "lazy_vtot")) lazy_vtot();
   else assert(!"unknown test");
   for (int l = 0; l < NLEV; l++) { free(map_[l]); free(gidx_[l]); }
   free(g_fine); free(gsq_fine);

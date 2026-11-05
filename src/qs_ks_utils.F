@@ -82,8 +82,9 @@ MODULE qs_ks_utils
                                               MIXED_PERIODIC_BC,&
                                               NEUMANN_BC,&
                                               PERIODIC_BC
-   USE pw_gpu,                          ONLY: pw_gpu_res_vtot_commit,&
-                                              pw_gpu_res_vtot_prepare
+   USE pw_gpu,                          ONLY: pw_gpu_res_ensure_host,&
+                                              pw_gpu_res_vtot_prepare,&
+                                              pw_gpu_res_vtot_skip_host
    USE pw_env_types,                    ONLY: pw_env_get,&
                                               pw_env_type
    USE pw_methods,                      ONLY: pw_axpy,&
@@ -1443,8 +1444,10 @@ CONTAINS
                vtot_device = .FALSE.
                IF (plain_sum) vtot_device = pw_gpu_res_vtot_prepare(v_rspace, v_rspace_new(ispin), &
                                                                     v_rspace_new(ispin)%pw_grid%dvol)
-               CALL pw_axpy(v_rspace, v_rspace_new(ispin), 1.0_dp, v_rspace_new(ispin)%pw_grid%dvol)
-               IF (vtot_device) vtot_device = pw_gpu_res_vtot_commit(v_rspace_new(ispin))
+               IF (vtot_device) vtot_device = pw_gpu_res_vtot_skip_host()
+               IF (.NOT. vtot_device) THEN
+                  CALL pw_axpy(v_rspace, v_rspace_new(ispin), 1.0_dp, v_rspace_new(ispin)%pw_grid%dvol)
+               END IF
             END IF ! gapw_xc
             IF (dft_control%qs_control%ddapc_explicit_potential) THEN
                IF (dft_control%qs_control%ddapc_restraint_is_spin) THEN
@@ -1563,6 +1566,7 @@ CONTAINS
                                        calculate_forces=calculate_forces, &
                                        gapw=gapw)
             END IF
+            CALL pw_gpu_res_ensure_host(v_rspace_new(ispin))
             CALL auxbas_pw_pool%give_back_pw(v_rspace_new(ispin))
          END DO ! ispin
 
@@ -1857,6 +1861,7 @@ CONTAINS
       do_zmp_read = dft_control%apply_external_vxc
       IF (do_zmp_read) THEN
          CALL pw_copy(qs_env%external_vxc, v_rspace_new(1))
+         CALL pw_gpu_res_ensure_host(rho_r(1))
          exc = accurate_dot_product(v_rspace_new(1)%array, rho_r(1)%array)* &
                v_rspace_new(1)%pw_grid%dvol
       ELSE

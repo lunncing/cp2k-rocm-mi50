@@ -143,6 +143,10 @@ int pw_gpu_remap_axpy_c(const double *x, double *y, size_t nx, size_t ny, int cx
 // chain is abandoned and the caller recomputes it on the original path).
 int pw_gpu_res_enabled_c(int what);
 void pw_gpu_res_invalidate_c(void);
+// Slot IDs: 0 RHO_G, 1 RHO_R, 2 VXC. -1 synchronizes any owner of host_ptr.
+void pw_gpu_res_ensure_host_c(int id, void *host_ptr);
+int pw_gpu_res_matches_c(int id, const void *host, size_t n);
+int pw_gpu_res_integrate_r_c(double *total_rho_out, double dvol);
 int pw_gpu_res_density_c(int nlevels, void *const *r_host, const int *npts,
     const int *ngpts, const int *nmaps, const int *grid_id, void *const *maps,
     void *const *gidx, const double *scale, const int *t_npts, int t_ngpts,
@@ -155,6 +159,7 @@ int pw_gpu_res_potential_c(const double *v_host, int nlevels, void *const *r_hos
 int pw_gpu_res_vtot_prepare_c(const double *vh_host, const double *vxc_host,
     size_t n, double dvol);
 int pw_gpu_res_vtot_commit_c(const double *vtot_host, size_t n);
+int pw_gpu_res_vtot_skip_host_c(void);
 int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host,
     const double *infl_host, double *rho_tot_host, size_t ngpts, size_t nprefix,
     const int *npts);

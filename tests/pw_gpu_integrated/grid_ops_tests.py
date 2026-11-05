@@ -26,6 +26,7 @@ def run_grid_ops_tests(build, compiler, flags, include, blas, env, sanitize):
     names = ["pw_gpu_copy", "pw_gpu_axpy", "pw_gpu_remap_copy", "pw_gpu_remap_axpy",
              "modify_hartree_pot_gpu", "pbe_lda_eval_gpu"]
     bindings = "\n".join(routine(wrapper, name, True) for name in names)
+    bindings += routine(wrapper, "pw_gpu_res_ensure_host_ptr")
     (build / "grid_bindings.inc").write_text(bindings)
     methods = (ROOT / "src/pw/pw_methods.F").read_text()
     for name in ("copy", "axpy"):

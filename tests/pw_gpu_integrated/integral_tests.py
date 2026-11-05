@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
+from grid_ops_tests import routine
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -15,6 +16,8 @@ def run_integral_tests(build, compiler, flags, include, blas, env, sanitize):
     import fypp
 
     source = (ROOT / "src/pw/pw_methods.F").read_text()
+    wrapper = (ROOT / "src/pw/pw_gpu.F").read_text()
+    (build / "res_host.inc").write_text(routine(wrapper, "pw_gpu_res_ensure_host_ptr"))
     template = re.search(
         r"^ *FUNCTION pw_integral_ab_\$\{kind\}.*?"
         r"^ *END FUNCTION pw_integral_ab_\$\{kind\}.*?$",

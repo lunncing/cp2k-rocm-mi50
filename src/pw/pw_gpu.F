@@ -63,9 +63,11 @@ MODULE pw_gpu
    PUBLIC :: modify_hartree_pot_gpu, pbe_lda_eval_gpu
    PUBLIC :: pw_gpu_res_enabled, pw_gpu_res_invalidate
    PUBLIC :: pw_gpu_res_density, pw_gpu_res_potential
+   PUBLIC :: pw_gpu_res_integrate_r, pw_gpu_res_ensure_host, pw_gpu_res_ensure_host_ptr
    PUBLIC :: pw_gpu_res_hartree_begin, pw_gpu_res_hartree_modify, pw_gpu_res_hartree_energy, &
              pw_gpu_res_hartree_finish, pw_gpu_res_hartree_cancel
    PUBLIC :: pw_gpu_res_vtot_prepare, pw_gpu_res_vtot_commit
+   PUBLIC :: pw_gpu_res_vtot_skip_host
    PUBLIC :: pw_gpu_res_density_id, pw_gpu_res_hartree_id, pw_gpu_res_xcin_id, pw_gpu_res_pot_id
 
    ! Residency features, see pw_gpu_res_enabled.
@@ -74,6 +76,10 @@ MODULE pw_gpu
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'pw_gpu'
    LOGICAL, PARAMETER, PRIVATE :: debug_this_module = .FALSE.
+
+   INTERFACE pw_gpu_res_ensure_host
+      MODULE PROCEDURE pw_gpu_res_ensure_host_r, pw_gpu_res_ensure_host_g
+   END INTERFACE
 
 CONTAINS
 
@@ -1498,6 +1504,84 @@ CONTAINS
 #endif
    END SUBROUTINE pw_gpu_res_invalidate
 
+! **************************************************************************************************
+!> \brief Materialize a lazy PW array before host access (also accepts an array slice).
+! **************************************************************************************************
+   SUBROUTINE pw_gpu_res_ensure_host_ptr(host)
+      TYPE(C_PTR), INTENT(IN) :: host
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTERFACE
+         SUBROUTINE pw_gpu_res_ensure_host_c(id, host) BIND(C, name="pw_gpu_res_ensure_host_c")
+            IMPORT :: C_INT, C_PTR
+            INTEGER(KIND=C_INT), VALUE :: id
+            TYPE(C_PTR), VALUE :: host
+         END SUBROUTINE pw_gpu_res_ensure_host_c
+      END INTERFACE
+      CALL pw_gpu_res_ensure_host_c(-1_C_INT, host)
+#else
+      MARK_USED(host)
+#endif
+   END SUBROUTINE pw_gpu_res_ensure_host_ptr
+
+! **************************************************************************************************
+!> \brief Synchronize a real-space density or potential before a host consumer uses it.
+! **************************************************************************************************
+   SUBROUTINE pw_gpu_res_ensure_host_r(pw)
+      TYPE(pw_r3d_rs_type), INTENT(IN) :: pw
+      IF (.NOT. ASSOCIATED(pw%array)) RETURN
+      IF (SIZE(pw%array) == 0) RETURN
+      CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
+   END SUBROUTINE pw_gpu_res_ensure_host_r
+
+! **************************************************************************************************
+!> \brief Synchronize a reciprocal-space density before a host consumer uses it.
+! **************************************************************************************************
+   SUBROUTINE pw_gpu_res_ensure_host_g(pw)
+      TYPE(pw_c1d_gs_type), INTENT(IN) :: pw
+      IF (.NOT. ASSOCIATED(pw%array)) RETURN
+      IF (SIZE(pw%array) == 0) RETURN
+      CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
+   END SUBROUTINE pw_gpu_res_ensure_host_g
+
+! **************************************************************************************************
+!> \brief Integrate the resident electron density with the isign=-1 charge convention.
+!>        Other arrays and distributed grids retain pw_integrate_function's CPU path.
+! **************************************************************************************************
+   FUNCTION pw_gpu_res_integrate_r(rho, total_rho) RESULT(done)
+      TYPE(pw_r3d_rs_type), INTENT(IN) :: rho
+      REAL(KIND=dp), INTENT(INOUT) :: total_rho
+      LOGICAL :: done
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTERFACE
+         FUNCTION pw_gpu_res_matches_c(id, host, n) BIND(C, name="pw_gpu_res_matches_c") RESULT(res)
+            IMPORT :: C_INT, C_PTR, C_SIZE_T
+            INTEGER(KIND=C_INT), VALUE :: id
+            TYPE(C_PTR), VALUE :: host
+            INTEGER(KIND=C_SIZE_T), VALUE :: n
+            INTEGER(KIND=C_INT) :: res
+         END FUNCTION pw_gpu_res_matches_c
+         FUNCTION pw_gpu_res_integrate_r_c(total, dvol) BIND(C, name="pw_gpu_res_integrate_r_c") RESULT(res)
+            IMPORT :: C_INT, C_DOUBLE
+            REAL(KIND=C_DOUBLE), INTENT(INOUT) :: total
+            REAL(KIND=C_DOUBLE), VALUE :: dvol
+            INTEGER(KIND=C_INT) :: res
+         END FUNCTION pw_gpu_res_integrate_r_c
+      END INTERFACE
+#endif
+
+      done = .FALSE.
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      IF (.NOT. pw_gpu_res_enabled(pw_gpu_res_density_id)) RETURN
+      IF (.NOT. res_grid_ok(rho%pw_grid)) RETURN
+      IF (.NOT. res_rs_ok(rho, rho%pw_grid)) RETURN
+      IF (pw_gpu_res_matches_c(1_C_INT, C_LOC(rho%array), SIZE(rho%array, KIND=C_SIZE_T)) == 0_C_INT) RETURN
+      done = pw_gpu_res_integrate_r_c(total_rho, -rho%pw_grid%dvol) /= 0_C_INT
+#else
+      MARK_USED(rho)
+      MARK_USED(total_rho)
+#endif
+   END FUNCTION pw_gpu_res_integrate_r
+
 #if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
 ! **************************************************************************************************
 !> \brief A replicated, non-spherical grid with a contiguous one- or two-sided g_hatmap.
@@ -1971,6 +2055,24 @@ CONTAINS
       done = .FALSE.
 #endif
    END FUNCTION pw_gpu_res_vtot_prepare
+
+! **************************************************************************************************
+!> \brief Accept the prepared device sum and defer host synchronization until first use.
+! **************************************************************************************************
+   FUNCTION pw_gpu_res_vtot_skip_host() RESULT(done)
+      LOGICAL :: done
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTERFACE
+         FUNCTION pw_gpu_res_vtot_skip_host_c() BIND(C, name="pw_gpu_res_vtot_skip_host_c") RESULT(res)
+            IMPORT :: C_INT
+            INTEGER(KIND=C_INT) :: res
+         END FUNCTION pw_gpu_res_vtot_skip_host_c
+      END INTERFACE
+      done = pw_gpu_res_vtot_skip_host_c() /= 0_C_INT
+#else
+      done = .FALSE.
+#endif
+   END FUNCTION pw_gpu_res_vtot_skip_host
 
 ! **************************************************************************************************
 !> \brief To be called right after that pw_axpy: keeps the device sum if it equals the host result.

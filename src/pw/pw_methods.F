@@ -24,6 +24,7 @@
 ! **************************************************************************************************
 MODULE pw_methods
    #:include "pw_types.fypp"
+   USE ISO_C_BINDING, ONLY: C_LOC
    USE cp_log_handling, ONLY: cp_logger_get_default_io_unit, &
                               cp_to_string
    USE fft_tools, ONLY: BWFFT, &
@@ -41,7 +42,8 @@ MODULE pw_methods
                       pw_fpga_init_bitstream, &
                       pw_fpga_r3dc1d_3d_dp, &
                       pw_fpga_r3dc1d_3d_sp
-   USE pw_gpu, ONLY: pw_gpu_c1dr3d_3d, &
+   USE pw_gpu, ONLY: pw_gpu_res_ensure_host_ptr, &
+                     pw_gpu_c1dr3d_3d, &
                      pw_gpu_c1dr3d_3d_ps, &
                      pw_gpu_r3dc1d_3d, &
                      pw_gpu_r3dc1d_3d_ps
@@ -245,6 +247,8 @@ CONTAINS
 
             INTEGER                                            :: handle
 
+            CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
+
             CALL timeset(routineN, handle)
 
 #if !defined(__INTEL_LLVM_COMPILER) || (20250000 <= __INTEL_LLVM_COMPILER)
@@ -274,6 +278,8 @@ CONTAINS
             CHARACTER(len=*), PARAMETER                        :: routineN = 'pw_scale'
 
             INTEGER                                            :: handle
+
+            CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
             CALL timeset(routineN, handle)
 
@@ -336,6 +342,8 @@ CONTAINS
 
             INTEGER                                            :: iop
 
+            CALL pw_gpu_res_ensure_host_ptr(C_LOC(fun%array))
+
             iop = 0
 
             IF (PRESENT(oprt)) THEN
@@ -391,6 +399,8 @@ CONTAINS
 
             INTEGER                                            :: handle
 
+            CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
+
             CALL timeset(routineN, handle)
 
 !$OMP PARALLEL WORKSHARE DEFAULT(NONE) SHARED(pw,value)
@@ -418,6 +428,8 @@ CONTAINS
             CHARACTER(len=*), PARAMETER                        :: routineN = 'pw_gather_p'
 
             INTEGER                                            :: gpt, handle, l, m, mn, n
+
+            CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
             CALL timeset(routineN, handle)
 
@@ -474,6 +486,8 @@ CONTAINS
             CHARACTER(len=*), PARAMETER                        :: routineN = 'pw_scatter_p'
 
             INTEGER                                            :: gpt, handle, l, m, mn, n
+
+            CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
             CALL timeset(routineN, handle)
 
@@ -579,6 +593,9 @@ CONTAINS
             #:if kind[1:]=='1d'
                INTEGER :: i, j, ng, ng1, ng2, ns
             #:endif
+
+            CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw1%array))
+            CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw2%array))
 
             CALL timeset(routineN, handle)
 
@@ -692,6 +709,8 @@ CONTAINS
 
             INTEGER                                            :: handle
 
+            CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
+
             CALL timeset(routineN, handle)
 
             #:if kind[1]=="1"
@@ -719,6 +738,8 @@ CONTAINS
             CHARACTER(len=*), PARAMETER :: routineN = 'pw_copy_from_array'
 
             INTEGER                                            :: handle
+
+            CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
             CALL timeset(routineN, handle)
 
@@ -760,6 +781,9 @@ CONTAINS
             #:if kind[1]=='1'
                INTEGER                                            :: i, j, ng, ng1, ng2
             #:endif
+
+            CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw1%array))
+            CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw2%array))
 
             CALL timeset(routineN, handle)
 
@@ -945,6 +969,10 @@ CONTAINS
                      INTEGER                                            :: handle
                      REAL(KIND=dp)                                      :: my_alpha
 
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw_out%array))
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw1%array))
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw2%array))
+
                      CALL timeset(routineN, handle)
 
                      my_alpha = 1.0_dp
@@ -987,6 +1015,9 @@ CONTAINS
                      CHARACTER(LEN=*), PARAMETER                        :: routineN = 'pw_multiply_with'
 
                      INTEGER                                            :: handle
+
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw1%array))
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw2%array))
 
                      CALL timeset(routineN, handle)
 
@@ -1042,6 +1073,9 @@ CONTAINS
                            END FUNCTION pw_cpu_dot_complex_c
                         END INTERFACE
                      #:endif
+
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw1%array))
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw2%array))
 
                      CALL timeset(routineN, handle)
 
@@ -1156,6 +1190,9 @@ CONTAINS
 
                            INTEGER                                            :: handle
 
+                           CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw1%array))
+                           CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw2%array))
+
                            CALL timeset(routineN, handle)
 
                            IF (.NOT. ASSOCIATED(pw1%pw_grid, pw2%pw_grid)) THEN
@@ -1227,6 +1264,9 @@ CONTAINS
                                  #:endif
                                  INTEGER, DIMENSION(:), POINTER                     :: n
                                  LOGICAL                                            :: test
+
+                                 CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw1%array))
+                                 CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw2%array))
 
                                  CALL timeset(routineN, handle2)
                                  out_unit = cp_logger_get_default_io_unit()
@@ -1540,6 +1580,9 @@ CONTAINS
                            TYPE(pw_${kind}$_gs_type), INTENT(INOUT)   :: pw2
                            REAL(KIND=dp), INTENT(IN), OPTIONAL                :: scale
 
+                           CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw1%array))
+                           CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw2%array))
+
                            CALL pw_gather_s_${kind}$_${kind2}$ (pw2, pw1%array, scale)
 
                         END SUBROUTINE pw_gather_s_${kind}$_${kind2}$_2
@@ -1562,6 +1605,8 @@ CONTAINS
                            CHARACTER(len=*), PARAMETER                        :: routineN = 'pw_gather_s'
 
                            INTEGER                                            :: gpt, handle, l, m, n
+
+                           CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
                            CALL timeset(routineN, handle)
 
@@ -1609,6 +1654,9 @@ CONTAINS
                            TYPE(pw_${kind2}$_gs_type), INTENT(INOUT)               :: pw2
                            REAL(KIND=dp), INTENT(IN), OPTIONAL                :: scale
 
+                           CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw1%array))
+                           CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw2%array))
+
                            CALL pw_scatter_s_${kind}$_${kind2}$ (pw1, pw2%array, scale)
 
                         END SUBROUTINE pw_scatter_s_${kind}$_${kind2}$_2
@@ -1631,6 +1679,8 @@ CONTAINS
                            CHARACTER(len=*), PARAMETER                        :: routineN = 'pw_scatter_s'
 
                            INTEGER                                            :: gpt, handle, l, m, n
+
+                           CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
                            CALL timeset(routineN, handle)
 
@@ -1724,6 +1774,8 @@ CONTAINS
                      INTEGER                                            :: handle, i
                      REAL(KIND=dp)                                      :: omega_2, tmp
 
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
+
                      CALL timeset(routineN, handle)
                      CPASSERT(omega >= 0)
 
@@ -1757,6 +1809,8 @@ CONTAINS
 
                      INTEGER                                            :: handle, i
                      REAL(KIND=dp)                                      :: omega_2, tmp
+
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
                      CALL timeset(routineN, handle)
                      CPASSERT(omega >= 0)
@@ -1797,6 +1851,8 @@ CONTAINS
                      INTEGER                                            :: cnt, handle, i
                      REAL(KIND=dp)                                      :: omega_2, tmp, tmp2
 
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
+
                      CALL timeset(routineN, handle)
 
                      omega_2 = omega*omega
@@ -1835,6 +1891,8 @@ CONTAINS
 
                      INTEGER                                            :: handle, i
                      REAL(KIND=dp)                                      :: omega_2, tmp, tmp2
+
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
                      CALL timeset(routineN, handle)
 
@@ -1884,6 +1942,8 @@ CONTAINS
                      INTEGER                                            :: handle, i
                      REAL(KIND=dp)                                      :: omega_2, tmp
 
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
+
                      CALL timeset(routineN, handle)
 
                      omega_2 = omega*omega
@@ -1918,6 +1978,8 @@ CONTAINS
 
                      INTEGER                                            :: handle, i
                      REAL(KIND=dp)                                      :: omega_2, tmp, tmp2
+
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
                      CALL timeset(routineN, handle)
 
@@ -1960,6 +2022,8 @@ CONTAINS
                      INTEGER                                            :: handle, i
                      REAL(KIND=dp)                                      :: tmp, tmp2
 
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
+
                      CALL timeset(routineN, handle)
                      CPASSERT(rcutoff >= 0)
 
@@ -1995,6 +2059,8 @@ CONTAINS
 
                      INTEGER                                            :: handle, i
                      REAL(KIND=dp)                                      :: rchalf, tmp, tmp2
+
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
                      CALL timeset(routineN, handle)
                      CPASSERT(rcutoff >= 0)
@@ -2037,6 +2103,8 @@ CONTAINS
 
                      COMPLEX(KIND=dp)                                   :: im
                      INTEGER                                            :: handle, m, idx, idir
+
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
                      CALL timeset(routineN, handle)
 
@@ -2091,6 +2159,8 @@ CONTAINS
 
                      INTEGER                                            :: handle
 
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
+
                      CALL timeset(routineN, handle)
 
 !$OMP PARALLEL WORKSHARE DEFAULT(NONE) SHARED(pw)
@@ -2121,6 +2191,8 @@ CONTAINS
 
                      INTEGER                                            :: cnt, handle, ig
                      REAL(KIND=dp)                                      :: gg, o3
+
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
                      CALL timeset(routineN, handle)
 
@@ -2168,6 +2240,8 @@ CONTAINS
                      INTEGER                                            :: cnt, handle, ig
                      REAL(KIND=dp)                                      :: gg, o3
                      CHARACTER(len=*), PARAMETER                        :: routineN = 'pw_dr2_gg'
+
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
                      CALL timeset(routineN, handle)
 
@@ -2217,6 +2291,8 @@ CONTAINS
 
                      INTEGER                                            :: cnt, handle, ig
                      REAL(KIND=dp)                                      :: arg, f
+
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(pw%array))
 
                      CALL timeset(routineN, handle)
 
@@ -2275,6 +2351,8 @@ CONTAINS
 
                      INTEGER                                            :: cnt, handle, ig
                      REAL(KIND=dp)                                      :: arg
+
+                     CALL pw_gpu_res_ensure_host_ptr(C_LOC(sf%array))
 
                      CALL timeset(routineN, handle)
 
