@@ -98,6 +98,12 @@ static grid_cache_entry *protected_grid_entry = NULL;
 static double *gbuf_dev;
 static size_t allocated_gbuf_size;
 
+// Four real grids: three gradients (later divergence inputs) and dE/drho.
+// The two shared complex buffers hold rho/norm and FFT/e0/dE/dnorm by lifetime.
+static double *xc_dev;
+static size_t allocated_xc_size;
+static bool protected_xc_buffer = false;
+
 // Runtime switches, read once in pw_gpu_init().
 static bool opt_map_cache = true; // CP2K_PW_GPU_MAP_CACHE
 static bool opt_fused_xc = true;  // CP2K_PW_GPU_FUSED_XC
@@ -233,6 +239,14 @@ static void grid_cache_clear_entry(grid_cache_entry *e) {
   memset(e, 0, sizeof(grid_cache_entry));
 }
 
+static void release_xc_buffer(void) {
+  if (xc_dev == NULL) return;
+  offloadStreamSynchronize(stream);
+  device_free(xc_dev, allocated_xc_size);
+  xc_dev = NULL;
+  allocated_xc_size = 0;
+}
+
 static int check_and_reclaim_memory(const size_t required_bytes) {
   read_memory_environment();
   if (max_gpu_memory_bytes == 0) {
@@ -242,6 +256,10 @@ static int check_and_reclaim_memory(const size_t required_bytes) {
          required_bytes > max_gpu_memory_bytes - current_gpu_allocated_bytes) {
     if (allocated_buffer_size_b != 0) {
       release_double_buffers();
+      continue;
+    }
+    if (xc_dev != NULL && !protected_xc_buffer) {
+      release_xc_buffer();
       continue;
     }
     grid_cache_entry *oldest = NULL;
@@ -282,6 +300,7 @@ static void release_work_buffers(void) {
   offloadStreamSynchronize(stream);
   offloadStreamSynchronize(stream_copy);
   release_double_buffers();
+  release_xc_buffer();
   device_free(buffer_dev_1, allocated_buffer_size);
   device_free(buffer_dev_2, allocated_buffer_size);
   device_free(ghatmap_dev, allocated_map_size);
@@ -342,6 +361,7 @@ void pw_gpu_init(void) {
   // Lazy allocation keeps initialization within even the smallest budget.
   allocated_buffer_size = allocated_map_size = allocated_gbuf_size = 0;
   allocated_buffer_size_b = 0;
+  allocated_xc_size = 0;
   current_gpu_allocated_bytes = peak_gpu_allocated_bytes = 0;
   offload_activate_chosen_device();
 
@@ -505,6 +525,21 @@ static int pw_gpu_ensure_gbuf_c(const size_t requested_size) {
     device_free(gbuf_dev, allocated_gbuf_size);
     device_malloc((void **)&gbuf_dev, requested_size);
     allocated_gbuf_size = requested_size;
+  }
+  return 1;
+}
+
+static int pw_gpu_ensure_xc_c(const size_t requested_size) {
+  const size_t growth = requested_size > allocated_xc_size
+                            ? requested_size - allocated_xc_size : 0;
+  protected_xc_buffer = true;
+  const int fits = check_and_reclaim_memory(growth);
+  protected_xc_buffer = false;
+  if (!fits) return memory_limit_exceeded();
+  if (growth) {
+    release_xc_buffer();
+    device_malloc((void **)&xc_dev, requested_size);
+    allocated_xc_size = requested_size;
   }
   return 1;
 }
@@ -870,6 +905,144 @@ static void fft_3d(const int direction, const int nx, const int ny,
   }
 
   offload_fftExecZ2Z(*plan, data, data, direction);
+}
+
+int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
+    const double *din_rho_r, double *dout_vxc_r, double *exc_out,
+    const int *ghatmap, const double *g, const int *npts, int ngpts, int nmaps,
+    double scale, int grid_id, double epsilon_rho, double kappa, double beta,
+    double mu, double scale_ec, double scale_ex, double gradient_cutoff,
+    double smooth_range, int spherical) {
+  if (!is_initialized || !opt_fused_xc || omp_get_num_threads() != 1) return 0;
+  if (npts == NULL || exc_out == NULL || ngpts < 0 ||
+      (nmaps != 1 && nmaps != 2) || grid_id <= 0 ||
+      !isfinite(gradient_cutoff) || gradient_cutoff < 0.0) return 0;
+  size_t nr = 1;
+  for (int d = 0; d < 3; d++) {
+    if (npts[d] < 0) return 0;
+    // Existing FFT conversion/map kernels use int for doubled indices.
+    if (npts[d] != 0 && nr > (size_t)(INT_MAX / 2) / (size_t)npts[d])
+      return memory_limit_exceeded();
+    nr *= (size_t)npts[d];
+  }
+  if ((size_t)ngpts > nr) return 0;
+  if (nr == 0) {
+    *exc_out = 0.0;
+    return 1;
+  }
+  if (nr > SIZE_MAX / (8 * sizeof(double))) return memory_limit_exceeded();
+  if (din_rho_r == NULL || dout_vxc_r == NULL ||
+      (ngpts && (zin_rho_g == NULL || ghatmap == NULL || g == NULL))) return 0;
+  const int nrpts = (int)nr;
+  const size_t real_size = sizeof(double) * nr;
+  const size_t buffer_size = 2 * real_size;
+  const size_t gbuf_size = 2 * sizeof(double) * (size_t)ngpts;
+  offload_activate_chosen_device();
+
+  // Reserve every required byte before consuming inputs or changing outputs.
+  // Optional dual-stream scratch and inactive grids can be reclaimed. Pin the
+  // active map while reserving the four real XC grids.
+  if (!pw_gpu_ensure_buffer_c(buffer_size, 0, false) ||
+      !pw_gpu_ensure_gbuf_c(gbuf_size)) return 0;
+  grid_cache_entry *entry = NULL;
+  const double *g_dev = NULL;
+  if (ngpts) {
+    if (!opt_map_cache) pw_gpu_grid_invalidate(grid_id);
+    entry = grid_cache_lookup_or_upload(grid_id, ghatmap, ngpts, nmaps);
+    if (entry == NULL || (g_dev = grid_cache_get_g(entry, g)) == NULL) return 0;
+  }
+  protected_grid_entry = entry;
+  const int fits = pw_gpu_ensure_xc_c(4 * real_size);
+  protected_grid_entry = NULL;
+  if (!fits) return 0;
+  const int *map_dev = entry == NULL ? NULL : entry->map_dev;
+  double *grad_dev[3] = {xc_dev, xc_dev + nr, xc_dev + 2 * nr};
+  double *vrho_dev = xc_dev + 3 * nr;
+  double *rho_dev = buffer_dev_1, *norm_dev = buffer_dev_1 + nr;
+  double *e0_dev = buffer_dev_2, *vnorm_dev = buffer_dev_2 + nr;
+
+  if (ngpts) offloadMemcpyAsyncHtoD(gbuf_dev, zin_rho_g, gbuf_size, stream);
+  offloadMemcpyAsyncHtoD(rho_dev, din_rho_r, real_size, stream);
+  for (int d = 0; d < 3; d++) {
+    offloadMemsetAsync(buffer_dev_2, 0, buffer_size, stream);
+    if (ngpts)
+      pw_gpu_launch_scatter_deriv(buffer_dev_2, gbuf_dev, g_dev, d, 1.0,
+                                  ngpts, nmaps, map_dev, stream);
+    fft_3d(OFFLOAD_FFT_INVERSE, npts[2], npts[1], npts[0], buffer_dev_2);
+    pw_gpu_launch_complex_to_real(buffer_dev_2, grad_dev[d], nrpts, stream);
+  }
+  pw_gpu_launch_norm3(grad_dev[0], grad_dev[1], grad_dev[2], norm_dev, nr, stream);
+  // The PBE elemental routine accumulates and skips sub-cutoff densities.
+  offloadMemsetAsync(buffer_dev_2, 0, buffer_size, stream);
+  offloadMemsetAsync(vrho_dev, 0, real_size, stream);
+  pw_gpu_launch_pbe_lda(rho_dev, norm_dev, e0_dev, vrho_dev, vnorm_dev, nr, 1,
+                        epsilon_rho, kappa, beta, mu, scale_ec, scale_ex, stream);
+  pw_gpu_launch_combine_div_input(grad_dev[0], grad_dev[1], grad_dev[2],
+                                  vnorm_dev, norm_dev, nr, gradient_cutoff, stream);
+  pw_gpu_launch_xc_cutoff(e0_dev, rho_dev, nr, epsilon_rho, smooth_range, stream);
+
+  // Norm and e0 are now dead. Ping-pong compensated reductions in their space
+  // until only one scalar remains, kept in norm_dev across the divergence FFTs.
+  size_t remaining = nr;
+  double *sum_in = e0_dev, *sum_out = norm_dev;
+  do {
+    pw_gpu_launch_xc_reduce(sum_in, sum_out, remaining, stream);
+    remaining = pw_gpu_xc_reduce_size(remaining);
+    double *swap = sum_in;
+    sum_in = sum_out;
+    sum_out = swap;
+  } while (remaining > 1);
+  if (sum_in != norm_dev)
+    pw_gpu_launch_copy(sum_in, norm_dev, 1, 1, 1, 1, 1.0, stream);
+
+  if (ngpts) offloadMemsetAsync(gbuf_dev, 0, gbuf_size, stream);
+  for (int d = 0; d < 3; d++) {
+    pw_gpu_launch_real_to_complex(grad_dev[d], buffer_dev_2, nrpts, stream);
+    fft_3d(OFFLOAD_FFT_FORWARD, npts[2], npts[1], npts[0], buffer_dev_2);
+    if (ngpts)
+      pw_gpu_launch_gather_deriv_acc(gbuf_dev, buffer_dev_2, g_dev, d, scale,
+                                     ngpts, map_dev, stream);
+  }
+  offloadMemsetAsync(buffer_dev_2, 0, buffer_size, stream);
+  if (ngpts)
+    pw_gpu_launch_scatter(buffer_dev_2, gbuf_dev, 1.0, ngpts, nmaps, map_dev, stream);
+  fft_3d(OFFLOAD_FFT_INVERSE, npts[2], npts[1], npts[0], buffer_dev_2);
+  // All three gradient inputs have been consumed; reuse the first for Vxc.
+  double *dout_dev = grad_dev[0];
+  pw_gpu_launch_complex_to_real(buffer_dev_2, dout_dev, nrpts, stream);
+  pw_gpu_launch_add_vrho(dout_dev, vrho_dev, nr, stream);
+
+  // xc_vxc_pw_create filters the entire potential, including dE/drho.
+  if (spherical && ngpts) {
+    pw_gpu_launch_real_to_complex(dout_dev, buffer_dev_2, nrpts, stream);
+    fft_3d(OFFLOAD_FFT_FORWARD, npts[2], npts[1], npts[0], buffer_dev_2);
+    pw_gpu_launch_gather(gbuf_dev, buffer_dev_2, scale, ngpts, map_dev, stream);
+    offloadMemsetAsync(buffer_dev_2, 0, buffer_size, stream);
+    pw_gpu_launch_scatter(buffer_dev_2, gbuf_dev, 1.0, ngpts, nmaps, map_dev, stream);
+    fft_3d(OFFLOAD_FFT_INVERSE, npts[2], npts[1], npts[0], buffer_dev_2);
+    pw_gpu_launch_complex_to_real(buffer_dev_2, dout_dev, nrpts, stream);
+  } else if (spherical) {
+    // An empty reciprocal-space filter removes the local PBE potential too.
+    offloadMemsetAsync(dout_dev, 0, real_size, stream);
+  }
+  pw_gpu_launch_xc_cutoff(dout_dev, rho_dev, nr, epsilon_rho * smooth_range,
+                          smooth_range, stream);
+  // These are the only downloads: the final potential and one energy scalar.
+  offloadMemcpyAsyncDtoH(dout_vxc_r, dout_dev, real_size, stream);
+  offloadMemcpyAsyncDtoH(exc_out, norm_dev, sizeof(double), stream);
+  offloadStreamSynchronize(stream);
+  if (!opt_map_cache) pw_gpu_grid_invalidate(grid_id);
+  return 1;
+}
+
+int pw_gpu_xc_full_pipeline_c(const double *zin_rho_g, const double *din_rho_r,
+    double *dout_vxc_r, double *exc_out, const int *ghatmap, const double *g,
+    const int *npts, int ngpts, int nmaps, double scale, int grid_id,
+    double epsilon_rho, double kappa, double beta, double mu,
+    double scale_ec, double scale_ex) {
+  return pw_gpu_xc_full_pipeline_configured_c(zin_rho_g, din_rho_r, dout_vxc_r,
+      exc_out, ghatmap, g, npts, ngpts, nmaps, scale, grid_id, epsilon_rho,
+      kappa, beta, mu, scale_ec, scale_ex, epsilon_rho, 0.0, 0);
 }
 
 /*******************************************************************************

@@ -257,7 +257,7 @@ __global__ void modify_hartree_pot_kernel(double *v, const double *g,
     pw_hartree_elem(v, g, gsq, r, radii, cv, i, natoms, nradii, gcut2, vol);
 }
 
-__global__ void pbe_lda_eval_kernel(const double *rho, const double *norm,
+__global__ void pw_gpu_pbe_lda_eval_kernel(const double *rho, const double *norm,
     double *e0, double *erho, double *enorm, size_t n, int grad,
     double epsilon, double kappa, double beta, double mu, double sc, double sx) {
   for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
@@ -306,8 +306,81 @@ void pw_gpu_launch_modify_hartree(double *v, const double *g, const double *gsq,
 void pw_gpu_launch_pbe_lda(const double *rho, const double *norm, double *e0,
     double *erho, double *enorm, size_t n, int grad, double epsilon,
     double kappa, double beta, double mu, double sc, double sx, offloadStream_t s) {
-  if (n) pbe_lda_eval_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+  if (n) pw_gpu_pbe_lda_eval_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
       rho, norm, e0, erho, enorm, n, grad, epsilon, kappa, beta, mu, sc, sx);
+}
+
+#include "pw_gpu_xc_ops.h"
+
+__global__ void pw_gpu_norm3_kernel(const double *g0, const double *g1,
+    const double *g2, double *norm, size_t n) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x)
+    norm[i] = pw_xc_norm3(g0[i], g1[i], g2[i]);
+}
+
+__global__ void pw_gpu_combine_div_input_kernel(double *g0, double *g1,
+    double *g2, const double *vnorm, const double *norm, size_t n, double cutoff) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x) {
+    const double factor = pw_xc_div_factor(vnorm[i], norm[i], cutoff);
+    g0[i] = -PW_GPU_DMUL(g0[i], factor);
+    g1[i] = -PW_GPU_DMUL(g1[i], factor);
+    g2[i] = -PW_GPU_DMUL(g2[i], factor);
+  }
+}
+
+__global__ void pw_gpu_add_vrho_kernel(double *vxc, const double *vrho, size_t n) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x)
+    vxc[i] = PW_GPU_DADD(vrho[i], vxc[i]);
+}
+
+__global__ void pw_gpu_xc_cutoff_kernel(double *values, const double *rho,
+    size_t n, double cutoff, double range) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x)
+    values[i] = pw_xc_cutoff(values[i], rho[i], cutoff, range);
+}
+
+__global__ void pw_gpu_xc_reduce_kernel(const double *values, double *partial,
+                                        size_t n, size_t columns) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < columns;
+       i += (size_t)blockDim.x * gridDim.x)
+    pw_xc_sum_column(values, partial, n, i, columns);
+}
+
+void pw_gpu_launch_norm3(const double *g0, const double *g1, const double *g2,
+                         double *norm, size_t n, offloadStream_t s) {
+  if (n) pw_gpu_norm3_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      g0, g1, g2, norm, n);
+}
+
+void pw_gpu_launch_combine_div_input(double *g0, double *g1, double *g2,
+    const double *vnorm, const double *norm, size_t n, double cutoff,
+    offloadStream_t s) {
+  if (n) pw_gpu_combine_div_input_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      g0, g1, g2, vnorm, norm, n, cutoff);
+}
+
+void pw_gpu_launch_add_vrho(double *vxc, const double *vrho, size_t n,
+                            offloadStream_t s) {
+  if (n) pw_gpu_add_vrho_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      vxc, vrho, n);
+}
+
+void pw_gpu_launch_xc_cutoff(double *values, const double *rho, size_t n,
+    double cutoff, double range, offloadStream_t s) {
+  if (n && range > 0.0)
+    pw_gpu_xc_cutoff_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+        values, rho, n, cutoff, range);
+}
+
+void pw_gpu_launch_xc_reduce(const double *values, double *partial, size_t n,
+                             offloadStream_t s) {
+  const size_t columns = n / PW_GPU_XC_REDUCE_CHUNK + (n % PW_GPU_XC_REDUCE_CHUNK != 0);
+  if (n) pw_gpu_xc_reduce_kernel<<<pw_grid_blocks(columns), PW_GPU_MAP_THREADS, 0, s>>>(
+      values, partial, n, columns);
 }
 
 #endif // defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)

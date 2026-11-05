@@ -32,6 +32,8 @@ Coverage includes:
   original Fortran branches: real/complex conversions, contiguous 1D/3D data,
   spherical padding/truncation, both reference-grid relations, gather/scatter,
   arbitrary alpha/beta, strided arrays, aliasing, empty arrays, NaNs and signed zero.
+  These host-resident operations must make no GPU calls, including in offload
+  builds. The retained C grid entry points and device kernels are tested directly.
 - Hartree compared to the compiled original atom/Gaussian loops, with complex
   coefficients, multiple atoms and radii, G=0 present/absent, the GCUT prefix,
   empty G ranges, and exact CPU fallback. No atom reduction reorders the sum.
@@ -41,6 +43,18 @@ Coverage includes:
   correlation scaling, accumulated outputs, and aliased unused derivative arrays.
   Derivative orders 2/3 retain the original CPU routine. OpenMP teams of 1 and 3
   execute exactly one GPU attempt via SINGLE/COPYPRIVATE.
+- Full XC gradient/norm/PBE/divergence/filter compared with compiled Fortran PBE,
+  the actual density cutoff routine, and an independent Fortran DFT at `1e-12`
+  relative/absolute tolerance. Tests compile the production early dispatch,
+  functional selector and C binding in all three offload configurations, with
+  OpenMP settings of 1 and 3. Unsupported functionals, smoothing, virial,
+  weighted/energy-grid requests, incompatible grids and failed allocations fall
+  back without leaking pool objects or timers.
+- Full-pipeline transfer tracing permits only the final real potential and one
+  energy scalar to be downloaded. One/two-map layouts, spherical filtering,
+  density cutoff boundaries, cached/uncached execution, rectangular FFT grids,
+  multiple energy-reduction passes, aliased inputs/outputs and empty G sets are
+  covered. Compensated reduction tests include cancellation and three levels.
 - All new C entry points at exact and one-byte-short memory limits; size overflow,
   untouched outputs on failed attempts, disabled fallback and allocation cleanup.
 - Production `.cu` bodies and launchers compiled as C++ with CPU launch emulation:
@@ -78,8 +92,9 @@ Coverage includes:
   vectors are also compared with Fortran `SUM(REAL(CONJG(a)*b))` directly.
   These tests run with offload, without offload, and with `__NO_OFFLOAD_PW`.
 
-The FFT comparisons use a relative/absolute tolerance of `2e-11`; CPU and GPU
-FFTs need not be bitwise identical. Dot-product comparisons allow floating-point
+The standalone FFT comparisons use a relative/absolute tolerance of `2e-11`;
+the full XC comparisons use `1e-12`. CPU and GPU FFTs need not be bitwise identical.
+Dot-product comparisons allow floating-point
 summation-order differences using product magnitudes and machine precision;
 the C reference check also accounts for vector length. DDOT replaces compensated
 summation only for contiguous `c1d/c1d/gs` arrays whose doubled length fits the
@@ -124,8 +139,11 @@ complex scaling retains the compiler's CPU handling of NaN/Inf cross terms. The 
 scatter maps must be injective, as required by the existing CPU parallel loops.
 
 The accounting covers the two shared work buffers, the optional real/complex
-secondary pair, the legacy map, compact G-space scratch, and every cached map and
-g-vector allocation. Opaque FFT-library
+secondary pair, the four real XC scratch grids, the legacy map, compact G-space
+scratch, and every cached map and g-vector allocation. The full XC pipeline
+reuses the shared buffers for density/norm, FFT data and PBE energy/derivatives;
+gradients, PBE evaluation, divergence, filtering and energy reduction stay in
+VRAM. Retained XC scratch can be reclaimed by other operations. Opaque FFT-library
 workspaces and allocations from other CP2K components are outside this budget.
 These mocks do not replace a full CP2K build or CUDA/HIP integration run.
 

@@ -54,6 +54,7 @@ MODULE pw_gpu
    PUBLIC :: pw_gpu_init, pw_gpu_finalize
    PUBLIC :: pw_gpu_set_memory_limit, pw_gpu_set_host_fallback, pw_gpu_get_allocated_bytes
    PUBLIC :: pw_gpu_fused_xc_available
+   PUBLIC :: pw_gpu_xc_full_pipeline_available, pw_gpu_xc_full_pipeline
    PUBLIC :: pw_gpu_gradient_c1d_r3d
    PUBLIC :: pw_gpu_divergence_r3d
    PUBLIC :: pw_gpu_filter_r3d
@@ -1184,6 +1185,83 @@ CONTAINS
       res = (pw_gpu_fused_xc_enabled_c() /= 0)
 #endif
    END FUNCTION pw_gpu_fused_xc_available
+
+! **************************************************************************************************
+!> \brief Full XC uses the same serial, local-grid ownership as the fused FFT paths.
+! **************************************************************************************************
+   FUNCTION pw_gpu_xc_full_pipeline_available(pw_grid) RESULT(res)
+      TYPE(pw_grid_type), INTENT(IN) :: pw_grid
+      LOGICAL :: res
+
+      res = pw_gpu_fused_xc_available(pw_grid)
+   END FUNCTION pw_gpu_xc_full_pipeline_available
+
+! **************************************************************************************************
+!> \brief Try gradient, PBE, divergence, filtering and energy reduction entirely in VRAM.
+!>        Only the input densities and final potential/energy cross the host boundary.
+!>        A false result leaves both outputs untouched for the original XC path.
+! **************************************************************************************************
+   LOGICAL FUNCTION pw_gpu_xc_full_pipeline(rho_g, rho_r, vxc, exc, epsilon_rho, &
+                                          kappa, beta, mu, scale_ec, scale_ex, &
+                                          gradient_cutoff, smooth_range) RESULT(done)
+      TYPE(pw_c1d_gs_type), INTENT(IN) :: rho_g
+      TYPE(pw_r3d_rs_type), INTENT(IN) :: rho_r
+      TYPE(pw_r3d_rs_type), INTENT(INOUT) :: vxc
+      REAL(KIND=dp), INTENT(INOUT) :: exc
+      REAL(KIND=dp), INTENT(IN) :: epsilon_rho, kappa, beta, mu, scale_ec, scale_ex
+      REAL(KIND=dp), INTENT(IN) :: gradient_cutoff, smooth_range
+
+      TYPE(pw_grid_type), POINTER :: grid
+      INTEGER :: ngpts, nmaps, d
+      INTEGER(KIND=C_SIZE_T) :: nrpts
+      REAL(KIND=dp) :: energy_sum, scale
+      INTERFACE
+         FUNCTION pw_gpu_xc_full_pipeline_c(zin, din, dout, energy, map, g, npts, ng, nm, scale, id, &
+                                            epsilon, kappa, beta, mu, sc, sx, drho_cutoff, smooth, filter) &
+            BIND(C, name="pw_gpu_xc_full_pipeline_configured_c") RESULT(res)
+            IMPORT :: C_PTR, C_INT, C_DOUBLE
+            TYPE(C_PTR), VALUE :: zin, din, dout, map, g
+            REAL(KIND=C_DOUBLE), INTENT(OUT) :: energy
+            INTEGER(KIND=C_INT), INTENT(IN) :: npts(3)
+            INTEGER(KIND=C_INT), VALUE :: ng, nm, id, filter
+            REAL(KIND=C_DOUBLE), VALUE :: scale, epsilon, kappa, beta, mu, sc, sx, drho_cutoff, smooth
+            INTEGER(KIND=C_INT) :: res
+         END FUNCTION pw_gpu_xc_full_pipeline_c
+      END INTERFACE
+
+      done = .FALSE.
+      grid => rho_r%pw_grid
+      IF (.NOT. ASSOCIATED(grid)) RETURN
+      IF (.NOT. pw_gpu_xc_full_pipeline_available(grid)) RETURN
+      IF (.NOT. ASSOCIATED(rho_g%pw_grid, grid) .OR. .NOT. ASSOCIATED(vxc%pw_grid, grid)) RETURN
+      IF (.NOT. ASSOCIATED(rho_g%array) .OR. .NOT. ASSOCIATED(rho_r%array) .OR. &
+          .NOT. ASSOCIATED(vxc%array)) RETURN
+      IF (.NOT. IS_CONTIGUOUS(rho_g%array) .OR. .NOT. IS_CONTIGUOUS(rho_r%array) .OR. &
+          .NOT. IS_CONTIGUOUS(vxc%array)) RETURN
+      IF (.NOT. IS_CONTIGUOUS(grid%g) .OR. .NOT. IS_CONTIGUOUS(grid%g_hatmap)) RETURN
+      nrpts = 1_C_SIZE_T
+      DO d = 1, 3
+         IF (grid%npts(d) <= 0) RETURN
+         IF (nrpts > INT(HUGE(0_C_INT)/2, C_SIZE_T)/INT(grid%npts(d), C_SIZE_T)) RETURN
+         nrpts = nrpts*INT(grid%npts(d), C_SIZE_T)
+      END DO
+      IF (SIZE(rho_r%array, KIND=C_SIZE_T) /= nrpts .OR. SIZE(vxc%array, KIND=C_SIZE_T) /= nrpts) RETURN
+      IF (ANY(SHAPE(rho_r%array) /= grid%npts) .OR. ANY(SHAPE(vxc%array) /= grid%npts)) RETURN
+      ngpts = SIZE(rho_g%array)
+      nmaps = SIZE(grid%g_hatmap, 2)
+      IF (ngpts <= 0 .OR. ngpts > nrpts) RETURN
+      IF (SIZE(grid%g, 1) /= 3 .OR. SIZE(grid%g, 2) /= ngpts) RETURN
+      IF (SIZE(grid%g_hatmap, 1) /= ngpts .OR. (nmaps /= 1 .AND. nmaps /= 2)) RETURN
+      scale = 1.0_dp/REAL(nrpts, dp)
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      done = pw_gpu_xc_full_pipeline_c(C_LOC(rho_g%array), C_LOC(rho_r%array), C_LOC(vxc%array), &
+                                      energy_sum, C_LOC(grid%g_hatmap), C_LOC(grid%g), INT(grid%npts, C_INT), &
+                                      INT(ngpts, C_INT), INT(nmaps, C_INT), scale, INT(grid%id_nr, C_INT), &
+                                      epsilon_rho, kappa, beta, mu, scale_ec, scale_ex, gradient_cutoff, &
+                                      smooth_range, MERGE(1_C_INT, 0_C_INT, grid%spherical)) /= 0_C_INT
+      IF (done) exc = energy_sum*grid%dvol
+#endif
+   END FUNCTION pw_gpu_xc_full_pipeline
 
 ! **************************************************************************************************
 !> \brief Fused XC gradient on the GPU: grad(d) = FFT^-1[ i G_d pw_g ], d = 1..3.

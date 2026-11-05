@@ -16,6 +16,7 @@ sys.dont_write_bytecode = True
 from integral_tests import run_integral_tests
 from grid_ops_tests import run_grid_ops_tests
 from kernel_body_tests import run_kernel_body_tests
+from xc_pipeline_tests import run_xc_pipeline_tests
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -24,8 +25,8 @@ RANK_NAMES = ("OMPI_COMM_WORLD_RANK", "PMI_RANK", "SLURM_PROCID", "MPI_LOCALRANK
 
 def source_checks() -> None:
     for name in ("src/input_cp2k_global.F", "src/pw/pw_gpu.F", "src/pw/pw_methods.F",
-                 "src/cp_ddapc_util.F", "src/xc/xc_pbe.F", "tests/pw_gpu_integrated/test_grid_ops.F",
-                 "tests/pw_gpu_integrated/test_pw_integral.F"):
+                 "src/cp_ddapc_util.F", "src/xc/xc_pbe.F", "src/xc/xc.F", "tests/pw_gpu_integrated/test_grid_ops.F",
+                 "tests/pw_gpu_integrated/test_pw_integral.F", "tests/pw_gpu_integrated/test_xc_pipeline.F"):
         lines = (ROOT / name).read_text().splitlines()
         long_lines = [(i, len(line)) for i, line in enumerate(lines, 1) if len(line) > 132]
         assert not long_lines, (name, long_lines)
@@ -50,6 +51,11 @@ def source_checks() -> None:
 
 
 def cases():
+    yield "XC full pipeline and VRAM transfer contract", ["xc_pipeline"], {}, 0, 0
+    yield "XC full pipeline without map caching", ["xc_pipeline"], {"CP2K_PW_GPU_MAP_CACHE": "0"}, 0, 0
+    yield "XC full pipeline exact budgets and reclamation", ["xc_limits"], {}, 0, 1
+    yield "XC full pipeline disabled fallback", ["xc_disabled"], {}, -1, 0
+    yield "XC full pipeline empty, overflow and ownership", ["xc_edges"], {}, 0, 1
     yield "grid kernels bitwise", ["grid_ops"], {}, 0, 0
     yield "new operations exact budgets and overflow", ["new_limits"], {}, 0, 1
     for op in range(6):
@@ -151,6 +157,7 @@ def main() -> None:
         print(f"{count} C mock cases passed; no-offload variants compiled; "
               f"{'ASan/UBSan enabled' if args.sanitize else 'optimized build'}.")
         run_integral_tests(build, compiler, flags, include, blas, clean_env, args.sanitize)
+        run_xc_pipeline_tests(build, compiler, flags, include, blas, clean_env, args.sanitize)
         run_grid_ops_tests(build, compiler, flags, include, blas, clean_env, args.sanitize)
 
 

@@ -216,11 +216,7 @@ CONTAINS
                CALL pw_copy_${kind}$_${kind2}$_${space}$ (a, b)
                CALL cpu_copy_${kind}$_${kind2}$_${space}$ (ar, br)
                IF (ANY(TRANSFER(b%array, [0_int64]) /= TRANSFER(br%array, [0_int64]))) ERROR STOP 'copy bits'
-               IF (gpu_enabled .AND. .NOT. limited .AND. layout /= 6 .AND. nx > 0) THEN
-                  IF (test_kernel_calls(0_C_INT) <= before) ERROR STOP 'copy not offloaded'
-               ELSE
-                  IF (test_kernel_calls(0_C_INT) /= before) ERROR STOP 'unexpected copy offload'
-               END IF
+               IF (test_kernel_calls(0_C_INT) /= before) ERROR STOP 'unexpected copy offload'
                DO ia = 1, SIZE(factors)
                   DO ib = 1, SIZE(factors)
                      xs = x0
@@ -229,6 +225,7 @@ CONTAINS
                      yr = y0
                      CALL pw_axpy_${kind}$_${kind2}$_${space}$ (a, b, factors(ia), factors(ib))
                      CALL cpu_axpy_${kind}$_${kind2}$_${space}$ (ar, br, factors(ia), factors(ib))
+                     IF (test_kernel_calls(0_C_INT) /= before) ERROR STOP 'unexpected AXPY offload'
                      IF (ANY(TRANSFER(b%array, [0_int64]) /= TRANSFER(br%array, [0_int64]))) THEN
                         PRINT *, '${kind}$ ${kind2}$ ${space}$', layout, factors(ia), factors(ib)
                         ERROR STOP 'AXPY bits'

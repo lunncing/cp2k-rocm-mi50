@@ -10,6 +10,12 @@
 
 #include <stddef.h>
 
+#define PW_GPU_XC_REDUCE_CHUNK 256
+static inline size_t pw_gpu_xc_reduce_size(size_t n) {
+  const size_t columns = n / PW_GPU_XC_REDUCE_CHUNK + (n % PW_GPU_XC_REDUCE_CHUNK != 0);
+  return columns <= 1 ? columns : 2 * columns;
+}
+
 #include "../../offload/offload_runtime.h"
 #if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
 
@@ -81,6 +87,33 @@ void pw_gpu_launch_modify_hartree(double *, const double *, const double *,
 void pw_gpu_launch_pbe_lda(const double *, const double *, double *, double *,
     double *, size_t, int, double, double, double, double, double, double,
     offloadStream_t);
+void pw_gpu_launch_norm3(const double *, const double *, const double *,
+                         double *, size_t, offloadStream_t);
+void pw_gpu_launch_combine_div_input(double *, double *, double *,
+    const double *, const double *, size_t, double, offloadStream_t);
+void pw_gpu_launch_add_vrho(double *, const double *, size_t, offloadStream_t);
+void pw_gpu_launch_xc_cutoff(double *, const double *, size_t, double, double,
+                             offloadStream_t);
+// Produces pw_gpu_xc_reduce_size(n) doubles: sum/correction pairs until the
+// final scalar. Keeping the corrections avoids losing cancellation accuracy.
+void pw_gpu_launch_xc_reduce(const double *, double *, size_t, offloadStream_t);
+
+// Full VRAM pipeline. exc_out is the unscaled sum of energy density; the
+// Fortran wrapper multiplies it by dvol. Outputs are untouched on failure.
+// The basic entry uses epsilon_rho as the gradient cutoff, without filtering
+// or density smoothing. The configured entry preserves xc_vxc_pw_create's
+// independent gradient cutoff, spherical filter and density cutoff settings.
+int pw_gpu_xc_full_pipeline_c(const double *zin_rho_g, const double *din_rho_r,
+    double *dout_vxc_r, double *exc_out, const int *ghatmap, const double *g,
+    const int *npts, int ngpts, int nmaps, double scale, int grid_id,
+    double epsilon_rho, double kappa, double beta, double mu,
+    double scale_ec, double scale_ex);
+int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
+    const double *din_rho_r, double *dout_vxc_r, double *exc_out,
+    const int *ghatmap, const double *g, const int *npts, int ngpts, int nmaps,
+    double scale, int grid_id, double epsilon_rho, double kappa, double beta,
+    double mu, double scale_ec, double scale_ex, double gradient_cutoff,
+    double smooth_range, int spherical);
 
 // Synchronous host-pointer attempts: 1 = completed, 0 = leave all host outputs
 // untouched and execute the original Fortran path. A memory failure observes

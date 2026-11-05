@@ -32,6 +32,8 @@ def run_grid_ops_tests(build, compiler, flags, include, blas, env, sanitize):
         # There is a space before '(' in the Fypp template.
         templ = routine(methods.replace("$_${space}$ (", "$_${space}$("),
                         "pw_" + name + "_${kind}$_${kind2}$_${space}$")
+        # Host-resident copy/AXPY must stay on the CPU, even in offload builds.
+        assert not re.search(r"pw_gpu_(?:remap_)?" + name + r"\b", templ)
         ref = templ.replace("pw_" + name + "_${kind}", "cpu_" + name + "_${kind}")
         ref = ref.replace("#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)", "#if 0")
         (build / (name + ".inc")).write_text(templ + ref)

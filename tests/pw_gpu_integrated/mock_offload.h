@@ -11,6 +11,7 @@ typedef struct mock_fft_plan *offload_fftHandle;
 #define OFFLOAD_FFT_Z2Z 0
 
 extern size_t mock_allocated, mock_peak, mock_limit, mock_allocations;
+extern size_t mock_upload_bytes, mock_download_bytes;
 extern int mock_fft_calls, mock_uploads, mock_live_plans;
 extern int mock_live_streams, mock_live_events, mock_event_records, mock_event_waits;
 extern int mock_grid_calls, mock_hartree_calls, mock_pbe_calls;
@@ -19,7 +20,8 @@ enum mock_operation_kind {
   MOCK_UPLOAD, MOCK_DOWNLOAD, MOCK_MEMSET, MOCK_FFT, MOCK_REAL_TO_COMPLEX,
   MOCK_COMPLEX_TO_REAL, MOCK_GATHER, MOCK_SCATTER, MOCK_SCATTER_DERIV,
   MOCK_GATHER_DERIV, MOCK_GRID_COPY, MOCK_GRID_AXPY, MOCK_REMAP_COPY,
-  MOCK_REMAP_AXPY, MOCK_HARTREE, MOCK_PBE
+  MOCK_REMAP_AXPY, MOCK_HARTREE, MOCK_PBE, MOCK_NORM3, MOCK_COMBINE_DIV,
+  MOCK_ADD_VRHO, MOCK_XC_CUTOFF, MOCK_XC_REDUCE
 };
 typedef struct {
   enum mock_operation_kind kind;

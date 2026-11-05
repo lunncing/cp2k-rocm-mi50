@@ -78,7 +78,8 @@ Eliminates 3.2 GB of intermediate PCIe transfers (DtoH and HtoD) and eliminates 
     END IF
     ```
 
-### 4. Constraints
+### 4. Constraints & Test Expectations
+- Preserve the edits in `pw_methods.F` (GPU copy/axpy dispatch disabled to keep host-resident array copy on CPU). Update test expectations in `grid_ops_tests.py` / `test_grid_ops.F` accordingly.
 - Fortran line lengths <= 132 chars.
 - 100% bitwise / numerical consistency within $10^{-12}$.
 - Respect `MAX_GPU_MEMORY_MB` and `HOST_FALLBACK`.

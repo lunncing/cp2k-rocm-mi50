@@ -27,14 +27,17 @@ MODULE xc
                                   section_get_lval, &
                                   section_get_rval, &
                                   section_vals_get_subs_vals, &
+                                  section_vals_get_subs_vals2, &
                                   section_vals_type, &
                                   section_vals_val_get
    USE kahan_sum, ONLY: accurate_dot_product, &
                         accurate_sum
    USE kinds, ONLY: default_path_length, &
                     dp
+   USE mathconstants, ONLY: pi
    USE pw_gpu, ONLY: pw_gpu_filter_r3d, &
-                     pw_gpu_fused_xc_available
+                     pw_gpu_fused_xc_available, &
+                     pw_gpu_xc_full_pipeline, pw_gpu_xc_full_pipeline_available
    USE pw_grid_types, ONLY: PW_MODE_DISTRIBUTED, &
                             pw_grid_type
    USE pw_methods, ONLY: pw_axpy, &
@@ -63,6 +66,7 @@ MODULE xc
    USE xc_derivatives, ONLY: xc_functionals_eval, &
                              xc_functionals_get_needs
    USE xc_gauxc_functional, ONLY: xc_section_uses_gauxc
+   USE xc_input_constants, ONLY: xc_deriv_pw, xc_rho_no_smooth, xc_pbe_orig, xc_pbe_rev, xc_pbe_sol
    USE xc_rho_cflags_types, ONLY: xc_rho_cflags_type
    USE xc_rho_set_types, ONLY: xc_rho_set_create, &
                                xc_rho_set_get, &
@@ -495,9 +499,9 @@ CONTAINS
       LOGICAL                                            :: dealloc_pw_to_deriv, has_laplace, &
                                                             has_tau, lsd, use_virial, has_gradient, &
                                                             has_derivs, has_rho, dealloc_pw_to_deriv_rho, &
-                                                            use_fused_filter
+                                                            use_fused_filter, gpu_done
       REAL(KIND=dp)                                      :: density_smooth_cut_range, drho_cutoff, &
-                                                            rho_cutoff
+                                                            rho_cutoff, kappa, beta, mu, scale_ec, scale_ex
       REAL(kind=dp), DIMENSION(:, :, :), POINTER         :: deriv_data, norm_drho, norm_drho_spin, &
                                                             rho, rhoa, rhob
       TYPE(cp_sll_xc_deriv_type), POINTER                :: pos
@@ -526,6 +530,30 @@ CONTAINS
 
       use_virial = compute_virial
       virial_xc = 0.0_dp
+
+      ! Try before constructing rho_set/deriv_set: their gradient and PBE arrays
+      ! would otherwise force the intermediate VRAM data back through the host.
+      IF (.NOT. lsd .AND. .NOT. use_virial .AND. .NOT. PRESENT(exc_r) .AND. .NOT. ASSOCIATED(weights)) THEN
+         IF (pw_gpu_xc_full_pipeline_available(pw_grid) .AND. ASSOCIATED(rho_g)) THEN
+            IF (SIZE(rho_g) == 1) THEN
+               IF (xc_vram_pbe_parameters(xc_section, rho_cutoff, drho_cutoff, density_smooth_cut_range, &
+                                         kappa, beta, mu, scale_ec, scale_ex)) THEN
+                  ALLOCATE (vxc_rho(1))
+                  CALL pw_pool%create_pw(vxc_rho(1))
+                  exc = 0.0_dp
+                  gpu_done = pw_gpu_xc_full_pipeline(rho_g(1), rho_r(1), vxc_rho(1), exc, rho_cutoff, &
+                                                     kappa, beta, mu, scale_ec, scale_ex, drho_cutoff, &
+                                                     density_smooth_cut_range)
+                  IF (gpu_done) THEN
+                     CALL timestop(handle)
+                     RETURN
+                  END IF
+                  CALL pw_pool%give_back_pw(vxc_rho(1))
+                  DEALLOCATE (vxc_rho)
+               END IF
+            END IF
+         END IF
+      END IF
 
       bo = rho_r(1)%pw_grid%bounds_local
       npoints = (bo(2, 1) - bo(1, 1) + 1)*(bo(2, 2) - bo(1, 2) + 1)*(bo(2, 3) - bo(1, 3) + 1)
@@ -784,6 +812,57 @@ CONTAINS
       CALL timestop(handle)
 
    END SUBROUTINE xc_vxc_pw_create
+
+! **************************************************************************************************
+!> \brief Select exactly one active native PBE functional and the PW/no-smoothing density path.
+!>        Mixed, spin, meta, weighted, energy-grid and virial cases retain the existing XC path.
+! **************************************************************************************************
+   LOGICAL FUNCTION xc_vram_pbe_parameters(xc_section, rho_cutoff, drho_cutoff, smooth_range, &
+                                           kappa, beta, mu, scale_ec, scale_ex) RESULT(eligible)
+      TYPE(section_vals_type), POINTER :: xc_section
+      REAL(KIND=dp), INTENT(OUT) :: rho_cutoff, drho_cutoff, smooth_range, kappa, beta, mu, scale_ec, scale_ex
+
+      TYPE(section_vals_type), POINTER :: functionals, functional, pbe
+      INTEGER :: ifun, param
+      LOGICAL :: active
+
+      eligible = .FALSE.
+      IF (section_get_ival(xc_section, "XC_GRID%XC_DERIV") /= xc_deriv_pw) RETURN
+      IF (section_get_ival(xc_section, "XC_GRID%XC_SMOOTH_RHO") /= xc_rho_no_smooth) RETURN
+      functionals => section_vals_get_subs_vals(xc_section, "XC_FUNCTIONAL")
+      NULLIFY (pbe)
+      ifun = 0
+      DO
+         ifun = ifun + 1
+         functional => section_vals_get_subs_vals2(functionals, i_section=ifun)
+         IF (.NOT. ASSOCIATED(functional)) EXIT
+         CALL section_vals_val_get(functional, "_SECTION_PARAMETERS_", l_val=active)
+         IF (.NOT. active) CYCLE
+         IF (functional%section%name /= "PBE" .OR. ASSOCIATED(pbe)) RETURN
+         pbe => functional
+      END DO
+      IF (.NOT. ASSOCIATED(pbe)) RETURN
+      CALL section_vals_val_get(pbe, "PARAMETRIZATION", i_val=param)
+      SELECT CASE (param)
+      CASE (xc_pbe_orig, xc_pbe_rev)
+         kappa = 0.804e0_dp
+         IF (param == xc_pbe_rev) kappa = 0.1245e1_dp
+         beta = 0.66725e-1_dp
+         mu = beta*pi**2/0.3e1_dp
+      CASE (xc_pbe_sol)
+         kappa = 0.804e0_dp
+         beta = 0.46e-1_dp
+         mu = 0.1e2_dp/0.81e2_dp
+      CASE DEFAULT
+         RETURN
+      END SELECT
+      CALL section_vals_val_get(pbe, "SCALE_C", r_val=scale_ec)
+      CALL section_vals_val_get(pbe, "SCALE_X", r_val=scale_ex)
+      rho_cutoff = section_get_rval(xc_section, "DENSITY_CUTOFF")
+      drho_cutoff = section_get_rval(xc_section, "GRADIENT_CUTOFF")
+      smooth_range = section_get_rval(xc_section, "DENSITY_SMOOTH_CUTOFF_RANGE")
+      eligible = .TRUE.
+   END FUNCTION xc_vram_pbe_parameters
 
 ! **************************************************************************************************
 !> \brief calculates just the exchange and correlation energy

@@ -10,8 +10,10 @@
 
 #define PW_GPU_ELEMENTAL static inline
 #include "pw_gpu_pbe.h"
+#include "pw_gpu_xc_ops.h"
 
 size_t mock_allocated, mock_peak, mock_limit, mock_allocations;
+size_t mock_upload_bytes, mock_download_bytes;
 int mock_fft_calls, mock_uploads, mock_live_plans;
 int mock_live_streams, mock_live_events, mock_event_records, mock_event_waits;
 int mock_grid_calls, mock_hartree_calls, mock_pbe_calls;
@@ -71,6 +73,7 @@ void mock_assert_idle(void) {
 void mock_reset_trace(void) {
   mock_assert_idle();
   mock_operation_count = 0;
+  mock_upload_bytes = mock_download_bytes = 0;
   mock_event_records = mock_event_waits = 0;
 }
 
@@ -187,12 +190,14 @@ void offloadMemcpyAsyncHtoD(void *dst, const void *src, size_t bytes,
   touch(dst, bytes);
   memcpy(dst, src, bytes);
   mock_uploads++;
+  mock_upload_bytes += bytes;
 }
 void offloadMemcpyAsyncDtoH(void *dst, const void *src, size_t bytes,
                            offloadStream_t stream) {
   begin_operation(MOCK_DOWNLOAD, stream, src, 0);
   touch(src, bytes);
   memcpy(dst, src, bytes);
+  mock_download_bytes += bytes;
 }
 void offloadMemsetAsync(void *dst, int value, size_t bytes,
                         offloadStream_t stream) {
@@ -446,4 +451,45 @@ void pw_gpu_launch_pbe_lda(const double *rho, const double *norm, double *e0,
     pw_pbe_lda_elem(rho, norm, e0, erho, enorm, i, grad, epsilon,
                     kappa, beta, mu, sc, sx);
   mock_pbe_calls++;
+}
+
+void pw_gpu_launch_norm3(const double *g0, const double *g1, const double *g2,
+                         double *norm, size_t n, offloadStream_t s) {
+  begin_operation(MOCK_NORM3, s, norm, 0);
+  touch(g0, n * sizeof(double)); touch(g1, n * sizeof(double));
+  touch(g2, n * sizeof(double)); touch(norm, n * sizeof(double));
+  for (size_t i = 0; i < n; i++) norm[i] = pw_xc_norm3(g0[i], g1[i], g2[i]);
+}
+
+void pw_gpu_launch_combine_div_input(double *g0, double *g1, double *g2,
+    const double *vnorm, const double *norm, size_t n, double cutoff, offloadStream_t s) {
+  begin_operation(MOCK_COMBINE_DIV, s, g0, 0);
+  touch(g0, n * sizeof(double)); touch(g1, n * sizeof(double));
+  touch(g2, n * sizeof(double)); touch(norm, n * sizeof(double));
+  touch(vnorm, n * sizeof(double));
+  for (size_t i = 0; i < n; i++) {
+    const double factor = pw_xc_div_factor(vnorm[i], norm[i], cutoff);
+    g0[i] = -g0[i] * factor; g1[i] = -g1[i] * factor; g2[i] = -g2[i] * factor;
+  }
+}
+
+void pw_gpu_launch_add_vrho(double *vxc, const double *vrho, size_t n, offloadStream_t s) {
+  begin_operation(MOCK_ADD_VRHO, s, vxc, 0);
+  touch(vxc, n * sizeof(double)); touch(vrho, n * sizeof(double));
+  for (size_t i = 0; i < n; i++) vxc[i] = vrho[i] + vxc[i];
+}
+
+void pw_gpu_launch_xc_cutoff(double *values, const double *rho, size_t n,
+    double cutoff, double range, offloadStream_t s) {
+  if (!n || range <= 0.0) return;
+  begin_operation(MOCK_XC_CUTOFF, s, values, 0);
+  touch(values, n * sizeof(double)); touch(rho, n * sizeof(double));
+  for (size_t i = 0; i < n; i++) values[i] = pw_xc_cutoff(values[i], rho[i], cutoff, range);
+}
+
+void pw_gpu_launch_xc_reduce(const double *values, double *partial, size_t n, offloadStream_t s) {
+  const size_t columns = n / PW_GPU_XC_REDUCE_CHUNK + (n % PW_GPU_XC_REDUCE_CHUNK != 0);
+  begin_operation(MOCK_XC_REDUCE, s, partial, 0);
+  touch(values, n * sizeof(double)); touch(partial, pw_gpu_xc_reduce_size(n) * sizeof(double));
+  for (size_t i = 0; i < columns; i++) pw_xc_sum_column(values, partial, n, i, columns);
 }
