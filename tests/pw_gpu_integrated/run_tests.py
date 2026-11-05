@@ -11,13 +11,16 @@ import shutil
 import subprocess
 import tempfile
 
+from integral_tests import run_integral_tests
+
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 RANK_NAMES = ("OMPI_COMM_WORLD_RANK", "PMI_RANK", "SLURM_PROCID", "MPI_LOCALRANKID")
 
 
 def source_checks() -> None:
-    for name in ("src/input_cp2k_global.F", "src/pw/pw_gpu.F"):
+    for name in ("src/input_cp2k_global.F", "src/pw/pw_gpu.F", "src/pw/pw_methods.F",
+                 "tests/pw_gpu_integrated/test_pw_integral.F"):
         lines = (ROOT / name).read_text().splitlines()
         long_lines = [(i, len(line)) for i, line in enumerate(lines, 1) if len(line) > 132]
         assert not long_lines, (name, long_lines)
@@ -90,6 +93,7 @@ def main() -> None:
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     source_checks()
     compiler = shlex.split(os.environ.get("CC", "cc"))
+    blas = shlex.split(os.environ.get("BLAS_LIBS", "-lblas"))
     flags = ["-std=c11", "-Wall", "-Wextra", "-Werror", "-Wpedantic", "-fopenmp", "-ffp-contract=off"]
     flags += ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"] if args.sanitize else ["-O2"]
     with tempfile.TemporaryDirectory(prefix=".build-", dir=HERE) as temporary:
@@ -108,7 +112,7 @@ def main() -> None:
         include = ["-I", str(HERE), "-I", str(gpu)]
         exe = build / "test_pw_gpu"
         command = compiler + flags + include + ["-D__OFFLOAD", str(HERE / "test_pw_gpu.c"),
-                    str(HERE / "mock_offload.c"), "-lm", "-o", str(exe)]
+                    str(HERE / "mock_offload.c"), *blas, "-lm", "-o", str(exe)]
         subprocess.run(command, check=True)
         for defines in ([], ["-D__OFFLOAD", "-D__NO_OFFLOAD_PW"]):
             subprocess.run(compiler + flags + include + defines + ["-c", str(gpu / "pw_gpu_internal.c"),
@@ -116,6 +120,7 @@ def main() -> None:
         clean_env = {k: v for k, v in os.environ.items() if k not in RANK_NAMES and
                      not k.startswith(("CP2K_GPU_", "CP2K_PW_GPU_"))}
         clean_env["OMP_NUM_THREADS"] = "1"
+        clean_env["OPENBLAS_NUM_THREADS"] = "1"
         clean_env["ASAN_OPTIONS"] = "detect_leaks=1:halt_on_error=1"
         clean_env["UBSAN_OPTIONS"] = "halt_on_error=1:print_stacktrace=1"
         count = 0
@@ -133,6 +138,7 @@ def main() -> None:
             count += 1
         print(f"{count} C mock cases passed; no-offload variants compiled; "
               f"{'ASan/UBSan enabled' if args.sanitize else 'optimized build'}.")
+        run_integral_tests(build, compiler, flags, include, blas, clean_env, args.sanitize)
 
 
 if __name__ == "__main__":

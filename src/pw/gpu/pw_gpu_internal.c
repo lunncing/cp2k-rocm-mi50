@@ -5,6 +5,21 @@
 /*  SPDX-License-Identifier: GPL-2.0-or-later                                 */
 /*----------------------------------------------------------------------------*/
 #include "../../offload/offload_runtime.h"
+
+/*******************************************************************************
+ * \brief Real part of the complex inner product, without temporary arrays.
+ *        Complex doubles are stored as interleaved real and imaginary parts.
+ *        This CPU operation is also available in builds without PW offload.
+ *        n_complex must be in [0, INT_MAX / 2] for the BLAS integer count.
+ ******************************************************************************/
+double pw_cpu_dot_complex_c(const void *a, const void *b, int n_complex) {
+  int n_double = 2 * n_complex;
+  extern double ddot_(const int *n, const double *x, const int *incx,
+                      const double *y, const int *incy);
+  const int inc = 1;
+  return ddot_(&n_double, (const double *)a, &inc, (const double *)b, &inc);
+}
+
 #if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
 
 #include "../../offload/offload_fft.h"

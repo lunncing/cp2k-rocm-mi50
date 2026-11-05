@@ -1,15 +1,20 @@
-# Integrated PW GPU memory and XC tests
+# Integrated PW GPU memory, XC, and CPU integral tests
 
-Run from the repository root with Python 3.9+ and a C11 compiler supporting
-OpenMP (GCC on Linux/WSL works):
+Run from the repository root with Python 3.9+, Fypp, a C11 compiler supporting
+OpenMP, GNU Fortran, and an LP64 BLAS providing `ddot_` (GCC/GFortran and
+OpenBLAS on Linux/WSL work). On Ubuntu the dependencies are available as
+`gcc gfortran libblas-dev fypp`:
 
 ```sh
 python3 tests/pw_gpu_integrated/run_tests.py
 python3 tests/pw_gpu_integrated/run_tests.py --sanitize
 ```
 
-`CC` can select another compatible compiler. The second command enables AddressSanitizer,
-UndefinedBehaviorSanitizer, and leak detection. No CUDA/HIP installation, GPU, MPI,
+`CC` and `FC` can select compatible C and Fortran compilers. `BLAS_LIBS` supplies
+BLAS linker flags (default `-lblas`, for example `-L/path/to/lib -lopenblas`).
+The second command enables AddressSanitizer, UndefinedBehaviorSanitizer, and
+leak detection. Fortran bounds checks are enabled in both builds.
+No CUDA/HIP installation, GPU, MPI,
 or complete CP2K checkout is required. Temporary build files stay under this test
 directory and are removed automatically.
 
@@ -33,9 +38,28 @@ Coverage includes:
   fallback at each allocation stage, a single notice, and disabled-fallback failure.
 - Prime and mixed-radix host FFT sizes, no-offload compilation, input keyword and
   C-binding declarations, and the 132-character line limit in the modified Fortran files.
+- `pw_cpu_dot_complex_c` linked to real BLAS: deterministic random vectors of
+  lengths 0 through 65537, real/imaginary signs, unaligned slices, and aliased
+  inputs, compared against an independent long-double complex inner product.
+- All 16 generated `pw_integral_ab` variants compiled from the production
+  template: default/accurate/standard sums, cell-volume scaling, `just_sum`,
+  full/half-space and G=0 corrections, local/distributed reductions, empty local
+  grids, strided arrays, and rejection of incompatible grids. Random complex
+  vectors are also compared with Fortran `SUM(REAL(CONJG(a)*b))` directly.
+  These tests run with offload, without offload, and with `__NO_OFFLOAD_PW`.
 
-The CPU comparisons use a relative/absolute tolerance of `2e-11`; CPU and GPU FFTs
-need not be bitwise identical. The existing GPU fused arithmetic remains intact.
+The FFT comparisons use a relative/absolute tolerance of `2e-11`; CPU and GPU
+FFTs need not be bitwise identical. Dot-product comparisons allow floating-point
+summation-order differences using product magnitudes and machine precision;
+the C reference check also accounts for vector length. DDOT replaces compensated
+summation only for contiguous `c1d/c1d/gs` arrays whose doubled length fits the
+BLAS integer range. Strided/oversized arrays retain the original sum paths.
+
+The Fortran harness extracts the actual integral routine and its C binding from
+`pw_methods.F` and preprocesses it with Fypp. Minimal grid, timer, reduction, and
+accurate-sum stubs replace CP2K modules absent from this snapshot; the C helper
+and BLAS are real. The reduction stub checks call counts and applies a known
+factor, while the sum stubs check that other variants retain their sum mode.
 
 ## Configuration
 
