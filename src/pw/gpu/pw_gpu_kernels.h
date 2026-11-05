@@ -8,6 +8,8 @@
 #ifndef PW_GPU_KERNELS_H
 #define PW_GPU_KERNELS_H
 
+#include <stddef.h>
+
 #include "../../offload/offload_runtime.h"
 #if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
 
@@ -63,6 +65,45 @@ void pw_gpu_launch_gather_deriv_acc(double *acc, const double *c,
                                     const double scale, const int ngpts,
                                     const int *ghatmap,
                                     offloadStream_t stream);
+
+// Device-pointer launchers. cx/cy are the number of doubles per element (1/2).
+void pw_gpu_launch_copy(const double *, double *, size_t, size_t, int, int,
+                        double, offloadStream_t);
+void pw_gpu_launch_axpy(const double *, double *, size_t, size_t, int, int,
+                        double, double, offloadStream_t);
+void pw_gpu_launch_remap_copy(const double *, double *, const int *, size_t,
+                              int, int, int, double, offloadStream_t);
+void pw_gpu_launch_remap_axpy(const double *, double *, const int *, size_t,
+                              int, int, int, double, double, offloadStream_t);
+void pw_gpu_launch_modify_hartree(double *, const double *, const double *,
+    const double *, const double *, const double *, size_t, size_t, size_t,
+    double, double, offloadStream_t);
+void pw_gpu_launch_pbe_lda(const double *, const double *, double *, double *,
+    double *, size_t, int, double, double, double, double, double, double,
+    offloadStream_t);
+
+// Synchronous host-pointer attempts: 1 = completed, 0 = leave all host outputs
+// untouched and execute the original Fortran path. A memory failure observes
+// HOST_FALLBACK (including fail-fast when disabled). Empty work is successful.
+int pw_gpu_copy_c(const double *x, double *y, size_t nx, size_t ny, int cx,
+                  int cy, double alpha);
+int pw_gpu_axpy_c(const double *x, double *y, size_t nx, size_t ny, int cx,
+                  int cy, double alpha, double beta);
+int pw_gpu_remap_copy_c(const double *x, double *y, size_t nx, size_t ny, int cx,
+                        int cy, const int *gidx, int scatter, double alpha);
+int pw_gpu_remap_axpy_c(const double *x, double *y, size_t nx, size_t ny, int cx,
+                        int cy, const int *gidx, int scatter, double alpha,
+                        double beta);
+// Hartree: g(3,n), r(3,natoms), cv(nradii,natoms). The caller selects the
+// contiguous nonzero-G prefix up to GCUT and applies the separate G=0 term.
+int modify_hartree_pot_gpu_c(double *v, const double *g, const double *gsq,
+    const double *r, const double *radii, const double *cv, size_t n,
+    size_t natoms, size_t nradii, double gcut2, double vol);
+// Unpolarized PBE energy and dE/drho, dE/d|grad rho|, added to existing outputs.
+// grad=0 does not access erho/enorm (the caller may alias them to rho).
+int pbe_lda_eval_gpu_c(const double *rho, const double *norm, double *e0,
+    double *erho, double *enorm, size_t n, int grad, double epsilon,
+    double kappa, double beta, double mu, double sc, double sx);
 
 #ifdef __cplusplus
 }

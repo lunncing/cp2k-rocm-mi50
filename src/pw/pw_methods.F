@@ -23,6 +23,7 @@
 !> \author apsi
 ! **************************************************************************************************
 MODULE pw_methods
+   USE ISO_C_BINDING, ONLY: C_LOC, C_SIZE_T
    #:include "pw_types.fypp"
    USE cp_log_handling, ONLY: cp_logger_get_default_io_unit, &
                               cp_to_string
@@ -41,7 +42,8 @@ MODULE pw_methods
                       pw_fpga_init_bitstream, &
                       pw_fpga_r3dc1d_3d_dp, &
                       pw_fpga_r3dc1d_3d_sp
-   USE pw_gpu, ONLY: pw_gpu_c1dr3d_3d, &
+   USE pw_gpu, ONLY: pw_gpu_copy, pw_gpu_axpy, pw_gpu_remap_copy, pw_gpu_remap_axpy, &
+                     pw_gpu_c1dr3d_3d, &
                      pw_gpu_c1dr3d_3d_ps, &
                      pw_gpu_r3dc1d_3d, &
                      pw_gpu_r3dc1d_3d_ps
@@ -580,6 +582,12 @@ CONTAINS
                INTEGER :: i, j, ng, ng1, ng2, ns
             #:endif
 
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+            INTEGER(KIND=C_SIZE_T) :: gpu_nx, gpu_ny
+            INTEGER, POINTER :: gpu_map(:)
+            LOGICAL :: gpu_done, gpu_compatible, gpu_scatter
+#endif
+
             CALL timeset(routineN, handle)
 
             IF (pw1%pw_grid%spherical .neqv. pw2%pw_grid%spherical) &
@@ -588,6 +596,46 @@ CONTAINS
                IF (pw1%pw_grid%spherical) &
                   CPABORT("Spherical grids only exist in reciprocal space!")
             #:endif
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+            IF (IS_CONTIGUOUS(pw1%array) .AND. IS_CONTIGUOUS(pw2%array)) THEN
+               gpu_nx = SIZE(pw1%array, KIND=C_SIZE_T)
+               gpu_ny = SIZE(pw2%array, KIND=C_SIZE_T)
+               gpu_compatible = .FALSE.
+               gpu_scatter = gpu_nx < gpu_ny
+               NULLIFY (gpu_map)
+               #:if kind[1]=='1'
+                  IF (ASSOCIATED(pw1%pw_grid, pw2%pw_grid)) THEN
+                     gpu_compatible = gpu_nx == gpu_ny
+                  ELSE
+                     IF (pw1%pw_grid%spherical) THEN
+                        gpu_compatible = pw_compatible(pw1%pw_grid, pw2%pw_grid)
+                     ELSE IF (pw1%pw_grid%id_nr == pw2%pw_grid%reference) THEN
+                        gpu_map => pw2%pw_grid%gidx
+                        gpu_compatible = IS_CONTIGUOUS(gpu_map)
+                     ELSE IF (pw2%pw_grid%id_nr == pw1%pw_grid%reference) THEN
+                        gpu_map => pw1%pw_grid%gidx
+                        gpu_compatible = IS_CONTIGUOUS(gpu_map)
+                     END IF
+                  END IF
+               #:else
+                  gpu_compatible = ALL(SHAPE(pw1%array) == SHAPE(pw2%array)) .AND. .NOT. pw1%pw_grid%spherical
+               #:endif
+               IF (gpu_compatible) THEN
+                  IF (ASSOCIATED(gpu_map)) THEN
+                     gpu_done = pw_gpu_remap_copy(C_LOC(pw1%array), C_LOC(pw2%array), gpu_nx, gpu_ny, &
+                        ${1 if kind[0]=='r' else 2}$, ${1 if kind2[0]=='r' else 2}$, gpu_map, gpu_scatter, 1.0_dp)
+                  ELSE
+                     gpu_done = pw_gpu_copy(C_LOC(pw1%array), C_LOC(pw2%array), gpu_nx, gpu_ny, &
+                        ${1 if kind[0]=='r' else 2}$, ${1 if kind2[0]=='r' else 2}$, 1.0_dp)
+                  END IF
+                  IF (gpu_done) THEN
+                     CALL timestop(handle)
+                     RETURN
+                  END IF
+               END IF
+            END IF
+#endif
 
             #:if kind[1]=='1'
                IF (.NOT. ASSOCIATED(pw1%pw_grid, pw2%pw_grid)) THEN
@@ -761,6 +809,12 @@ CONTAINS
                INTEGER                                            :: i, j, ng, ng1, ng2
             #:endif
 
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+            INTEGER(KIND=C_SIZE_T) :: gpu_nx, gpu_ny
+            INTEGER, POINTER :: gpu_map(:)
+            LOGICAL :: gpu_done, gpu_compatible, gpu_scatter
+#endif
+
             CALL timeset(routineN, handle)
 
             my_alpha = 1.0_dp
@@ -771,6 +825,54 @@ CONTAINS
 
             my_allow_noncompatible_grids = .FALSE.
             IF (PRESENT(allow_noncompatible_grids)) my_allow_noncompatible_grids = allow_noncompatible_grids
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+            IF (IS_CONTIGUOUS(pw1%array) .AND. IS_CONTIGUOUS(pw2%array)) THEN
+               gpu_nx = SIZE(pw1%array, KIND=C_SIZE_T)
+               gpu_ny = SIZE(pw2%array, KIND=C_SIZE_T)
+               gpu_compatible = .FALSE.
+               gpu_scatter = gpu_nx < gpu_ny
+               NULLIFY (gpu_map)
+               #:if kind[1]=='1'
+                  IF (ASSOCIATED(pw1%pw_grid, pw2%pw_grid)) THEN
+                     gpu_compatible = gpu_nx == gpu_ny
+                  ELSE
+                     IF (pw_compatible(pw1%pw_grid, pw2%pw_grid) .OR. my_allow_noncompatible_grids) THEN
+                        IF (pw1%pw_grid%spherical) THEN
+                           gpu_compatible = .TRUE.
+                        ELSE IF (pw1%pw_grid%id_nr == pw2%pw_grid%reference) THEN
+                           gpu_map => pw2%pw_grid%gidx
+                           gpu_compatible = IS_CONTIGUOUS(gpu_map)
+                        ELSE IF (pw2%pw_grid%id_nr == pw1%pw_grid%reference) THEN
+                           gpu_map => pw1%pw_grid%gidx
+                           gpu_compatible = IS_CONTIGUOUS(gpu_map)
+                        END IF
+                     END IF
+                  END IF
+               #:else
+                  gpu_compatible = ALL(SHAPE(pw1%array) == SHAPE(pw2%array)) .AND. &
+                     (ASSOCIATED(pw1%pw_grid, pw2%pw_grid) .OR. &
+                      pw_compatible(pw1%pw_grid, pw2%pw_grid) .OR. my_allow_noncompatible_grids)
+                  ! The nonassociated 3D CPU branch evaluates alpha*X even for
+                  ! alpha=0; retain its NaN and signed-zero behavior.
+                  IF (.NOT. ASSOCIATED(pw1%pw_grid, pw2%pw_grid) .AND. my_alpha == 0.0_dp) &
+                     gpu_compatible = .FALSE.
+               #:endif
+               IF (gpu_compatible) THEN
+                  IF (ASSOCIATED(gpu_map)) THEN
+                     gpu_done = pw_gpu_remap_axpy(C_LOC(pw1%array), C_LOC(pw2%array), gpu_nx, gpu_ny, &
+                        ${1 if kind[0]=='r' else 2}$, ${1 if kind2[0]=='r' else 2}$, gpu_map, gpu_scatter, my_alpha, my_beta)
+                  ELSE
+                     gpu_done = pw_gpu_axpy(C_LOC(pw1%array), C_LOC(pw2%array), gpu_nx, gpu_ny, &
+                        ${1 if kind[0]=='r' else 2}$, ${1 if kind2[0]=='r' else 2}$, my_alpha, my_beta)
+                  END IF
+                  IF (gpu_done) THEN
+                     CALL timestop(handle)
+                     RETURN
+                  END IF
+               END IF
+            END IF
+#endif
 
             IF (my_beta /= 1.0_dp) THEN
                IF (my_beta == 0.0_dp) THEN

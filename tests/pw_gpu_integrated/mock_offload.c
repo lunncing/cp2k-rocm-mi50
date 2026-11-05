@@ -4,12 +4,17 @@
 #include <assert.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define PW_GPU_ELEMENTAL static inline
+#include "pw_gpu_pbe.h"
 
 size_t mock_allocated, mock_peak, mock_limit, mock_allocations;
 int mock_fft_calls, mock_uploads, mock_live_plans;
 int mock_live_streams, mock_live_events, mock_event_records, mock_event_waits;
+int mock_grid_calls, mock_hartree_calls, mock_pbe_calls;
 mock_operation mock_operations[8192];
 size_t mock_operation_count;
 struct mock_fft_plan {
@@ -71,8 +76,9 @@ void mock_reset_trace(void) {
 
 static void touch(const void *ptr, size_t bytes) {
   for (size_t i = 0; i < 64; i++) {
-    if (allocations[i].ptr == ptr) {
-      assert(ptr != NULL && bytes <= allocations[i].size);
+    const uintptr_t base = (uintptr_t)allocations[i].ptr, p = (uintptr_t)ptr;
+    if (base != 0 && p >= base && p - base < allocations[i].size) {
+      assert(bytes <= allocations[i].size - (p - base));
       for (int s = 1; s <= 2; s++) {
         assert(allocations[i].last_use[s] <= streams[active_stream].clock[s] &&
                "device access without a stream dependency");
@@ -345,4 +351,99 @@ void pw_gpu_launch_gather_deriv_acc(double *acc, const double *in, const double 
     acc[2 * i] -= (scale * in[2 * map[i] + 1]) * g[3 * i + idir];
     acc[2 * i + 1] += (scale * in[2 * map[i]]) * g[3 * i + idir];
   }
+}
+
+void pw_gpu_launch_copy(const double *x, double *y, size_t nx, size_t ny,
+    int cx, int cy, double alpha, offloadStream_t stream) {
+  begin_operation(MOCK_GRID_COPY, stream, y, 0);
+  if (nx) touch(x, nx * (size_t)cx * sizeof(double));
+  touch(y, ny * (size_t)cy * sizeof(double));
+  for (size_t i = 0; i < ny; i++)
+    for (int c = 0; c < cy; c++)
+      y[(size_t)cy * i + c] = i < nx
+          ? pw_grid_scale(pw_grid_component(x, i, cx, c), alpha) : 0.0;
+  mock_grid_calls++;
+}
+
+void pw_gpu_launch_axpy(const double *x, double *y, size_t nx, size_t ny,
+    int cx, int cy, double alpha, double beta, offloadStream_t stream) {
+  begin_operation(MOCK_GRID_AXPY, stream, y, 0);
+  if (nx && alpha != 0.0) touch(x, nx * (size_t)cx * sizeof(double));
+  touch(y, ny * (size_t)cy * sizeof(double));
+  for (size_t i = 0; i < ny; i++)
+    for (int c = 0; c < cy; c++) {
+      const size_t j = (size_t)cy * i + c;
+      y[j] = pw_grid_axpy(i < nx && alpha != 0.0
+                            ? pw_grid_component(x, i, cx, c) : 0.0,
+                          beta != 0.0 ? y[j] : 0.0,
+                          i < nx ? alpha : 0.0, beta);
+    }
+  mock_grid_calls++;
+}
+
+void pw_gpu_launch_remap_copy(const double *x, double *y, const int *map,
+    size_t n, int cx, int cy, int scatter, double alpha, offloadStream_t stream) {
+  begin_operation(MOCK_REMAP_COPY, stream, y, 0);
+  if (n) touch(map, n * sizeof(int));
+  for (size_t i = 0; i < n; i++) {
+    const size_t src = scatter ? i : (size_t)map[i] - 1;
+    const size_t dst = scatter ? (size_t)map[i] - 1 : i;
+    touch(x, (src + 1) * (size_t)cx * sizeof(double));
+    touch(y, (dst + 1) * (size_t)cy * sizeof(double));
+    for (int c = 0; c < cy; c++)
+      y[(size_t)cy * dst + c] =
+          pw_grid_scale(pw_grid_component(x, src, cx, c), alpha);
+  }
+  mock_grid_calls++;
+}
+
+void pw_gpu_launch_remap_axpy(const double *x, double *y, const int *map,
+    size_t n, int cx, int cy, int scatter, double alpha, double beta,
+    offloadStream_t stream) {
+  begin_operation(MOCK_REMAP_AXPY, stream, y, 0);
+  if (n) touch(map, n * sizeof(int));
+  for (size_t i = 0; i < n; i++) {
+    const size_t src = scatter ? i : (size_t)map[i] - 1;
+    const size_t dst = scatter ? (size_t)map[i] - 1 : i;
+    if (alpha != 0.0) touch(x, (src + 1) * (size_t)cx * sizeof(double));
+    touch(y, (dst + 1) * (size_t)cy * sizeof(double));
+    for (int c = 0; c < cy; c++) {
+      const size_t j = (size_t)cy * dst + c;
+      y[j] = pw_grid_axpy(alpha != 0.0 ? pw_grid_component(x, src, cx, c) : 0.0,
+                          beta != 0.0 ? y[j] : 0.0, alpha, beta);
+    }
+  }
+  mock_grid_calls++;
+}
+
+void pw_gpu_launch_modify_hartree(double *v, const double *g, const double *gsq,
+    const double *r, const double *radii, const double *cv, size_t n,
+    size_t na, size_t nr, double cut, double vol, offloadStream_t stream) {
+  begin_operation(MOCK_HARTREE, stream, v, 0);
+  touch(v, 2 * n * sizeof(double));
+  touch(g, 3 * n * sizeof(double));
+  touch(gsq, n * sizeof(double));
+  if (na) touch(r, 3 * na * sizeof(double));
+  if (nr) touch(radii, nr * sizeof(double));
+  if (na && nr) touch(cv, na * nr * sizeof(double));
+  for (size_t i = 0; i < n; i++)
+    pw_hartree_elem(v, g, gsq, r, radii, cv, i, na, nr, cut, vol);
+  mock_hartree_calls++;
+}
+
+void pw_gpu_launch_pbe_lda(const double *rho, const double *norm, double *e0,
+    double *erho, double *enorm, size_t n, int grad, double epsilon,
+    double kappa, double beta, double mu, double sc, double sx, offloadStream_t stream) {
+  begin_operation(MOCK_PBE, stream, e0, grad);
+  touch(rho, n * sizeof(double));
+  touch(norm, n * sizeof(double));
+  touch(e0, n * sizeof(double));
+  if (grad) {
+    touch(erho, n * sizeof(double));
+    touch(enorm, n * sizeof(double));
+  }
+  for (size_t i = 0; i < n; i++)
+    pw_pbe_lda_elem(rho, norm, e0, erho, enorm, i, grad, epsilon,
+                    kappa, beta, mu, sc, sx);
+  mock_pbe_calls++;
 }

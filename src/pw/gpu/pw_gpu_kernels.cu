@@ -12,6 +12,7 @@
 
 #define PW_GPU_ELEMENTAL static __device__ inline
 #include "pw_gpu_fused_ops.h"
+#include "pw_gpu_pbe.h"
 
 #if defined(_OMP_H)
 #error "OpenMP should not be used in .cu files to accommodate HIP."
@@ -192,6 +193,121 @@ void pw_gpu_launch_gather_deriv_acc(double *acc, const double *c,
   const int numBlocks = (ngpts + threadsPerBlock - 1) / threadsPerBlock;
   pw_gather_deriv_acc<<<numBlocks, threadsPerBlock, 0, stream>>>(
       acc, c, g, idir, scale, ngpts, ghatmap);
+}
+
+// Grid-stride loops also cover arrays whose double count exceeds INT_MAX.
+__global__ void pw_gpu_copy_kernel(const double *x, double *y, size_t nx,
+                                   size_t ny, int cx, int cy, double alpha) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < ny;
+       i += (size_t)blockDim.x * gridDim.x) {
+    for (int c = 0; c < cy; c++) {
+      y[(size_t)cy * i + c] = i < nx
+          ? pw_grid_scale(pw_grid_component(x, i, cx, c), alpha) : 0.0;
+    }
+  }
+}
+
+__global__ void pw_gpu_axpy_kernel(const double *x, double *y, size_t nx,
+                                   size_t ny, int cx, int cy, double alpha,
+                                   double beta) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < ny;
+       i += (size_t)blockDim.x * gridDim.x) {
+    for (int c = 0; c < cy; c++) {
+      const size_t j = (size_t)cy * i + c;
+      y[j] = pw_grid_axpy(i < nx && alpha != 0.0
+                            ? pw_grid_component(x, i, cx, c) : 0.0,
+                          beta != 0.0 ? y[j] : 0.0,
+                          i < nx ? alpha : 0.0, beta);
+    }
+  }
+}
+
+__global__ void pw_gpu_remap_copy_kernel(const double *x, double *y,
+    const int *gidx, size_t n, int cx, int cy, int scatter, double alpha) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x) {
+    const size_t src = scatter ? i : (size_t)gidx[i] - 1;
+    const size_t dst = scatter ? (size_t)gidx[i] - 1 : i;
+    for (int c = 0; c < cy; c++)
+      y[(size_t)cy * dst + c] =
+          pw_grid_scale(pw_grid_component(x, src, cx, c), alpha);
+  }
+}
+
+__global__ void pw_gpu_remap_axpy_kernel(const double *x, double *y,
+    const int *gidx, size_t n, int cx, int cy, int scatter, double alpha,
+    double beta) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x) {
+    const size_t src = scatter ? i : (size_t)gidx[i] - 1;
+    const size_t dst = scatter ? (size_t)gidx[i] - 1 : i;
+    for (int c = 0; c < cy; c++) {
+      const size_t j = (size_t)cy * dst + c;
+      y[j] = pw_grid_axpy(alpha != 0.0 ? pw_grid_component(x, src, cx, c) : 0.0,
+                          beta != 0.0 ? y[j] : 0.0, alpha, beta);
+    }
+  }
+}
+
+__global__ void modify_hartree_pot_kernel(double *v, const double *g,
+    const double *gsq, const double *r, const double *radii, const double *cv,
+    size_t n, size_t natoms, size_t nradii, double gcut2, double vol) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x)
+    pw_hartree_elem(v, g, gsq, r, radii, cv, i, natoms, nradii, gcut2, vol);
+}
+
+__global__ void pbe_lda_eval_kernel(const double *rho, const double *norm,
+    double *e0, double *erho, double *enorm, size_t n, int grad,
+    double epsilon, double kappa, double beta, double mu, double sc, double sx) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x)
+    pw_pbe_lda_elem(rho, norm, e0, erho, enorm, i, grad, epsilon,
+                    kappa, beta, mu, sc, sx);
+}
+
+static unsigned int pw_grid_blocks(size_t n) {
+  const size_t blocks = n / PW_GPU_MAP_THREADS + (n % PW_GPU_MAP_THREADS != 0);
+  return (unsigned int)(blocks < 65535 ? blocks : 65535);
+}
+
+void pw_gpu_launch_copy(const double *x, double *y, size_t nx, size_t ny,
+    int cx, int cy, double alpha, offloadStream_t s) {
+  if (ny) pw_gpu_copy_kernel<<<pw_grid_blocks(ny), PW_GPU_MAP_THREADS, 0, s>>>(
+      x, y, nx, ny, cx, cy, alpha);
+}
+
+void pw_gpu_launch_axpy(const double *x, double *y, size_t nx, size_t ny,
+    int cx, int cy, double alpha, double beta, offloadStream_t s) {
+  if (ny) pw_gpu_axpy_kernel<<<pw_grid_blocks(ny), PW_GPU_MAP_THREADS, 0, s>>>(
+      x, y, nx, ny, cx, cy, alpha, beta);
+}
+
+void pw_gpu_launch_remap_copy(const double *x, double *y, const int *map,
+    size_t n, int cx, int cy, int scatter, double alpha, offloadStream_t s) {
+  if (n) pw_gpu_remap_copy_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      x, y, map, n, cx, cy, scatter, alpha);
+}
+
+void pw_gpu_launch_remap_axpy(const double *x, double *y, const int *map,
+    size_t n, int cx, int cy, int scatter, double alpha, double beta,
+    offloadStream_t s) {
+  if (n) pw_gpu_remap_axpy_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      x, y, map, n, cx, cy, scatter, alpha, beta);
+}
+
+void pw_gpu_launch_modify_hartree(double *v, const double *g, const double *gsq,
+    const double *r, const double *radii, const double *cv, size_t n,
+    size_t natoms, size_t nradii, double gcut2, double vol, offloadStream_t s) {
+  if (n) modify_hartree_pot_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      v, g, gsq, r, radii, cv, n, natoms, nradii, gcut2, vol);
+}
+
+void pw_gpu_launch_pbe_lda(const double *rho, const double *norm, double *e0,
+    double *erho, double *enorm, size_t n, int grad, double epsilon,
+    double kappa, double beta, double mu, double sc, double sx, offloadStream_t s) {
+  if (n) pbe_lda_eval_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      rho, norm, e0, erho, enorm, n, grad, epsilon, kappa, beta, mu, sc, sx);
 }
 
 #endif // defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)

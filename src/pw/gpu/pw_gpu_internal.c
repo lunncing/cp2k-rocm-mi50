@@ -30,6 +30,7 @@ double pw_cpu_dot_complex_c(const void *a, const void *b, int n_complex) {
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <omp.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -505,6 +506,178 @@ static int pw_gpu_ensure_gbuf_c(const size_t requested_size) {
     device_malloc((void **)&gbuf_dev, requested_size);
     allocated_gbuf_size = requested_size;
   }
+  return 1;
+}
+
+// Reserve the complete operation before uploading or changing any output.
+// All parts except an optional trailing int map are double-aligned. Reusing
+// compact scratch keeps these operations in the existing budget and lifecycle.
+static int pw_ops_reserve(const size_t *counts, const size_t *widths, int nparts,
+                          void **parts, size_t *bytes) {
+  if (!is_initialized) return 0;
+  size_t total = 0;
+  for (int i = 0; i < nparts; i++) {
+    if (counts[i] > (SIZE_MAX - total) / widths[i])
+      return memory_limit_exceeded();
+    bytes[i] = counts[i] * widths[i];
+    total += bytes[i];
+  }
+  offload_activate_chosen_device();
+  if (!pw_gpu_ensure_gbuf_c(total)) return 0;
+  size_t offset = 0;
+  for (int i = 0; i < nparts; i++) {
+    parts[i] = (char *)gbuf_dev + offset;
+    offset += bytes[i];
+  }
+  return 1;
+}
+
+static int pw_grid_op(const double *x, double *y, size_t nx, size_t ny,
+    int cx, int cy, const int *map, int scatter, double alpha, double beta,
+    bool add) {
+  if (ny == 0) return 1;
+  // These attempts may be called from routines used in parallel CPU regions.
+  // Only a serial caller owns the shared PW scratch for grid operations.
+  if (!is_initialized || omp_get_num_threads() != 1) return 0;
+  if ((cx != 1 && cx != 2) || (cy != 1 && cy != 2)) return 0;
+  const size_t n = nx < ny ? nx : ny;
+  if (nx > SIZE_MAX / (sizeof(double) * (size_t)cx) ||
+      ny > SIZE_MAX / (sizeof(double) * (size_t)cy))
+    return memory_limit_exceeded();
+  const size_t xbytes = nx * sizeof(double) * (size_t)cx;
+  const size_t ybytes = ny * sizeof(double) * (size_t)cy;
+  if (ybytes > SIZE_MAX - xbytes ||
+      (map != NULL && n > (SIZE_MAX - xbytes - ybytes) / sizeof(int)))
+    return memory_limit_exceeded();
+  if (map != NULL) {
+    for (size_t i = 0; i < n; i++)
+      if (map[i] < 1 || (size_t)map[i] > (scatter ? ny : nx)) return 0;
+  }
+  // pw_axpy scales Y before reading X on the CPU. Aliased arrays with beta!=1
+  // must retain that ordering, including partially overlapping pointer slices.
+  if (add && beta != 1.0 && alpha != 0.0) {
+    const uintptr_t xp = (uintptr_t)x, yp = (uintptr_t)y;
+    if (xp <= yp ? yp - xp < xbytes : xp - yp < ybytes) return 0;
+  }
+  // Some Fortran compilers promote a real coefficient to complex before
+  // scaling: (a,0)*(xr,xi) then evaluates zero*Inf/NaN cross terms. Retain the
+  // compiler's behavior for nonfinite complex scaling rather than assuming
+  // that two independent real multiplies have identical exceptional results.
+  if (add && cy == 2) {
+    if (alpha != 0.0 && alpha != 1.0) {
+      if (!isfinite(alpha)) return 0;
+      for (size_t i = 0; i < xbytes / sizeof(double); i++)
+        if (!isfinite(x[i])) return 0;
+    }
+    if (beta != 0.0 && beta != 1.0) {
+      if (!isfinite(beta)) return 0;
+      for (size_t i = 0; i < ybytes / sizeof(double); i++)
+        if (!isfinite(y[i])) return 0;
+    }
+  }
+  const size_t counts[] = {nx, ny, map != NULL ? n : 0};
+  const size_t widths[] = {sizeof(double) * (size_t)cx,
+                           sizeof(double) * (size_t)cy, sizeof(int)};
+  void *p[3];
+  size_t b[3];
+  if (!pw_ops_reserve(counts, widths, 3, p, b)) return 0;
+  if (b[0] && (!add || alpha != 0.0))
+    offloadMemcpyAsyncHtoD(p[0], x, b[0], stream);
+  if (add && beta != 0.0) offloadMemcpyAsyncHtoD(p[1], y, b[1], stream);
+  if (b[2]) offloadMemcpyAsyncHtoD(p[2], map, b[2], stream);
+  if (map != NULL) {
+    if (add) {
+      pw_gpu_launch_axpy(NULL, p[1], 0, ny, cx, cy, 0.0, beta, stream);
+      pw_gpu_launch_remap_axpy(p[0], p[1], p[2], n, cx, cy, scatter,
+                               alpha, 1.0, stream);
+    } else {
+      offloadMemsetAsync(p[1], 0, b[1], stream);
+      pw_gpu_launch_remap_copy(p[0], p[1], p[2], n, cx, cy, scatter, alpha, stream);
+    }
+  } else if (add) {
+    pw_gpu_launch_axpy(p[0], p[1], nx, ny, cx, cy, alpha, beta, stream);
+  } else {
+    pw_gpu_launch_copy(p[0], p[1], nx, ny, cx, cy, alpha, stream);
+  }
+  offloadMemcpyAsyncDtoH(y, p[1], b[1], stream);
+  offloadStreamSynchronize(stream);
+  return 1;
+}
+
+int pw_gpu_copy_c(const double *x, double *y, size_t nx, size_t ny, int cx,
+                  int cy, double alpha) {
+  return pw_grid_op(x, y, nx, ny, cx, cy, NULL, 0, alpha, 0.0, false);
+}
+
+int pw_gpu_axpy_c(const double *x, double *y, size_t nx, size_t ny, int cx,
+                  int cy, double alpha, double beta) {
+  return pw_grid_op(x, y, nx, ny, cx, cy, NULL, 0, alpha, beta, true);
+}
+
+int pw_gpu_remap_copy_c(const double *x, double *y, size_t nx, size_t ny, int cx,
+    int cy, const int *gidx, int scatter, double alpha) {
+  if (nx && ny && gidx == NULL) return 0;
+  return pw_grid_op(x, y, nx, ny, cx, cy, gidx, scatter, alpha, 0.0, false);
+}
+
+int pw_gpu_remap_axpy_c(const double *x, double *y, size_t nx, size_t ny, int cx,
+    int cy, const int *gidx, int scatter, double alpha, double beta) {
+  if (nx && ny && gidx == NULL) return 0;
+  return pw_grid_op(x, y, nx, ny, cx, cy, gidx, scatter, alpha, beta, true);
+}
+
+int modify_hartree_pot_gpu_c(double *v, const double *g, const double *gsq,
+    const double *r, const double *radii, const double *cv, size_t n,
+    size_t natoms, size_t nradii, double gcut2, double vol) {
+  if (n == 0) return 1;
+  if (!is_initialized || omp_get_num_threads() != 1) return 0;
+  if (n > SIZE_MAX / (6 * sizeof(double))) return memory_limit_exceeded();
+  // Match the sorted-G CPU loop's EXIT, including untouched coefficients
+  // beyond the first vector above GCUT. G=0 is handled in the Fortran caller.
+  size_t active = 0;
+  while (active < n && !(gsq[active] > gcut2)) active++;
+  n = active;
+  if (n == 0) return 1;
+  if (nradii && natoms > SIZE_MAX / nradii) return memory_limit_exceeded();
+  const size_t counts[] = {n, n, n, natoms, nradii, natoms * nradii};
+  const size_t widths[] = {2 * sizeof(double), 3 * sizeof(double), sizeof(double),
+                           3 * sizeof(double), sizeof(double), sizeof(double)};
+  void *p[6];
+  size_t b[6];
+  if (!pw_ops_reserve(counts, widths, 6, p, b)) return 0;
+  const void *h[] = {v, g, gsq, r, radii, cv};
+  for (int i = 0; i < 6; i++)
+    if (b[i]) offloadMemcpyAsyncHtoD(p[i], h[i], b[i], stream);
+  pw_gpu_launch_modify_hartree(p[0], p[1], p[2], p[3], p[4], p[5], n,
+                               natoms, nradii, gcut2, vol, stream);
+  offloadMemcpyAsyncDtoH(v, p[0], b[0], stream);
+  offloadStreamSynchronize(stream);
+  return 1;
+}
+
+int pbe_lda_eval_gpu_c(const double *rho, const double *norm, double *e0,
+    double *erho, double *enorm, size_t n, int grad, double epsilon,
+    double kappa, double beta, double mu, double sc, double sx) {
+  if (grad < 0 || grad > 1) return 0;
+  if (n == 0) return 1;
+  // pbe_lda_calc calls this once from OMP SINGLE, then broadcasts success.
+  const size_t counts[] = {n, n, n, grad ? n : 0, grad ? n : 0};
+  const size_t widths[] = {sizeof(double), sizeof(double), sizeof(double),
+                           sizeof(double), sizeof(double)};
+  void *p[5];
+  size_t b[5];
+  if (!pw_ops_reserve(counts, widths, 5, p, b)) return 0;
+  const void *h[] = {rho, norm, e0, erho, enorm};
+  for (int i = 0; i < 5; i++)
+    if (b[i]) offloadMemcpyAsyncHtoD(p[i], h[i], b[i], stream);
+  pw_gpu_launch_pbe_lda(p[0], p[1], p[2], p[3], p[4], n, grad, epsilon,
+                        kappa, beta, mu, sc, sx, stream);
+  offloadMemcpyAsyncDtoH(e0, p[2], b[2], stream);
+  if (grad) {
+    offloadMemcpyAsyncDtoH(erho, p[3], b[3], stream);
+    offloadMemcpyAsyncDtoH(enorm, p[4], b[4], stream);
+  }
+  offloadStreamSynchronize(stream);
   return 1;
 }
 

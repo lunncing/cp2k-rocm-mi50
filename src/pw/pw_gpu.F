@@ -57,11 +57,180 @@ MODULE pw_gpu
    PUBLIC :: pw_gpu_gradient_c1d_r3d
    PUBLIC :: pw_gpu_divergence_r3d
    PUBLIC :: pw_gpu_filter_r3d
+   PUBLIC :: pw_gpu_copy, pw_gpu_axpy, pw_gpu_remap_copy, pw_gpu_remap_axpy
+   PUBLIC :: modify_hartree_pot_gpu, pbe_lda_eval_gpu
 
    CHARACTER(len=*), PARAMETER, PRIVATE :: moduleN = 'pw_gpu'
    LOGICAL, PARAMETER, PRIVATE :: debug_this_module = .FALSE.
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Try the nonzero-G Hartree correction. G=0 remains in the caller.
+! **************************************************************************************************
+   LOGICAL FUNCTION modify_hartree_pot_gpu(v, g, gsq, r, radii, cv, n, na, nr, gcut2, vol) RESULT(done)
+      INTEGER, INTENT(IN) :: n, na, nr
+      COMPLEX(KIND=dp), TARGET, INTENT(INOUT) :: v(n)
+      REAL(KIND=dp), TARGET, INTENT(IN) :: g(3, n), gsq(n), r(3, na), radii(nr), cv(nr*na)
+      REAL(KIND=dp), INTENT(IN) :: gcut2, vol
+      INTERFACE
+         FUNCTION modify_hartree_pot_gpu_c(v, g, gsq, r, radii, cv, n, na, nr, gcut2, vol) &
+            BIND(C, name="modify_hartree_pot_gpu_c") RESULT(res)
+            IMPORT :: C_PTR, C_SIZE_T, C_DOUBLE, C_INT
+            TYPE(C_PTR), VALUE :: v, g, gsq, r, radii, cv
+            INTEGER(KIND=C_SIZE_T), VALUE :: n, na, nr
+            REAL(KIND=C_DOUBLE), VALUE :: gcut2, vol
+            INTEGER(KIND=C_INT) :: res
+         END FUNCTION modify_hartree_pot_gpu_c
+      END INTERFACE
+
+      done = .FALSE.
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      done = modify_hartree_pot_gpu_c(C_LOC(v), C_LOC(g), C_LOC(gsq), C_LOC(r), C_LOC(radii), C_LOC(cv), &
+                                    INT(n, C_SIZE_T), INT(na, C_SIZE_T), INT(nr, C_SIZE_T), gcut2, vol) /= 0_C_INT
+#endif
+   END FUNCTION modify_hartree_pot_gpu
+
+! **************************************************************************************************
+!> \brief Try unpolarized PBE energy and first derivatives, preserving existing accumulated values.
+! **************************************************************************************************
+   LOGICAL FUNCTION pbe_lda_eval_gpu(rho, norm, e0, erho, enorm, n, grad, epsilon, &
+                                   kappa, beta, mu, sc, sx) RESULT(done)
+      INTEGER, INTENT(IN) :: n, grad
+      REAL(KIND=dp), TARGET, INTENT(IN) :: rho(n), norm(n)
+      REAL(KIND=dp), TARGET, INTENT(INOUT) :: e0(n), erho(n), enorm(n)
+      REAL(KIND=dp), INTENT(IN) :: epsilon, kappa, beta, mu, sc, sx
+      INTERFACE
+         FUNCTION pbe_lda_eval_gpu_c(rho, norm, e0, erho, enorm, n, grad, epsilon, &
+                                     kappa, beta, mu, sc, sx) BIND(C, name="pbe_lda_eval_gpu_c") RESULT(res)
+            IMPORT :: C_PTR, C_SIZE_T, C_DOUBLE, C_INT
+            TYPE(C_PTR), VALUE :: rho, norm, e0, erho, enorm
+            INTEGER(KIND=C_SIZE_T), VALUE :: n
+            INTEGER(KIND=C_INT), VALUE :: grad
+            REAL(KIND=C_DOUBLE), VALUE :: epsilon, kappa, beta, mu, sc, sx
+            INTEGER(KIND=C_INT) :: res
+         END FUNCTION pbe_lda_eval_gpu_c
+      END INTERFACE
+
+      done = .FALSE.
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      done = pbe_lda_eval_gpu_c(C_LOC(rho), C_LOC(norm), C_LOC(e0), C_LOC(erho), C_LOC(enorm), &
+                              INT(n, C_SIZE_T), INT(grad, C_INT), epsilon, kappa, beta, mu, sc, sx) /= 0_C_INT
+#endif
+   END FUNCTION pbe_lda_eval_gpu
+
+! **************************************************************************************************
+!> \brief Try a synchronous GPU grid operation; false leaves outputs unchanged.
+! **************************************************************************************************
+   LOGICAL FUNCTION pw_gpu_copy(x, y, nx, ny, cx, cy, alpha) RESULT(done)
+      TYPE(C_PTR), VALUE :: x, y
+      INTEGER(KIND=C_SIZE_T), INTENT(IN) :: nx, ny
+      INTEGER, INTENT(IN) :: cx, cy
+      REAL(KIND=dp), INTENT(IN) :: alpha
+      INTERFACE
+         FUNCTION pw_gpu_copy_c(x, y, nx, ny, cx, cy, alpha) &
+            BIND(C, name="pw_gpu_copy_c") RESULT(res)
+            IMPORT :: C_PTR, C_INT, C_SIZE_T, C_DOUBLE
+            TYPE(C_PTR), VALUE :: x, y
+            INTEGER(KIND=C_SIZE_T), VALUE :: nx, ny
+            INTEGER(KIND=C_INT), VALUE :: cx, cy
+            REAL(KIND=C_DOUBLE), VALUE :: alpha
+            INTEGER(KIND=C_INT) :: res
+         END FUNCTION pw_gpu_copy_c
+      END INTERFACE
+
+      done = .FALSE.
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      done = pw_gpu_copy_c(x, y, nx, ny, INT(cx, C_INT), INT(cy, C_INT), &
+         alpha) /= 0_C_INT
+#endif
+   END FUNCTION pw_gpu_copy
+
+! **************************************************************************************************
+!> \brief Try a synchronous GPU grid operation; false leaves outputs unchanged.
+! **************************************************************************************************
+   LOGICAL FUNCTION pw_gpu_axpy(x, y, nx, ny, cx, cy, alpha, beta) RESULT(done)
+      TYPE(C_PTR), VALUE :: x, y
+      INTEGER(KIND=C_SIZE_T), INTENT(IN) :: nx, ny
+      INTEGER, INTENT(IN) :: cx, cy
+      REAL(KIND=dp), INTENT(IN) :: alpha, beta
+      INTERFACE
+         FUNCTION pw_gpu_axpy_c(x, y, nx, ny, cx, cy, alpha, beta) &
+            BIND(C, name="pw_gpu_axpy_c") RESULT(res)
+            IMPORT :: C_PTR, C_INT, C_SIZE_T, C_DOUBLE
+            TYPE(C_PTR), VALUE :: x, y
+            INTEGER(KIND=C_SIZE_T), VALUE :: nx, ny
+            INTEGER(KIND=C_INT), VALUE :: cx, cy
+            REAL(KIND=C_DOUBLE), VALUE :: alpha, beta
+            INTEGER(KIND=C_INT) :: res
+         END FUNCTION pw_gpu_axpy_c
+      END INTERFACE
+
+      done = .FALSE.
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      done = pw_gpu_axpy_c(x, y, nx, ny, INT(cx, C_INT), INT(cy, C_INT), &
+         alpha, beta) /= 0_C_INT
+#endif
+   END FUNCTION pw_gpu_axpy
+
+! **************************************************************************************************
+!> \brief Try a synchronous GPU grid operation; false leaves outputs unchanged.
+! **************************************************************************************************
+   LOGICAL FUNCTION pw_gpu_remap_copy(x, y, nx, ny, cx, cy, gidx, scatter, alpha) RESULT(done)
+      TYPE(C_PTR), VALUE :: x, y
+      INTEGER(KIND=C_SIZE_T), INTENT(IN) :: nx, ny
+      INTEGER, INTENT(IN) :: cx, cy
+      INTEGER(KIND=C_INT), CONTIGUOUS, TARGET, INTENT(IN) :: gidx(:)
+      LOGICAL, INTENT(IN) :: scatter
+      REAL(KIND=dp), INTENT(IN) :: alpha
+      INTERFACE
+         FUNCTION pw_gpu_remap_copy_c(x, y, nx, ny, cx, cy, map, direction, alpha) &
+            BIND(C, name="pw_gpu_remap_copy_c") RESULT(res)
+            IMPORT :: C_PTR, C_INT, C_SIZE_T, C_DOUBLE
+            TYPE(C_PTR), VALUE :: x, y, map
+            INTEGER(KIND=C_SIZE_T), VALUE :: nx, ny
+            INTEGER(KIND=C_INT), VALUE :: cx, cy, direction
+            REAL(KIND=C_DOUBLE), VALUE :: alpha
+            INTEGER(KIND=C_INT) :: res
+         END FUNCTION pw_gpu_remap_copy_c
+      END INTERFACE
+
+      done = .FALSE.
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      done = pw_gpu_remap_copy_c(x, y, nx, ny, INT(cx, C_INT), INT(cy, C_INT), &
+         C_LOC(gidx), MERGE(1_C_INT, 0_C_INT, scatter), alpha) /= 0_C_INT
+#endif
+   END FUNCTION pw_gpu_remap_copy
+
+! **************************************************************************************************
+!> \brief Try a synchronous GPU grid operation; false leaves outputs unchanged.
+! **************************************************************************************************
+   LOGICAL FUNCTION pw_gpu_remap_axpy(x, y, nx, ny, cx, cy, gidx, scatter, alpha, beta) RESULT(done)
+      TYPE(C_PTR), VALUE :: x, y
+      INTEGER(KIND=C_SIZE_T), INTENT(IN) :: nx, ny
+      INTEGER, INTENT(IN) :: cx, cy
+      INTEGER(KIND=C_INT), CONTIGUOUS, TARGET, INTENT(IN) :: gidx(:)
+      LOGICAL, INTENT(IN) :: scatter
+      REAL(KIND=dp), INTENT(IN) :: alpha, beta
+      INTERFACE
+         FUNCTION pw_gpu_remap_axpy_c(x, y, nx, ny, cx, cy, map, direction, alpha, beta) &
+            BIND(C, name="pw_gpu_remap_axpy_c") RESULT(res)
+            IMPORT :: C_PTR, C_INT, C_SIZE_T, C_DOUBLE
+            TYPE(C_PTR), VALUE :: x, y, map
+            INTEGER(KIND=C_SIZE_T), VALUE :: nx, ny
+            INTEGER(KIND=C_INT), VALUE :: cx, cy, direction
+            REAL(KIND=C_DOUBLE), VALUE :: alpha, beta
+            INTEGER(KIND=C_INT) :: res
+         END FUNCTION pw_gpu_remap_axpy_c
+      END INTERFACE
+
+      done = .FALSE.
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      done = pw_gpu_remap_axpy_c(x, y, nx, ny, INT(cx, C_INT), INT(cy, C_INT), &
+         C_LOC(gidx), MERGE(1_C_INT, 0_C_INT, scatter), alpha, beta) /= 0_C_INT
+#endif
+   END FUNCTION pw_gpu_remap_axpy
+
 
 ! **************************************************************************************************
 !> \brief Sets the per-rank budget in MiB (zero means unlimited). Environment overrides take precedence.

@@ -497,9 +497,14 @@ static void environment_limit(void) {
   finish();
 }
 
+#include "test_grid_ops.h"
+
 int main(int argc, char **argv) {
   assert(argc >= 2);
   if (!strcmp(argv[1], "limits")) limits();
+  else if (!strcmp(argv[1], "grid_ops")) grid_ops();
+  else if (!strcmp(argv[1], "new_limits")) new_limits(0);
+  else if (!strcmp(argv[1], "new_disabled")) new_limits(argc > 2 ? atoi(argv[2]) + 1 : 1);
   else if (!strcmp(argv[1], "eviction")) eviction();
   else if (!strcmp(argv[1], "fallback")) fallback();
   else if (!strcmp(argv[1], "late_fallback")) late_fallback();

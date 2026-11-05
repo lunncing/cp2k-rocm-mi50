@@ -1,16 +1,16 @@
-# Integrated PW GPU memory, XC, and CPU integral tests
+# Integrated PW GPU grid, Hartree, PBE, memory, XC, and CPU integral tests
 
-Run from the repository root with Python 3.9+, Fypp, a C11 compiler supporting
-OpenMP, GNU Fortran, and an LP64 BLAS providing `ddot_` (GCC/GFortran and
+Run from the repository root with Python 3.9+, Fypp, C11 and C++17 compilers supporting
+OpenMP, GNU Fortran, and an LP64 BLAS providing `ddot_` (GCC/G++/GFortran and
 OpenBLAS on Linux/WSL work). On Ubuntu the dependencies are available as
-`gcc gfortran libblas-dev fypp`:
+`gcc g++ gfortran libblas-dev fypp`:
 
 ```sh
 python3 tests/pw_gpu_integrated/run_tests.py
 python3 tests/pw_gpu_integrated/run_tests.py --sanitize
 ```
 
-`CC` and `FC` can select compatible C and Fortran compilers. `BLAS_LIBS` supplies
+`CC`, `CXX`, and `FC` can select compatible C, C++, and Fortran compilers. `BLAS_LIBS` supplies
 BLAS linker flags (default `-lblas`, for example `-L/path/to/lib -lopenblas`).
 The second command enables AddressSanitizer, UndefinedBehaviorSanitizer, and
 leak detection. Fortran bounds checks are enabled in both builds.
@@ -28,6 +28,25 @@ an independent direct DFT, used to check the production CPU fallback numerically
 
 Coverage includes:
 
+- All 16 generated copy and AXPY variants compared bit for bit against the
+  original Fortran branches: real/complex conversions, contiguous 1D/3D data,
+  spherical padding/truncation, both reference-grid relations, gather/scatter,
+  arbitrary alpha/beta, strided arrays, aliasing, empty arrays, NaNs and signed zero.
+- Hartree compared to the compiled original atom/Gaussian loops, with complex
+  coefficients, multiple atoms and radii, G=0 present/absent, the GCUT prefix,
+  empty G ranges, and exact CPU fallback. No atom reduction reorders the sum.
+- PBE, revPBE and PBEsol energy and first derivatives compared to compiled
+  `pbe_lda_calc` at `1e-12` relative/absolute tolerance. Covers density cutoff
+  neighbors, nonpositive/NaN densities, zero gradients, independent exchange and
+  correlation scaling, accumulated outputs, and aliased unused derivative arrays.
+  Derivative orders 2/3 retain the original CPU routine. OpenMP teams of 1 and 3
+  execute exactly one GPU attempt via SINGLE/COPYPRIVATE.
+- All new C entry points at exact and one-byte-short memory limits; size overflow,
+  untouched outputs on failed attempts, disabled fallback and allocation cleanup.
+- Production `.cu` bodies and launchers compiled as C++ with CPU launch emulation:
+  empty launches, block boundaries/tails, and grid strides. Only launch syntax and
+  device annotations are replaced. The compiled Fortran comparisons independently
+  check the shared scalar arithmetic used by these kernels and the runtime mock.
 - Exact budget boundaries, replacement growth, overflow rejection, unlimited
   allocation, lowering a live limit, current/peak accounting, and reinitialization.
 - Automatic environment detection before initialization and during initialization;
@@ -93,15 +112,38 @@ large prime transform lengths can be slower because their radix uses a direct DF
 `input_cp2k_global:read_global_section(global_section)` reads a parsed GLOBAL
 section and calls the public setters in `pw_gpu`. This source snapshot has no
 startup GLOBAL reader/caller to connect; the environment path initializes itself
-inside C regardless of whether the input hook is called. No files outside the
-specified implementation files, necessary GPU header, and this test directory
-are changed.
+inside C regardless of whether the input hook is called.
+
+The new C entry points take host pointers and stage each operation in the existing
+compact scratch allocation. The kernels operate on device pointers. Every required
+buffer is reserved before uploads or output writes; a failed attempt returns zero
+so the caller executes its unchanged CPU branch. Grid calls in an OpenMP team and
+AXPY aliases that require CPU scaling order also retain the CPU branch. Nonfinite
+complex scaling retains the compiler's CPU handling of NaN/Inf cross terms. The one-based
+`gidx` maps are uploaded per call, independently of the zero-based FFT map cache;
+scatter maps must be injective, as required by the existing CPU parallel loops.
 
 The accounting covers the two shared work buffers, the optional real/complex
 secondary pair, the legacy map, compact G-space scratch, and every cached map and
 g-vector allocation. Opaque FFT-library
 workspaces and allocations from other CP2K components are outside this budget.
 These mocks do not replace a full CP2K build or CUDA/HIP integration run.
+
+## Source provenance and PBE maintenance
+
+The supplied snapshot omitted the specification's two callers. `src/cp_ddapc_util.F`
+and `src/xc/xc_pbe.F` were restored from CP2K upstream commit
+[`37370f362787e9d04d7644023de78707537d81e5`](https://github.com/cp2k/cp2k/tree/37370f362787e9d04d7644023de78707537d81e5)
+before adding the GPU calls. Their original CPU routines remain the numerical
+references in the tests. Other dependencies of these modules are stubbed, so this
+test suite does not constitute a full CP2K build.
+
+`pw_gpu_pbe.h` is generated from the energy/first-derivative expression trees of
+`pbe_lda_calc`. Regenerate it with `python3 tests/pw_gpu_integrated/generate_pbe_kernel.py`
+when updating those expressions; the suite rejects a stale header. Explicitly
+rounded multiply/add operations prevent contraction on CUDA, and HIP/Clang disables
+contraction in the element functions. Transcendental functions use double precision;
+their hardware results still require verification on a CUDA/HIP system.
 
 A scan of all Fortran sources also found two existing out-of-scope violations:
 `src/xc/xc_rho_set_types.F:407` (187 characters) and `:463` (227 characters).
