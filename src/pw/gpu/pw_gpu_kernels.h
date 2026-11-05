@@ -109,6 +109,15 @@ void pw_gpu_launch_res_cdot_terms(const double *a, const double *b, double *p,
 void pw_gpu_launch_res_sample(const double *x, double *out, size_t n, int width,
                               offloadStream_t stream);
 
+// Natural FFT box order. Influence width is 1 (real) or 2 (complex).
+// Prefix coordinates are validated, zero-based FFT box offsets.
+void pw_gpu_launch_res_natural_cmul(double *v_h, const double *rho,
+    const double *infl, int width, size_t n, offloadStream_t stream);
+void pw_gpu_launch_res_natural_cdot_terms(const double *rho, const double *v_h,
+    double *terms, size_t n, offloadStream_t stream);
+void pw_gpu_launch_res_natural_extract_prefix(const double *src,
+    double *prefix_out, const int *coords, size_t nprefix, offloadStream_t stream);
+
 // Full VRAM pipeline. exc_out is the unscaled sum of energy density; the
 // Fortran wrapper multiplies it by dvol. Outputs are untouched on failure.
 // The basic entry uses epsilon_rho as the gradient cutoff, without filtering

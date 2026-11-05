@@ -88,6 +88,7 @@ typedef struct {
   const int *gidx_host; // reference-grid index (one-based), multigrid paths
   int *gidx_dev;
   int gidx_bound;       // validated upper bound of the gidx entries
+  const int *gidx_natural_map; // NULL: sorted G, otherwise target FFT box
   unsigned long last_use;
 } grid_cache_entry;
 
@@ -121,12 +122,12 @@ static bool protected_xc_buffer = false;
  *        scratch and only created when they fit the budget and free memory.
  ******************************************************************************/
 enum {
-  RES_RHO_G = 0, // borrowed: xc_dev[0, 2 ngpts)
+  RES_RHO_G = 0, // borrowed: xc_dev[0, 2 ngpts), or a full natural FFT box
   RES_RHO_R,     // borrowed: xc_dev_hi[0, nr)
   RES_VXC,       // borrowed: xc_dev[0, nr); Vxc, later dvol*Vxc + V_H
   RES_V_H_R,     // owned
   RES_RHO_CORE,  // owned
-  RES_INFL,      // owned, real part of the influence function
+  RES_INFL,      // owned, compact real influence when its imaginary part is zero
   RES_NSLOTS
 };
 enum { RES_INVALID = 0, RES_VALID, RES_PENDING };
@@ -140,6 +141,7 @@ typedef struct {
   unsigned long epoch;
   int state;
   bool vtot;          // RES_VXC holds dvol*Vxc + V_H instead of Vxc
+  bool natural_g;     // G-space storage uses res_natural's FFT box layout
   bool dev_authoritative; // host must be synchronized before access
   double *samples;    // host copy of the fingerprint values
   size_t sample_capacity;
@@ -157,6 +159,7 @@ static bool opt_res = true, opt_res_density = true, opt_res_hartree = true;
 static bool opt_res_xcin = true, opt_res_pot = true, opt_res_verify = false;
 static bool opt_res_stats = true;
 static bool opt_res_lazy_density = true;
+static bool opt_res_natural_g = true;
 static bool opt_res_lazy_pot = true; // lazy Vxc and V_H (inside the granted window)
 // Lazy (device-authoritative) results are only created inside a window that
 // the SCF driver grants for setups without host readers between a result and
@@ -175,8 +178,22 @@ static struct {
   bool pending;
   unsigned long epoch;
   size_t ngpts;
+  bool natural_g;
+  int npts[3];
   int g0_done, modify_done;
 } res_hartree;
+// The local full-box map is host-owned and immutable until grid invalidation.
+// No full target map is kept on the device by density/Hartree. Bounded staging
+// also makes a lazy natural density synchronizable without a new allocation.
+static struct {
+  int grid_id, npts[3];
+  size_t n;
+  const int *map;
+} res_natural;
+static double *res_natural_dev = NULL;
+static size_t res_natural_capacity = 0;
+#define PW_GPU_RES_NATURAL_CHUNK 65536
+static void res_natural_forget(void);
 static void res_evict_all(void);
 static bool res_evict_one(void);
 static void res_invalidate_borrowed(void);
@@ -476,6 +493,7 @@ void pw_gpu_init(void) {
   opt_res_pot = opt_res && env_flag("CP2K_PW_GPU_RES_POT", true);
   opt_res_verify = opt_res && env_flag("CP2K_PW_GPU_RES_VERIFY", false);
   opt_res_lazy_density = opt_res && env_flag("CP2K_PW_GPU_RES_LAZY_DENSITY", true);
+  opt_res_natural_g = opt_res && env_flag("CP2K_PW_GPU_RES_NATURAL_G", true);
   opt_res_lazy_pot = opt_res && env_flag("CP2K_PW_GPU_RES_LAZY_POT", true);
   opt_res_stats = opt_res && env_flag("CP2K_PW_GPU_RES_STATS", true);
   {
@@ -488,6 +506,7 @@ void pw_gpu_init(void) {
   memset(&res_stats, 0, sizeof(res_stats));
   res_lazy_grant = res_density_token = false;
   memset(&res_hartree, 0, sizeof(res_hartree));
+  memset(&res_natural, 0, sizeof(res_natural));
   res_pinned = 0;
   res_small_dev = NULL;
   res_small_bytes = 0;
@@ -535,6 +554,7 @@ void pw_gpu_grid_invalidate(const int grid_id) {
   }
 #pragma omp critical(pw_gpu_grid_cache)
   {
+    if (res_natural.grid_id == grid_id) res_natural_forget();
     bool found = false;
     for (int i = 0; i < PW_GPU_GRID_CACHE_SIZE; i++) {
       if (grid_cache[i].grid_id == grid_id) {
@@ -701,6 +721,21 @@ static int pw_gpu_ensure_xc_c(const size_t requested_size) {
  ******************************************************************************/
 #include "pw_gpu_res_ops.h"
 
+static void res_natural_download(const double *src, double *dst,
+                                  const int *map, const size_t n) {
+  assert(res_natural_dev != NULL && res_natural_capacity != 0);
+  int *coords = (int *)(res_natural_dev + 2 * res_natural_capacity);
+  for (size_t first = 0; first < n; first += res_natural_capacity) {
+    const size_t count = n - first < res_natural_capacity
+                             ? n - first : res_natural_capacity;
+    offloadMemcpyAsyncHtoD(coords, map + first, count * sizeof(int), stream);
+    pw_gpu_launch_res_natural_extract_prefix(src, res_natural_dev, coords,
+                                              count, stream);
+    offloadMemcpyAsyncDtoH(dst + 2 * first, res_natural_dev,
+                           2 * count * sizeof(double), stream);
+  }
+}
+
 // No allocation is needed to materialize a lazy result, including under memory
 // pressure. Only equal-width slots (density and Vtot) can be authoritative.
 static void res_sync(const int id) {
@@ -710,7 +745,11 @@ static void res_sync(const int id) {
   assert(s->width == s->host_width && (s->owned_bytes != 0 || s->epoch == xc_epoch));
   offload_activate_chosen_device();
   const size_t bytes = s->n * (size_t)s->width * sizeof(double);
-  offloadMemcpyAsyncDtoH((void *)s->host, s->dev, bytes, stream);
+  if (s->natural_g) {
+    res_natural_download(s->dev, (double *)s->host, res_natural.map, s->n);
+  } else {
+    offloadMemcpyAsyncDtoH((void *)s->host, s->dev, bytes, stream);
+  }
   offloadStreamSynchronize(stream);
   s->dev_authoritative = false;
   res_stats.syncs++;
@@ -738,6 +777,23 @@ static void res_invalidate(const int id) {
   res[id].dev_authoritative = false;
   res[id].state = RES_INVALID;
   res[id].vtot = false;
+  res[id].natural_g = false;
+}
+
+static void res_natural_forget(void) {
+  for (int id = 0; id < RES_NSLOTS; id++) {
+    if (res[id].natural_g) {
+      res_sync(id);
+      res_invalidate(id);
+    }
+  }
+  // Coarse-grid reference indices depend on the target's ordering too.
+  for (int i = 0; i < PW_GPU_GRID_CACHE_SIZE; i++) {
+    if (grid_cache[i].gidx_natural_map != NULL)
+      grid_cache_clear_entry(&grid_cache[i]);
+  }
+  if (res_hartree.natural_g) res_hartree.pending = false;
+  memset(&res_natural, 0, sizeof(res_natural));
 }
 
 static void res_invalidate_borrowed(void) {
@@ -806,6 +862,10 @@ static void res_evict_all(void) {
   }
   res_free_small();
   res_invalidate_borrowed();
+  offloadStreamSynchronize(stream);
+  device_free(res_natural_dev, res_natural_capacity * (2 * sizeof(double) + sizeof(int)));
+  res_natural_dev = NULL;
+  res_natural_capacity = 0;
 }
 
 // Free device memory as reported by the runtime (false: unknown).
@@ -935,8 +995,9 @@ static bool res_verify_full(const res_slot *s, const double *h) {
   offloadStreamSynchronize(stream);
   bool ok = true;
   for (size_t e = 0; e < s->n && ok; e++) {
+    const size_t j = s->natural_g ? (size_t)res_natural.map[e] : e;
     for (int c = 0; c < s->width; c++) {
-      ok = ok && res_bits_equal(copy[(size_t)s->width * e + c],
+      ok = ok && res_bits_equal(copy[(size_t)s->width * j + c],
                                 h[(size_t)s->host_width * e + c]);
     }
     if (s->host_width == 2 && s->width == 1) {
@@ -965,6 +1026,7 @@ static void res_bind(const int id, const void *host, const size_t n,
   assert(s->dev == dev);
   s->epoch = xc_epoch;
   s->vtot = false;
+  s->natural_g = false;
   s->dev_authoritative = false;
   s->state = RES_INVALID;
 }
@@ -1017,6 +1079,15 @@ static double *res_lookup(const int id, const void *host, const size_t n,
     res_invalidate(id);
   }
   return NULL;
+}
+
+static double *res_lookup_g(const int id, const void *host, const size_t n,
+                            const bool natural) {
+  if (res[id].natural_g != natural) {
+    res_sync(id);
+    res_invalidate(id);
+  }
+  return res_lookup(id, host, n, false);
 }
 
 // Check the Fortran object's identity before reducing the single resident slot.
@@ -1422,14 +1493,15 @@ static const double *grid_cache_get_g(grid_cache_entry *e,
  *        grid. All entries are checked once to lie in [1, bound].
  ******************************************************************************/
 static const int *grid_cache_get_gidx(grid_cache_entry *e, const int *gidx_host,
-                                      const int bound) {
+                                      const int bound, const int *natural_map) {
   if (e == NULL || gidx_host == NULL) {
     return NULL;
   }
   if (e->ngpts <= 0) {
     return NULL;
   }
-  if (e->gidx_dev != NULL && e->gidx_host == gidx_host && e->gidx_bound == bound) {
+  if (e->gidx_dev != NULL && e->gidx_host == gidx_host && e->gidx_bound == bound &&
+      e->gidx_natural_map == natural_map) {
     return e->gidx_dev;
   }
   if (e->gidx_dev != NULL) {
@@ -1443,17 +1515,31 @@ static const int *grid_cache_get_gidx(grid_cache_entry *e, const int *gidx_host,
     }
   }
   const size_t size = sizeof(int) * (size_t)e->ngpts;
+  int *translated = NULL;
+  if (natural_map != NULL) {
+    translated = malloc(size);
+    if (translated == NULL) return NULL;
+    for (int i = 0; i < e->ngpts; i++)
+      translated[i] = natural_map[gidx_host[i] - 1] + 1;
+  }
   protected_grid_entry = e;
   const int fits = check_and_reclaim_memory(size);
   protected_grid_entry = NULL;
   if (!fits) {
+    free(translated);
     memory_limit_exceeded();
     return NULL;
   }
   device_malloc((void **)&e->gidx_dev, size);
-  offloadMemcpyAsyncHtoD(e->gidx_dev, gidx_host, size, stream);
+  offloadMemcpyAsyncHtoD(e->gidx_dev, translated != NULL ? translated : gidx_host,
+                         size, stream);
+  if (translated != NULL) {
+    offloadStreamSynchronize(stream);
+    free(translated);
+  }
   e->gidx_host = gidx_host;
   e->gidx_bound = bound;
+  e->gidx_natural_map = natural_map;
   return e->gidx_dev;
 }
 
@@ -1637,6 +1723,12 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
   // are overwritten afterwards, which ends the residency of both densities.
   const double *res_g = (ngpts && opt_res_xcin)
       ? res_lookup(RES_RHO_G, zin_rho_g, (size_t)ngpts, false) : NULL;
+  if (res_g != NULL && res[RES_RHO_G].natural_g &&
+      (res_natural.grid_id != grid_id || res_natural.map != ghatmap ||
+       memcmp(res_natural.npts, npts, sizeof(res_natural.npts)))) {
+    res_sync(RES_RHO_G);
+    res_g = NULL;
+  }
   const double *res_r = opt_res_xcin ? res_lookup(RES_RHO_R, din_rho_r, nr, false) : NULL;
   if (ngpts && res_g == NULL) {
     pw_gpu_res_ensure_host_c(RES_RHO_G, (void *)zin_rho_g);
@@ -1646,8 +1738,13 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
     pw_gpu_res_ensure_host_c(RES_RHO_R, (void *)din_rho_r);
     offloadMemcpyAsyncHtoD(rho_dev, din_rho_r, real_size, stream);
   }
-  if (res_g != NULL)
-    pw_gpu_launch_copy(res_g, gbuf_dev, (size_t)ngpts, (size_t)ngpts, 2, 2, 1.0, stream);
+  if (res_g != NULL) {
+    if (res[RES_RHO_G].natural_g) {
+      pw_gpu_launch_gather(gbuf_dev, res_g, 1.0, ngpts, map_dev, stream);
+    } else {
+      pw_gpu_launch_copy(res_g, gbuf_dev, (size_t)ngpts, (size_t)ngpts, 2, 2, 1.0, stream);
+    }
+  }
   if (res_r != NULL) pw_gpu_launch_copy(res_r, rho_dev, nr, nr, 1, 1, 1.0, stream);
   if (res_g != NULL || res_r != NULL) res_stats.xc_in++;
   res_retire_borrowed((res_g != NULL ? 1u << RES_RHO_G : 0u) |
@@ -1786,6 +1883,81 @@ static void res_host_copy(double *dst, const double *src, const size_t n) {
   }
 }
 
+static bool res_natural_prepare(const int grid_id, const int *map,
+                                 const int *npts, const size_t n) {
+  if (res_natural.grid_id != grid_id || res_natural.map != map ||
+      res_natural.n != n || memcmp(res_natural.npts, npts, sizeof(res_natural.npts))) {
+    // Full-box residency requires a permutation, not a cutoff or half-space
+    // map. Validate once per immutable grid, without allocating a device map.
+    unsigned char *seen = calloc((n + 7) / 8, 1);
+    if (seen == NULL) return false;
+    bool valid = true;
+    for (size_t i = 0; i < n; i++) {
+      if (map[i] < 0 || (size_t)map[i] >= n ||
+          (seen[(size_t)map[i] / 8] & (1u << (map[i] % 8)))) {
+        valid = false;
+        break;
+      }
+      seen[(size_t)map[i] / 8] |= (unsigned char)(1u << (map[i] % 8));
+    }
+    free(seen);
+    if (!valid) return false;
+    res_natural_forget();
+    res_natural.grid_id = grid_id;
+    res_natural.map = map;
+    res_natural.n = n;
+    memcpy(res_natural.npts, npts, sizeof(res_natural.npts));
+  }
+  // Drop an old sorted-G map and its derivative vectors before reserving
+  // scratch or optional RHO_CORE/INFL. The coarse-grid maps remain useful.
+  for (int i = 0; i < PW_GPU_GRID_CACHE_SIZE; i++) {
+    if (grid_cache[i].grid_id == grid_id) grid_cache_clear_entry(&grid_cache[i]);
+  }
+  const size_t count = n < PW_GPU_RES_NATURAL_CHUNK ? n : PW_GPU_RES_NATURAL_CHUNK;
+  if (count > res_natural_capacity) {
+    const size_t unit = 2 * sizeof(double) + sizeof(int);
+    if (!check_and_reclaim_memory((count - res_natural_capacity) * unit)) return false;
+    offloadStreamSynchronize(stream);
+    device_free(res_natural_dev, res_natural_capacity * unit);
+    device_malloc((void **)&res_natural_dev, count * unit);
+    res_natural_capacity = count;
+  }
+  return true;
+}
+
+// The host remains in sorted G order. Convert immutable inputs only on a
+// cache miss; the streaming Hartree kernels never read a full device map.
+static bool res_natural_upload(double *dev, const double *host, const int width) {
+  double *box = malloc(res_natural.n * (size_t)width * sizeof(double));
+  if (box == NULL) return false;
+#pragma omp parallel for schedule(static) if (res_natural.n >= 4096)
+  for (size_t i = 0; i < res_natural.n; i++) {
+    const size_t j = (size_t)res_natural.map[i];
+    for (int c = 0; c < width; c++) box[(size_t)width * j + c] = host[2 * i + c];
+  }
+  offloadMemcpyAsyncHtoD(dev, box, res_natural.n * (size_t)width * sizeof(double), stream);
+  offloadStreamSynchronize(stream); // box must outlive its asynchronous upload
+  free(box);
+  return true;
+}
+
+static void res_register_natural_lazy(double *host, const size_t n, double *dev) {
+  res_bind(RES_RHO_G, host, n, 2, 2, dev);
+  res_slot *s = &res[RES_RHO_G];
+  s->natural_g = true;
+  const size_t count = pw_res_sample_count(n);
+  int coords[PW_GPU_RES_PREFIX_SAMPLES + PW_GPU_RES_STRIDED_SAMPLES];
+  for (size_t k = 0; k < count; k++)
+    coords[k] = res_natural.map[pw_res_sample_index(k, n)];
+  int *dev_coords = (int *)(res_natural_dev + 2 * res_natural_capacity);
+  offloadMemcpyAsyncHtoD(dev_coords, coords, count * sizeof(int), stream);
+  pw_gpu_launch_res_natural_extract_prefix(dev, res_natural_dev, dev_coords, count, stream);
+  offloadMemcpyAsyncDtoH(s->samples, res_natural_dev, 2 * count * sizeof(double), stream);
+  offloadStreamSynchronize(stream);
+  s->state = RES_VALID;
+  s->dev_authoritative = true;
+}
+
 /*******************************************************************************
  * \brief density_rs2pw (pw_interp) on the device:
  *          rho_g = 0; for each level l: rho_g += P_l gather(scale_l FFT[r_l]);
@@ -1838,6 +2010,16 @@ static int res_density(const bool lazy_allowed, const int nlevels,
     return 0; // all real inputs must fit into one complex buffer
   }
   offload_activate_chosen_device();
+  // The Fortran entry admits only local grids (one MPI rank owns the box).
+  // Sparse and conjugate half-space maps retain their sorted representation.
+  const bool natural = opt_res_natural_g && t_nmaps == 1 && (size_t)t_ngpts == t_nr;
+  if (natural) {
+    for (int l = 0; l < nlevels; l++) {
+      if (gidx[l] == NULL && (maps[l] != t_map || nmaps[l] != 1 ||
+          memcmp(npts + 3 * l, t_npts, 3 * sizeof(int)))) return 0;
+    }
+    if (!res_natural_prepare(t_grid_id, t_map, t_npts, t_nr)) return 0;
+  }
   if (!pw_gpu_ensure_buffer_c(2 * sizeof(double) * nr_max, 0, false) ||
       !pw_gpu_ensure_gbuf_c(2 * sizeof(double) * ng_max) ||
       !pw_gpu_ensure_xc_c(4 * sizeof(double) * t_nr)) {
@@ -1866,11 +2048,20 @@ static int res_density(const bool lazy_allowed, const int nlevels,
   }
   offloadMemsetAsync(rho_g_dev, 0, 2 * sizeof(double) * (size_t)t_ngpts, stream);
   for (int l = 0; l < nlevels; l++) {
+    if (natural && gidx[l] == NULL) {
+      pw_gpu_launch_real_to_complex(buffer_dev_1 + roff[l], buffer_dev_2,
+                                    (int)nr[l], stream);
+      fft_3d(OFFLOAD_FFT_FORWARD, npts[3 * l + 2], npts[3 * l + 1], npts[3 * l],
+             buffer_dev_2);
+      pw_gpu_launch_copy(buffer_dev_2, buffer_dev_2, t_nr, t_nr, 2, 2, scale[l], stream);
+      pw_gpu_launch_axpy(buffer_dev_2, rho_g_dev, t_nr, t_nr, 2, 2, 1.0, 1.0, stream);
+      continue;
+    }
     grid_cache_entry *e =
         grid_cache_lookup_or_upload(grid_id[l], maps[l], ngpts[l], nmaps[l]);
     const int *gidx_dev = NULL;
     if (e != NULL && gidx[l] != NULL) {
-      gidx_dev = grid_cache_get_gidx(e, gidx[l], t_ngpts);
+      gidx_dev = grid_cache_get_gidx(e, gidx[l], t_ngpts, natural ? t_map : NULL);
     }
     if (e == NULL || (gidx[l] != NULL && gidx_dev == NULL)) {
       offloadStreamSynchronize(stream);
@@ -1891,22 +2082,30 @@ static int res_density(const bool lazy_allowed, const int nlevels,
                                2, 2, 1, 1.0, 1.0, stream);
     }
   }
-  grid_cache_entry *t =
-      grid_cache_lookup_or_upload(t_grid_id, t_map, t_ngpts, t_nmaps);
-  if (t == NULL) {
-    offloadStreamSynchronize(stream);
-    res_stats.density_fail++;
-    return 0;
+  if (natural) {
+    pw_gpu_launch_copy(rho_g_dev, buffer_dev_2, t_nr, t_nr, 2, 2, 1.0, stream);
+  } else {
+    grid_cache_entry *t =
+        grid_cache_lookup_or_upload(t_grid_id, t_map, t_ngpts, t_nmaps);
+    if (t == NULL) {
+      offloadStreamSynchronize(stream);
+      res_stats.density_fail++;
+      return 0;
+    }
+    offloadMemsetAsync(buffer_dev_2, 0, 2 * sizeof(double) * t_nr, stream);
+    pw_gpu_launch_scatter(buffer_dev_2, rho_g_dev, 1.0, t_ngpts, t_nmaps,
+                          t->map_dev, stream);
   }
-  offloadMemsetAsync(buffer_dev_2, 0, 2 * sizeof(double) * t_nr, stream);
-  pw_gpu_launch_scatter(buffer_dev_2, rho_g_dev, 1.0, t_ngpts, t_nmaps,
-                        t->map_dev, stream);
   offloadEventRecord(event_compute_done[0], stream); // rho_g complete and read
   fft_3d(OFFLOAD_FFT_INVERSE, t_npts[2], t_npts[1], t_npts[0], buffer_dev_2);
   pw_gpu_launch_complex_to_real(buffer_dev_2, rho_r_dev, (int)t_nr, stream);
   offloadEventRecord(event_compute_done[1], stream);
   if (lazy) {
-    res_register_lazy(RES_RHO_G, rho_g_host, (size_t)t_ngpts, 2, rho_g_dev, samples);
+    if (natural) {
+      res_register_natural_lazy(rho_g_host, t_nr, rho_g_dev);
+    } else {
+      res_register_lazy(RES_RHO_G, rho_g_host, (size_t)t_ngpts, 2, rho_g_dev, samples);
+    }
     res_register_lazy(RES_RHO_R, rho_r_host, t_nr, 1, rho_r_dev, samples);
     offloadStreamSynchronize(stream);
     res_stats.density++;
@@ -1914,16 +2113,22 @@ static int res_density(const bool lazy_allowed, const int nlevels,
     res_stats.download_saved += sizeof(double) * (2 * (size_t)t_ngpts + t_nr);
     return 1;
   }
-  // The G-space download overlaps the inverse FFT.
+  // Sorted-G downloads overlap the inverse FFT. Natural-G downloads gather
+  // through bounded staging on the compute stream, preserving host ordering.
   offloadStreamWaitEvent(stream_copy, event_compute_done[0]);
-  offloadMemcpyAsyncDtoH(rho_g_host, rho_g_dev,
-                         2 * sizeof(double) * (size_t)t_ngpts, stream_copy);
+  if (natural) {
+    res_natural_download(rho_g_dev, rho_g_host, t_map, t_nr);
+  } else {
+    offloadMemcpyAsyncDtoH(rho_g_host, rho_g_dev,
+                           2 * sizeof(double) * (size_t)t_ngpts, stream_copy);
+  }
   offloadStreamWaitEvent(stream_copy, event_compute_done[1]);
   offloadMemcpyAsyncDtoH(rho_r_host, rho_r_dev, sizeof(double) * t_nr,
                          stream_copy);
   offloadStreamSynchronize(stream_copy);
   offloadStreamSynchronize(stream);
   res_register(RES_RHO_G, rho_g_host, (size_t)t_ngpts, 2, 2, rho_g_dev);
+  res[RES_RHO_G].natural_g = natural;
   res_register(RES_RHO_R, rho_r_host, t_nr, 1, 1, rho_r_dev);
   res_stats.density++;
   return 1;
@@ -2025,7 +2230,7 @@ static int res_potential(const double *v_host, const int nlevels,
     if (l == aux) continue;
     grid_cache_entry *e =
         grid_cache_lookup_or_upload(grid_id[l], maps[l], ngpts[l], nmaps[l]);
-    const int *gidx_dev = grid_cache_get_gidx(e, gidx[l], ngpts[aux]);
+    const int *gidx_dev = grid_cache_get_gidx(e, gidx[l], ngpts[aux], NULL);
     if (e == NULL || gidx_dev == NULL) {
       offloadStreamSynchronize(stream);
       res_stats.potential_fail++;
@@ -2166,12 +2371,14 @@ int pw_gpu_res_vtot_commit_c(const double *vtot_host, const size_t n) {
  *          modify: G=0 term and DDAPC correction of v_H on the device
  *          energy: Re sum conj(rho_tot) v_H          (deterministic sum)
  *          finish: v_H_r = dvol * Re FFT^-1[scatter(v_H)] -> host, resident
+ *        Natural full boxes omit the final scatter; only the DDAPC prefix
+ *        uses indirect accesses, and core/influence conversions are cached.
  *        The steps share the scratch buffers. Any other PW GPU call in between
  *        changes scratch_epoch, after which the remaining steps return 0 and
  *        the caller recomputes everything on the original path.
  ******************************************************************************/
 static int res_hartree_fail(void) {
-  if (res_hartree.pending) {
+  if (is_initialized) {
     offloadStreamSynchronize(stream);
   }
   res_hartree.pending = false;
@@ -2202,37 +2409,68 @@ int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host
   }
   offload_activate_chosen_device();
   const size_t zbytes = 2 * sizeof(double) * ngpts;
-  if (!pw_gpu_ensure_buffer_c(2 * sizeof(double) * nr, 0, false) ||
-      !pw_gpu_ensure_gbuf_c(zbytes)) {
+  const bool natural = opt_res_natural_g && ngpts == nr &&
+      res[RES_RHO_G].state == RES_VALID && res[RES_RHO_G].natural_g &&
+      res[RES_RHO_G].host == rho_g_host && res[RES_RHO_G].n == ngpts &&
+      res_natural.n == nr && !memcmp(res_natural.npts, npts, sizeof(res_natural.npts));
+  protected_xc_buffer = natural;
+  const bool fits = pw_gpu_ensure_buffer_c(2 * sizeof(double) * nr, 0, false) &&
+                    pw_gpu_ensure_gbuf_c(zbytes);
+  protected_xc_buffer = false;
+  if (!fits) {
     res_stats.hartree_fail++;
     return 0;
   }
   double *rho_tot = buffer_dev_2, *v_h = gbuf_dev;
 
   // rho_tot = pw_copy(rho_core); pw_axpy(rho_g, rho_tot)
-  double *core = res_lookup(RES_RHO_CORE, core_host, ngpts, false);
+  double *core = res_lookup_g(RES_RHO_CORE, core_host, ngpts, natural);
   if (core == NULL && res_ensure_owned(RES_RHO_CORE, zbytes)) {
     core = res[RES_RHO_CORE].dev;
-    offloadMemcpyAsyncHtoD(core, core_host, zbytes, stream);
+    if (natural) {
+      if (!res_natural_upload(core, core_host, 2)) return res_hartree_fail();
+    } else {
+      offloadMemcpyAsyncHtoD(core, core_host, zbytes, stream);
+    }
     res_register(RES_RHO_CORE, core_host, ngpts, 2, 2, core);
+    res[RES_RHO_CORE].natural_g = natural;
   }
   res_pinned |= 1u << RES_RHO_CORE;
   if (core != NULL) {
     pw_gpu_launch_copy(core, rho_tot, ngpts, ngpts, 2, 2, 1.0, stream);
+  } else if (natural) {
+    if (!res_natural_upload(rho_tot, core_host, 2)) return res_hartree_fail();
   } else {
     offloadMemcpyAsyncHtoD(rho_tot, core_host, zbytes, stream);
   }
-  const double *rg = res_lookup(RES_RHO_G, rho_g_host, ngpts, false);
+  const double *rg = res_lookup_g(RES_RHO_G, rho_g_host, ngpts, natural);
   if (rg == NULL) {
-    offloadMemcpyAsyncHtoD(v_h, rho_g_host, zbytes, stream);
+    if (natural) {
+      if (!res_natural_upload(v_h, rho_g_host, 2)) return res_hartree_fail();
+    } else {
+      offloadMemcpyAsyncHtoD(v_h, rho_g_host, zbytes, stream);
+    }
     rg = v_h;
   }
   pw_gpu_launch_axpy(rg, rho_tot, ngpts, ngpts, 2, 2, 1.0, 1.0, stream);
 
   // v_H = rho_tot * influence. A real influence function is kept compactly.
   int width = 1;
-  double *infl = res_lookup(RES_INFL, infl_host, ngpts, false);
-  if (infl == NULL) {
+  double *infl = res_lookup_g(RES_INFL, infl_host, ngpts, natural);
+  if (natural) {
+    if (infl != NULL) {
+      width = res[RES_INFL].width;
+    } else {
+      width = res_imag_zero(infl_host, ngpts) ? 1 : 2;
+      const bool resident = res_ensure_owned(RES_INFL, sizeof(double) * ngpts * (size_t)width);
+      infl = resident ? res[RES_INFL].dev : buffer_dev_1;
+      if (!res_natural_upload(infl, infl_host, width)) return res_hartree_fail();
+      if (resident) {
+        res_register(RES_INFL, infl_host, ngpts, width, 2, infl);
+        res[RES_INFL].natural_g = true;
+      }
+    }
+  } else if (infl == NULL) {
     offloadMemcpyAsyncHtoD(buffer_dev_1, infl_host, zbytes, stream);
     bool compact = res_ensure_owned(RES_INFL, sizeof(double) * ngpts);
     if (compact && !res_imag_zero(infl_host, ngpts)) {
@@ -2248,14 +2486,20 @@ int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host
       width = 2;
     }
   }
-  pw_gpu_launch_res_cmul(v_h, rho_tot, infl, width, ngpts, stream);
-  offloadMemcpyAsyncDtoH(rho_tot_host, rho_tot, 2 * sizeof(double) * nprefix,
-                         stream);
+  if (natural) {
+    pw_gpu_launch_res_natural_cmul(v_h, rho_tot, infl, width, nr, stream);
+    res_natural_download(rho_tot, rho_tot_host, res_natural.map, nprefix);
+  } else {
+    pw_gpu_launch_res_cmul(v_h, rho_tot, infl, width, ngpts, stream);
+    offloadMemcpyAsyncDtoH(rho_tot_host, rho_tot, 2 * sizeof(double) * nprefix, stream);
+  }
   offloadStreamSynchronize(stream);
   res_pinned = 0;
   res_hartree.pending = true;
   res_hartree.epoch = scratch_epoch;
   res_hartree.ngpts = ngpts;
+  res_hartree.natural_g = natural;
+  memcpy(res_hartree.npts, npts, sizeof(res_hartree.npts));
   return 1;
 }
 
@@ -2284,6 +2528,10 @@ int pw_gpu_res_hartree_modify_c(const double g0_delta, const int have_g0,
   for (int i = 0; i < 6; i++) {
     total += counts[i];
   }
+  const size_t params = total;
+  if (res_hartree.natural_g) {
+    total += 2 * active + (active * sizeof(int) + sizeof(double) - 1) / sizeof(double);
+  }
   double *small = res_small(total);
   if (small == NULL) {
     return res_hartree_fail();
@@ -2302,12 +2550,21 @@ int pw_gpu_res_hartree_modify_c(const double g0_delta, const int have_g0,
     }
   }
   if (have_g0) {
-    pw_gpu_launch_axpy(dev[0], gbuf_dev, 1, 1, 2, 2, 1.0, 1.0, stream);
+    const size_t g0 = res_hartree.natural_g ? (size_t)res_natural.map[0] : 0;
+    pw_gpu_launch_axpy(dev[0], gbuf_dev + 2 * g0, 1, 1, 2, 2, 1.0, 1.0, stream);
   }
   if (active != 0) {
-    pw_gpu_launch_modify_hartree(gbuf_dev + 2 * first, dev[1], dev[2], dev[3],
+    double *v = res_hartree.natural_g ? small + params : gbuf_dev + 2 * first;
+    int *coords = res_hartree.natural_g ? (int *)(small + params + 2 * active) : NULL;
+    if (res_hartree.natural_g) {
+      offloadMemcpyAsyncHtoD(coords, res_natural.map + first, active * sizeof(int), stream);
+      pw_gpu_launch_res_natural_extract_prefix(gbuf_dev, v, coords, active, stream);
+    }
+    pw_gpu_launch_modify_hartree(v, dev[1], dev[2], dev[3],
                                  dev[4], dev[5], active, natoms, nradii, gcut2,
                                  vol, stream);
+    if (res_hartree.natural_g)
+      pw_gpu_launch_scatter(gbuf_dev, v, 1.0, (int)active, 1, coords, stream);
   }
   // The host arguments may be released by the caller after the return.
   offloadStreamSynchronize(stream);
@@ -2320,7 +2577,11 @@ int pw_gpu_res_hartree_energy_c(double *dot) {
   }
   const size_t n = res_hartree.ngpts;
   double *terms = buffer_dev_1, *partial = buffer_dev_1 + n;
-  pw_gpu_launch_res_cdot_terms(buffer_dev_2, gbuf_dev, terms, n, stream);
+  if (res_hartree.natural_g) {
+    pw_gpu_launch_res_natural_cdot_terms(buffer_dev_2, gbuf_dev, terms, n, stream);
+  } else {
+    pw_gpu_launch_res_cdot_terms(buffer_dev_2, gbuf_dev, terms, n, stream);
+  }
   size_t remaining = n;
   double *sum_in = terms, *sum_out = partial;
   do {
@@ -2340,16 +2601,20 @@ int pw_gpu_res_hartree_finish_c(double *v_h_r_host, const int *npts,
                                 const int grid_id, const int *ghatmap,
                                 const double dvol) {
   size_t nr;
-  if (!res_hartree_ready() || v_h_r_host == NULL || ghatmap == NULL ||
+  if (!res_hartree_ready() || v_h_r_host == NULL || ghatmap == NULL || npts == NULL ||
       !res_grid_points(npts, &nr) || ngpts <= 0 ||
       (size_t)ngpts != res_hartree.ngpts || (nmaps != 1 && nmaps != 2) ||
-      grid_id <= 0) {
+      grid_id <= 0 || memcmp(npts, res_hartree.npts, sizeof(res_hartree.npts))) {
     return res_hartree_fail();
   }
-  grid_cache_entry *e = grid_cache_lookup_or_upload(grid_id, ghatmap, ngpts, nmaps);
-  if (e == NULL || !res_hartree_ready()) {
+  const bool natural = res_hartree.natural_g;
+  if (natural && (nmaps != 1 || grid_id != res_natural.grid_id ||
+                  ghatmap != res_natural.map || nr != res_natural.n)) {
     return res_hartree_fail();
   }
+  grid_cache_entry *e = natural ? NULL :
+      grid_cache_lookup_or_upload(grid_id, ghatmap, ngpts, nmaps);
+  if ((!natural && e == NULL) || !res_hartree_ready()) return res_hartree_fail();
   double *dst = buffer_dev_1;
   const bool resident = opt_res_pot && res_ensure_owned(RES_V_H_R, sizeof(double) * nr);
   if (resident) {
@@ -2370,11 +2635,13 @@ int pw_gpu_res_hartree_finish_c(double *v_h_r_host, const int *npts,
     res_pinned &= ~(1u << RES_V_H_R);
     lazy = samples != NULL && res_sample_buffer(&res[RES_V_H_R], pw_res_sample_count(nr));
   }
-  offloadMemsetAsync(buffer_dev_2, 0, 2 * sizeof(double) * nr, stream);
-  pw_gpu_launch_scatter(buffer_dev_2, gbuf_dev, 1.0, ngpts, nmaps, e->map_dev,
-                        stream);
-  fft_3d(OFFLOAD_FFT_INVERSE, npts[2], npts[1], npts[0], buffer_dev_2);
-  pw_gpu_launch_complex_to_real(buffer_dev_2, dst, (int)nr, stream);
+  double *fft_input = natural ? gbuf_dev : buffer_dev_2;
+  if (!natural) {
+    offloadMemsetAsync(buffer_dev_2, 0, 2 * sizeof(double) * nr, stream);
+    pw_gpu_launch_scatter(buffer_dev_2, gbuf_dev, 1.0, ngpts, nmaps, e->map_dev, stream);
+  }
+  fft_3d(OFFLOAD_FFT_INVERSE, npts[2], npts[1], npts[0], fft_input);
+  pw_gpu_launch_complex_to_real(fft_input, dst, (int)nr, stream);
   pw_gpu_launch_copy(dst, dst, nr, nr, 1, 1, dvol, stream); // pw_scale
   if (lazy) {
     res_register_lazy(RES_V_H_R, v_h_r_host, nr, 1, dst, samples);

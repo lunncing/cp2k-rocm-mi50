@@ -428,6 +428,50 @@ void pw_gpu_launch_res_sample(const double *x, double *out, size_t n, int width,
       x, out, n, width, count);
 }
 
+// Adapted from the verified natural_fft_kernels.cu prototype. Retain the
+// separately rounded arithmetic used by the sorted-G Fortran operations.
+__global__ void pw_gpu_res_natural_cmul_kernel(double *v_h, const double *rho,
+    const double *infl, int width, size_t n) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x)
+    pw_res_cmul_elem(v_h, rho, infl, width, i);
+}
+
+__global__ void pw_gpu_res_natural_cdot_terms_kernel(const double *rho,
+    const double *v_h, double *terms, size_t n) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x)
+    terms[i] = pw_res_cdot_term(rho, v_h, i);
+}
+
+__global__ void pw_gpu_res_natural_extract_prefix_kernel(const double *src,
+    double *prefix_out, const int *coords, size_t nprefix) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < nprefix;
+       i += (size_t)blockDim.x * gridDim.x) {
+    const size_t j = (size_t)coords[i];
+    prefix_out[2 * i] = src[2 * j];
+    prefix_out[2 * i + 1] = src[2 * j + 1];
+  }
+}
+
+void pw_gpu_launch_res_natural_cmul(double *v_h, const double *rho,
+    const double *infl, int width, size_t n, offloadStream_t s) {
+  if (n) pw_gpu_res_natural_cmul_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      v_h, rho, infl, width, n);
+}
+
+void pw_gpu_launch_res_natural_cdot_terms(const double *rho, const double *v_h,
+    double *terms, size_t n, offloadStream_t s) {
+  if (n) pw_gpu_res_natural_cdot_terms_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      rho, v_h, terms, n);
+}
+
+void pw_gpu_launch_res_natural_extract_prefix(const double *src,
+    double *prefix_out, const int *coords, size_t nprefix, offloadStream_t s) {
+  if (nprefix) pw_gpu_res_natural_extract_prefix_kernel<<<pw_grid_blocks(nprefix), PW_GPU_MAP_THREADS, 0, s>>>(
+      src, prefix_out, coords, nprefix);
+}
+
 #endif // defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
 
 // EOF
