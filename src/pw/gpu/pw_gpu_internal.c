@@ -40,6 +40,7 @@ double pw_cpu_dot_complex_c(const void *a, const void *b, int n_complex) {
 #include <string.h>
 
 #include "pw_gpu_host.h"
+#include "grid_passthrough.h"
 
 /*******************************************************************************
  * \brief Static variables for retaining objects that are expensive to create.
@@ -812,8 +813,15 @@ static void res_invalidate_borrowed(void) {
 // consumed density). Anything else that is still live is synchronized first.
 static void res_retire_borrowed(const unsigned consumed) {
   for (int id = 0; id <= RES_VXC; id++) {
-    const bool dead = res_lazy_grant && id != RES_VXC && (consumed & (1u << id));
-    if (!dead) res_sync(id);
+    const bool dead = res_lazy_grant &&
+        (id == RES_RHO_G || id == RES_RHO_R) && (consumed & (1u << id));
+    if (dead) {
+      // Clear authority before invalidating the shared XC storage. These
+      // densities have reached their last consumer in the granted window.
+      res[id].dev_authoritative = false;
+    } else {
+      res_sync(id);
+    }
     res_invalidate(id);
   }
   xc_epoch++;
@@ -885,8 +893,9 @@ static bool res_device_free_memory(size_t *free_bytes) {
 #endif
 }
 
-// An optional slot never evicts anything, stays within the explicit budget and
-// leaves res_reserve_bytes of free device memory to the FFT and other libraries.
+// Reclaim idle caches/optional work buffers for persistent Hartree inputs, but
+// never evict live density, another owned slot, or the active FFT scratch.
+// Leave res_reserve_bytes free for the FFT and other libraries.
 static bool res_ensure_owned(const int id, const size_t bytes) {
   res_slot *s = &res[id];
   if (s->owned_bytes == bytes && s->dev != NULL) {
@@ -897,18 +906,27 @@ static bool res_ensure_owned(const int id, const size_t bytes) {
     return false;
   }
   read_memory_environment();
-  if (max_gpu_memory_bytes != 0) {
-    if (current_gpu_allocated_bytes > max_gpu_memory_bytes ||
-        bytes > max_gpu_memory_bytes - current_gpu_allocated_bytes) {
-      return false;
+  for (;;) {
+    size_t free_bytes;
+    const bool budget_ok = max_gpu_memory_bytes == 0
+        ? bytes <= SIZE_MAX - current_gpu_allocated_bytes
+        : current_gpu_allocated_bytes <= max_gpu_memory_bytes &&
+          bytes <= max_gpu_memory_bytes - current_gpu_allocated_bytes;
+    const bool device_ok = !res_device_free_memory(&free_bytes) ||
+        (free_bytes >= res_reserve_bytes && bytes <= free_bytes - res_reserve_bytes);
+    if (budget_ok && device_ok) break;
+    if (allocated_buffer_size_b != 0) {
+      release_double_buffers();
+      continue;
     }
-  } else if (bytes > SIZE_MAX - current_gpu_allocated_bytes) {
-    return false;
-  }
-  size_t free_bytes;
-  if (res_device_free_memory(&free_bytes) &&
-      (free_bytes < res_reserve_bytes || bytes > free_bytes - res_reserve_bytes)) {
-    return false;
+    grid_cache_entry *oldest = NULL;
+    for (int i = 0; i < PW_GPU_GRID_CACHE_SIZE; i++) {
+      grid_cache_entry *e = &grid_cache[i];
+      if (e->grid_id != 0 && e != protected_grid_entry &&
+          (oldest == NULL || e->last_use < oldest->last_use)) oldest = e;
+    }
+    if (oldest == NULL) return false;
+    grid_cache_clear_entry(oldest);
   }
   device_malloc((void **)&s->dev, bytes);
   s->owned_bytes = bytes;
@@ -1724,7 +1742,7 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
   const double *res_g = (ngpts && opt_res_xcin)
       ? res_lookup(RES_RHO_G, zin_rho_g, (size_t)ngpts, false) : NULL;
   if (res_g != NULL && res[RES_RHO_G].natural_g &&
-      (res_natural.grid_id != grid_id || res_natural.map != ghatmap ||
+      (res_natural.grid_id != grid_id ||
        memcmp(res_natural.npts, npts, sizeof(res_natural.npts)))) {
     res_sync(RES_RHO_G);
     res_g = NULL;
@@ -1970,7 +1988,7 @@ static void res_register_natural_lazy(double *host, const size_t n, double *dev)
  *        Returns 0 with all host outputs untouched if anything is unsupported.
  ******************************************************************************/
 static int res_density(const bool lazy_allowed, const int nlevels,
-                       void *const *r_host, const int *npts,
+                       void *const *r_host, void *const *r_dev, const int *npts,
                        const int *ngpts, const int *nmaps, const int *grid_id,
                        void *const *maps, void *const *gidx, const double *scale,
                        const int *t_npts, const int t_ngpts, const int t_nmaps,
@@ -1993,7 +2011,7 @@ static int res_density(const bool lazy_allowed, const int nlevels,
   for (int l = 0; l < nlevels; l++) {
     if (!res_grid_points(npts + 3 * l, &nr[l]) || ngpts[l] <= 0 ||
         (size_t)ngpts[l] > nr[l] || (nmaps[l] != 1 && nmaps[l] != 2) ||
-        grid_id[l] <= 0 || r_host[l] == NULL || maps[l] == NULL) {
+        grid_id[l] <= 0 || (r_host[l] == NULL && (r_dev == NULL || r_dev[l] == NULL)) || maps[l] == NULL) {
       return 0;
     }
     if (gidx[l] == NULL) {
@@ -2002,7 +2020,7 @@ static int res_density(const bool lazy_allowed, const int nlevels,
       return 0;
     }
     roff[l] = total;
-    total += nr[l];
+    if (r_dev == NULL || r_dev[l] == NULL) total += nr[l];
     nr_max = nr[l] > nr_max ? nr[l] : nr_max;
     ng_max = (size_t)ngpts[l] > ng_max ? (size_t)ngpts[l] : ng_max;
   }
@@ -2043,13 +2061,22 @@ static int res_density(const bool lazy_allowed, const int nlevels,
   }
 
   for (int l = 0; l < nlevels; l++) {
+    if (r_dev != NULL && r_dev[l] != NULL) continue;
     offloadMemcpyAsyncHtoD(buffer_dev_1 + roff[l], r_host[l],
                            sizeof(double) * nr[l], stream);
   }
   offloadMemsetAsync(rho_g_dev, 0, 2 * sizeof(double) * (size_t)t_ngpts, stream);
   for (int l = 0; l < nlevels; l++) {
+    const double *input = buffer_dev_1 + roff[l];
+    if (r_dev != NULL && r_dev[l] != NULL) {
+      const grid_buffer_descriptor source = {r_dev[l], sizeof(double) * nr[l]};
+      grid_buffer_descriptor view;
+      if (!grid_pw_bridge(&source, source.nbytes, &view)) return 0;
+      input = view.dev_ptr;
+      res_stats.upload_saved += source.nbytes;
+    }
     if (natural && gidx[l] == NULL) {
-      pw_gpu_launch_real_to_complex(buffer_dev_1 + roff[l], buffer_dev_2,
+      pw_gpu_launch_real_to_complex(input, buffer_dev_2,
                                     (int)nr[l], stream);
       fft_3d(OFFLOAD_FFT_FORWARD, npts[3 * l + 2], npts[3 * l + 1], npts[3 * l],
              buffer_dev_2);
@@ -2068,7 +2095,7 @@ static int res_density(const bool lazy_allowed, const int nlevels,
       res_stats.density_fail++;
       return 0;
     }
-    pw_gpu_launch_real_to_complex(buffer_dev_1 + roff[l], buffer_dev_2,
+    pw_gpu_launch_real_to_complex(input, buffer_dev_2,
                                   (int)nr[l], stream);
     fft_3d(OFFLOAD_FFT_FORWARD, npts[3 * l + 2], npts[3 * l + 1], npts[3 * l],
            buffer_dev_2);
@@ -2139,11 +2166,11 @@ int pw_gpu_res_density_c(const int nlevels, void *const *r_host, const int *npts
                          void *const *maps, void *const *gidx, const double *scale,
                          const int *t_npts, const int t_ngpts, const int t_nmaps,
                          const int t_grid_id, const int *t_map, double *rho_g_host,
-                         double *rho_r_host) {
+                         double *rho_r_host, void *const *r_dev) {
   // The token is consumed by every attempt, including rejected ones.
   const bool lazy_allowed = res_density_token;
   res_density_token = false;
-  const int done = res_density(lazy_allowed, nlevels, r_host, npts, ngpts, nmaps,
+  const int done = res_density(lazy_allowed, nlevels, r_host, r_dev, npts, ngpts, nmaps,
                                grid_id, maps, gidx, scale, t_npts, t_ngpts,
                                t_nmaps, t_grid_id, t_map, rho_g_host, rho_r_host);
   protected_xc_buffer = false;
@@ -2163,7 +2190,7 @@ static int res_potential(const double *v_host, const int nlevels,
                          void *const *r_host, const int *npts, const int *ngpts,
                          const int *nmaps, const int *grid_id, void *const *maps,
                          void *const *gidx, const double *rscale, const int aux,
-                         const double fwd_scale) {
+                         const double fwd_scale, void **aux_dev) {
   if (!is_initialized || !opt_res_pot || !opt_map_cache ||
       omp_get_num_threads() != 1) {
     return 0;
@@ -2195,6 +2222,9 @@ static int res_potential(const double *v_host, const int nlevels,
     return 0;
   }
   const double *src = res_lookup(RES_VXC, v_host, nr[aux], true);
+  // A borrowed output must live in the resident XC allocation, never scratch
+  // that the interpolation itself or a returned PW pool could overwrite.
+  if (aux_dev != NULL && src == NULL) return 0;
   protected_xc_buffer = src != NULL; // grid cache uploads must not release it
   size_t start = 0;
   if (src == NULL) {
@@ -2249,7 +2279,13 @@ static int res_potential(const double *v_host, const int nlevels,
   }
   // The auxiliary level also comes from the device when the host AXPY was
   // skipped. Do not copy the stale host Vxc into the real-space grid.
-  if (res[RES_VXC].dev_authoritative && res[RES_VXC].host == v_host) {
+  if (aux_dev != NULL) {
+    const grid_buffer_descriptor source = {(void *)src, sizeof(double) * nr[aux]};
+    grid_buffer_descriptor view;
+    if (!grid_pw_bridge(&source, source.nbytes, &view)) return 0;
+    *aux_dev = view.dev_ptr;
+    res_stats.download_saved += source.nbytes;
+  } else if (res[RES_VXC].dev_authoritative && res[RES_VXC].host == v_host) {
     offloadMemcpyAsyncDtoH(r_host[aux], src, sizeof(double) * nr[aux], stream);
     if (r_host[aux] == v_host) res[RES_VXC].dev_authoritative = false;
   } else {
@@ -2270,9 +2306,10 @@ int pw_gpu_res_potential_c(const double *v_host, const int nlevels,
                            void *const *r_host, const int *npts, const int *ngpts,
                            const int *nmaps, const int *grid_id, void *const *maps,
                            void *const *gidx, const double *rscale, const int aux,
-                           const double fwd_scale) {
+                           const double fwd_scale, void **aux_dev) {
+  if (aux_dev != NULL) *aux_dev = NULL;
   const int done = res_potential(v_host, nlevels, r_host, npts, ngpts, nmaps,
-                                 grid_id, maps, gidx, rscale, aux, fwd_scale);
+                                 grid_id, maps, gidx, rscale, aux, fwd_scale, aux_dev);
   protected_xc_buffer = false;
   if (!done) pw_gpu_res_ensure_host_c(RES_VXC, (void *)v_host);
   return done;
@@ -2608,15 +2645,16 @@ int pw_gpu_res_hartree_finish_c(double *v_h_r_host, const int *npts,
     return res_hartree_fail();
   }
   const bool natural = res_hartree.natural_g;
-  if (natural && (nmaps != 1 || grid_id != res_natural.grid_id ||
-                  ghatmap != res_natural.map || nr != res_natural.n)) {
+  if (natural && (nmaps != 1 || grid_id != res_natural.grid_id || nr != res_natural.n)) {
     return res_hartree_fail();
   }
   grid_cache_entry *e = natural ? NULL :
       grid_cache_lookup_or_upload(grid_id, ghatmap, ngpts, nmaps);
   if ((!natural && e == NULL) || !res_hartree_ready()) return res_hartree_fail();
   double *dst = buffer_dev_1;
+  protected_grid_entry = e;
   const bool resident = opt_res_pot && res_ensure_owned(RES_V_H_R, sizeof(double) * nr);
+  protected_grid_entry = NULL;
   if (resident) {
     dst = res[RES_V_H_R].dev;
     // A live V_H of another host array is written back before it is replaced.

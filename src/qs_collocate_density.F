@@ -101,7 +101,7 @@ MODULE qs_collocate_density
                                    realspace_grid_type, &
                                    rs_grid_zero, &
                                    transfer_rs2pw
-   USE rs_pw_interface, ONLY: density_rs2pw
+   USE rs_pw_interface, ONLY: density_rs2pw, rs_pw_grid_prepare
    USE task_list_methods, ONLY: rs_copy_to_buffer, &
                                 rs_distribute_matrix, &
                                 rs_scatter_matrices
@@ -1619,6 +1619,7 @@ CONTAINS
       DEALLOCATE (matrix_images)
 
       ! Map all tasks onto the grids
+      CALL rs_pw_grid_prepare(rs_rho)
       CALL grid_collocate_task_list(task_list=task_list%grid_task_list, &
                                     ga_gb_function=ga_gb_function, &
                                     pab_blocks=task_list%pab_buffer, &

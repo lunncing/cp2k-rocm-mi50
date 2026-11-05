@@ -156,15 +156,19 @@ void pw_gpu_res_invalidate_c(void);
 void pw_gpu_res_ensure_host_c(int id, void *host_ptr);
 int pw_gpu_res_matches_c(int id, const void *host, size_t n);
 int pw_gpu_res_integrate_r_c(double *total_rho_out, double dvol);
+// Non-NULL r_dev[l] borrows a completed, layout-compatible real Grid box and
+// replaces r_host[l]. The caller retains the allocation through this call.
 int pw_gpu_res_density_c(int nlevels, void *const *r_host, const int *npts,
     const int *ngpts, const int *nmaps, const int *grid_id, void *const *maps,
     void *const *gidx, const double *scale, const int *t_npts, int t_ngpts,
     int t_nmaps, int t_grid_id, const int *t_map, double *rho_g_host,
-    double *rho_r_host);
+    double *rho_r_host, void *const *r_dev);
+// Optional aux_dev receives a borrowed resident potential instead of writing
+// r_host[aux]. Consume it synchronously in Grid before any further PW operation.
 int pw_gpu_res_potential_c(const double *v_host, int nlevels, void *const *r_host,
     const int *npts, const int *ngpts, const int *nmaps, const int *grid_id,
     void *const *maps, void *const *gidx, const double *rscale, int aux,
-    double fwd_scale);
+    double fwd_scale, void **aux_dev);
 int pw_gpu_res_vtot_prepare_c(const double *vh_host, const double *vxc_host,
     size_t n, double dvol);
 int pw_gpu_res_vtot_commit_c(const double *vtot_host, size_t n);

@@ -24,7 +24,8 @@
 !> \author Benjamin G. Levine
 ! **************************************************************************************************
 MODULE pw_gpu
-   USE ISO_C_BINDING,                   ONLY: C_DOUBLE,&
+   USE ISO_C_BINDING,                   ONLY: C_ASSOCIATED,&
+                                              C_DOUBLE,&
                                               C_INT,&
                                               C_LOC,&
                                               C_NULL_PTR,&
@@ -63,6 +64,7 @@ MODULE pw_gpu
    PUBLIC :: modify_hartree_pot_gpu, pbe_lda_eval_gpu
    PUBLIC :: pw_gpu_res_enabled, pw_gpu_res_invalidate
    PUBLIC :: pw_gpu_res_density, pw_gpu_res_potential
+   PUBLIC :: pw_gpu_res_density_grid
    PUBLIC :: pw_gpu_res_integrate_r, pw_gpu_res_ensure_host, pw_gpu_res_ensure_host_ptr
    PUBLIC :: pw_gpu_res_hartree_begin, pw_gpu_res_hartree_modify, pw_gpu_res_hartree_energy, &
              pw_gpu_res_hartree_finish, pw_gpu_res_hartree_cancel
@@ -1724,13 +1726,15 @@ CONTAINS
 !> \param mgrid_gspace ...
 !> \param rho ...
 !> \param rho_gspace ...
+!> \param rs_dev_ptrs Optional completed Grid device views with the same FFT layouts.
 !> \return ...
 ! **************************************************************************************************
-   FUNCTION pw_gpu_res_density(mgrid_rspace, mgrid_gspace, rho, rho_gspace) RESULT(done)
+   FUNCTION pw_gpu_res_density(mgrid_rspace, mgrid_gspace, rho, rho_gspace, rs_dev_ptrs) RESULT(done)
       TYPE(pw_r3d_rs_type), DIMENSION(:), INTENT(IN)     :: mgrid_rspace
       TYPE(pw_c1d_gs_type), DIMENSION(:), INTENT(IN)     :: mgrid_gspace
       TYPE(pw_r3d_rs_type), INTENT(INOUT)                :: rho
       TYPE(pw_c1d_gs_type), INTENT(INOUT)                :: rho_gspace
+      TYPE(C_PTR), DIMENSION(:), INTENT(IN), OPTIONAL    :: rs_dev_ptrs
       LOGICAL                                            :: done
 
 #if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
@@ -1740,15 +1744,15 @@ CONTAINS
       INTEGER(KIND=C_INT), DIMENSION(3*max_levels)       :: npts
       INTEGER(KIND=C_INT), DIMENSION(max_levels)         :: grid_id, ngpts, nmaps
       REAL(KIND=C_DOUBLE), DIMENSION(max_levels)         :: scale
-      TYPE(C_PTR), DIMENSION(max_levels)                 :: gidx, maps, r_host
+      TYPE(C_PTR), DIMENSION(max_levels)                 :: gidx, maps, r_host, r_dev
       TYPE(pw_grid_type), POINTER                        :: grid, target_grid
       INTERFACE
          FUNCTION pw_gpu_res_density_c(nlevels, r_host, npts, ngpts, nmaps, grid_id, maps, gidx, &
-                                       scale, t_npts, t_ngpts, t_nmaps, t_grid_id, t_map, rho_g, rho_r) &
+                                       scale, t_npts, t_ngpts, t_nmaps, t_grid_id, t_map, rho_g, rho_r, r_dev) &
             BIND(C, name="pw_gpu_res_density_c") RESULT(res)
             IMPORT :: C_PTR, C_INT, C_DOUBLE
             INTEGER(KIND=C_INT), VALUE                   :: nlevels
-            TYPE(C_PTR), DIMENSION(*), INTENT(IN)        :: r_host
+            TYPE(C_PTR), DIMENSION(*), INTENT(IN)        :: r_host, r_dev
             INTEGER(KIND=C_INT), DIMENSION(*), INTENT(IN) :: npts, ngpts, nmaps, grid_id
             TYPE(C_PTR), DIMENSION(*), INTENT(IN)        :: maps, gidx
             REAL(KIND=C_DOUBLE), DIMENSION(*), INTENT(IN) :: scale
@@ -1762,6 +1766,11 @@ CONTAINS
       done = .FALSE.
       nlevels = SIZE(mgrid_rspace)
       IF (nlevels < 1 .OR. nlevels > max_levels .OR. SIZE(mgrid_gspace) /= nlevels) RETURN
+      r_dev = C_NULL_PTR
+      IF (PRESENT(rs_dev_ptrs)) THEN
+         IF (SIZE(rs_dev_ptrs) /= nlevels) RETURN
+         r_dev(1:nlevels) = rs_dev_ptrs
+      END IF
       IF (.NOT. pw_gpu_res_enabled(pw_gpu_res_density_id)) RETURN
       target_grid => rho_gspace%pw_grid
       IF (.NOT. res_grid_ok(target_grid)) RETURN
@@ -1769,7 +1778,11 @@ CONTAINS
       DO l = 1, nlevels
          grid => mgrid_gspace(l)%pw_grid
          IF (.NOT. res_grid_ok(grid)) RETURN
-         IF (.NOT. res_rs_ok(mgrid_rspace(l), grid)) RETURN
+         r_host(l) = C_NULL_PTR
+         IF (.NOT. C_ASSOCIATED(r_dev(l))) THEN
+            IF (.NOT. res_rs_ok(mgrid_rspace(l), grid)) RETURN
+            r_host(l) = C_LOC(mgrid_rspace(l)%array)
+         END IF
          IF (ASSOCIATED(grid, target_grid)) THEN
             gidx(l) = C_NULL_PTR
          ELSE
@@ -1786,22 +1799,41 @@ CONTAINS
          nmaps(l) = INT(SIZE(grid%g_hatmap, 2), C_INT)
          grid_id(l) = INT(grid%id_nr, C_INT)
          maps(l) = C_LOC(grid%g_hatmap(1, 1))
-         r_host(l) = C_LOC(mgrid_rspace(l)%array)
-         scale(l) = 1.0_dp/REAL(mgrid_rspace(l)%pw_grid%ngpts, KIND=dp)
+         scale(l) = 1.0_dp/REAL(grid%ngpts, KIND=dp)
       END DO
       done = pw_gpu_res_density_c(INT(nlevels, C_INT), r_host, npts, ngpts, nmaps, grid_id, maps, gidx, &
                                   scale, INT(target_grid%npts, C_INT), INT(SIZE(target_grid%gsq), C_INT), &
                                   INT(SIZE(target_grid%g_hatmap, 2), C_INT), INT(target_grid%id_nr, C_INT), &
                                   C_LOC(target_grid%g_hatmap(1, 1)), C_LOC(rho_gspace%array), &
-                                  C_LOC(rho%array)) /= 0_C_INT
+                                  C_LOC(rho%array), r_dev) /= 0_C_INT
 #else
       MARK_USED(mgrid_rspace)
       MARK_USED(mgrid_gspace)
       MARK_USED(rho)
       MARK_USED(rho_gspace)
+      MARK_USED(rs_dev_ptrs)
       done = .FALSE.
 #endif
    END FUNCTION pw_gpu_res_density
+
+! **************************************************************************************************
+!> \brief Consume completed, layout-compatible Grid device views without host copies.
+!>        Optional real grids supply any levels that still require a host transfer.
+   FUNCTION pw_gpu_res_density_grid(rs_dev_ptrs, mgrid_gspace, rho, rho_gspace, mgrid_rspace) RESULT(done)
+      TYPE(C_PTR), DIMENSION(:), INTENT(IN) :: rs_dev_ptrs
+      TYPE(pw_c1d_gs_type), DIMENSION(:), INTENT(IN) :: mgrid_gspace
+      TYPE(pw_r3d_rs_type), INTENT(INOUT) :: rho
+      TYPE(pw_c1d_gs_type), INTENT(INOUT) :: rho_gspace
+      TYPE(pw_r3d_rs_type), DIMENSION(:), INTENT(IN), OPTIONAL :: mgrid_rspace
+      TYPE(pw_r3d_rs_type) :: unused(SIZE(mgrid_gspace))
+      LOGICAL :: done
+
+      IF (PRESENT(mgrid_rspace)) THEN
+         done = pw_gpu_res_density(mgrid_rspace, mgrid_gspace, rho, rho_gspace, rs_dev_ptrs)
+      ELSE
+         done = pw_gpu_res_density(unused, mgrid_gspace, rho, rho_gspace, rs_dev_ptrs)
+      END IF
+   END FUNCTION pw_gpu_res_density_grid
 
 ! **************************************************************************************************
 !> \brief potential_pw2rs (pw_interp branch) on the GPU, bitwise equal to
@@ -1810,12 +1842,14 @@ CONTAINS
 !> \param v_rspace ...
 !> \param mgrid_rspace ...
 !> \param aux the auxiliary (finest) level
+!> \param aux_dev Optional borrowed output, consumed by Grid before another PW operation.
 !> \return ...
 ! **************************************************************************************************
-   FUNCTION pw_gpu_res_potential(v_rspace, mgrid_rspace, aux) RESULT(done)
+   FUNCTION pw_gpu_res_potential(v_rspace, mgrid_rspace, aux, aux_dev) RESULT(done)
       TYPE(pw_r3d_rs_type), INTENT(IN)                   :: v_rspace
       TYPE(pw_r3d_rs_type), DIMENSION(:), INTENT(INOUT)  :: mgrid_rspace
       INTEGER, INTENT(IN)                                :: aux
+      TYPE(C_PTR), INTENT(OUT), OPTIONAL                 :: aux_dev
       LOGICAL                                            :: done
 
 #if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
@@ -1826,10 +1860,12 @@ CONTAINS
       INTEGER(KIND=C_INT), DIMENSION(max_levels)         :: grid_id, ngpts, nmaps
       REAL(KIND=C_DOUBLE), DIMENSION(max_levels)         :: rscale
       TYPE(C_PTR), DIMENSION(max_levels)                 :: gidx, maps, r_host
+      TYPE(C_PTR), TARGET                               :: device
+      TYPE(C_PTR)                                       :: device_out
       TYPE(pw_grid_type), POINTER                        :: aux_grid, grid
       INTERFACE
          FUNCTION pw_gpu_res_potential_c(v_host, nlevels, r_host, npts, ngpts, nmaps, grid_id, maps, &
-                                         gidx, rscale, aux, fwd_scale) &
+                                         gidx, rscale, aux, fwd_scale, aux_dev) &
             BIND(C, name="pw_gpu_res_potential_c") RESULT(res)
             IMPORT :: C_PTR, C_INT, C_DOUBLE
             TYPE(C_PTR), VALUE                           :: v_host
@@ -1840,11 +1876,18 @@ CONTAINS
             REAL(KIND=C_DOUBLE), DIMENSION(*), INTENT(IN) :: rscale
             INTEGER(KIND=C_INT), VALUE                   :: aux
             REAL(KIND=C_DOUBLE), VALUE                   :: fwd_scale
+            TYPE(C_PTR), VALUE                           :: aux_dev
             INTEGER(KIND=C_INT)                          :: res
          END FUNCTION pw_gpu_res_potential_c
       END INTERFACE
 
       done = .FALSE.
+      device = C_NULL_PTR
+      device_out = C_NULL_PTR
+      IF (PRESENT(aux_dev)) THEN
+         aux_dev = C_NULL_PTR
+         device_out = C_LOC(device)
+      END IF
       nlevels = SIZE(mgrid_rspace)
       IF (nlevels < 1 .OR. nlevels > max_levels .OR. aux < 1 .OR. aux > nlevels) RETURN
       IF (.NOT. pw_gpu_res_enabled(pw_gpu_res_pot_id)) RETURN
@@ -1876,11 +1919,13 @@ CONTAINS
       END DO
       done = pw_gpu_res_potential_c(C_LOC(v_rspace%array), INT(nlevels, C_INT), r_host, npts, ngpts, &
                                     nmaps, grid_id, maps, gidx, rscale, INT(aux - 1, C_INT), &
-                                    1.0_dp/REAL(v_rspace%pw_grid%ngpts, KIND=dp)) /= 0_C_INT
+                                    1.0_dp/REAL(v_rspace%pw_grid%ngpts, KIND=dp), device_out) /= 0_C_INT
+      IF (PRESENT(aux_dev)) aux_dev = device
 #else
       MARK_USED(v_rspace)
       MARK_USED(mgrid_rspace)
       MARK_USED(aux)
+      IF (PRESENT(aux_dev)) aux_dev = C_NULL_PTR
       done = .FALSE.
 #endif
    END FUNCTION pw_gpu_res_potential

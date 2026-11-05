@@ -20,6 +20,7 @@ sys.path.insert(0, str(HERMES))
 sys.dont_write_bytecode = True
 import run_tests as hermes  # noqa: E402
 from fortran_tests import run_fortran_tests  # noqa: E402
+from grid_tests import run_grid_tests  # noqa: E402
 
 RES_CASES = ["density", "density_rejects", "potential", "hartree", "chain", "memory",
              "borrowed", "samples", "verify"]
@@ -177,7 +178,17 @@ static void natural_chain(void) {
   }
   // XC still consumes sorted coefficients; hand off without uploading rho_g.
   const unsigned long hits = res[RES_RHO_G].hits;
+  const unsigned long syncs = res_stats.syncs;
+  // The XC wrapper can supply an equal map at a different address. Grid ID
+  // and dimensions define the natural layout, not the temporary's address.
+  int *saved_map = map_[0];
+  map_[0] = malloc(n * sizeof(int));
+  memcpy(map_[0], saved_map, n * sizeof(int));
   assert(xc_call(rg, rr, vxc, &exc));
+  free(map_[0]);
+  map_[0] = saved_map;
+  assert(res_stats.syncs == syncs);
+  assert(!res[RES_RHO_G].dev_authoritative && !res[RES_RHO_R].dev_authoritative);
   pw_gpu_res_ensure_host_c(RES_VXC, vxc);
   same(vxc, ref_vxc, n, "natural XC handoff");
   same(&exc, &ref_exc, 1, "natural XC energy");
@@ -437,6 +448,7 @@ def main():
                 assert "AddressSanitizer" not in r.stderr and "runtime error:" not in r.stderr, r.stderr
             print(f"PASS natural FFT {name} ({overrides or 'defaults'}, OMP=1/3)")
         run_fortran_tests(build, cc, flags, inc, blas, env)
+        run_grid_tests(build, cc, flags, inc, blas, env)
 
 
 if __name__ == "__main__":

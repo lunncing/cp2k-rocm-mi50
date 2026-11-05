@@ -12,6 +12,7 @@
 !> \author JGH (04.2014)
 ! **************************************************************************************************
 MODULE rs_pw_interface
+   USE ISO_C_BINDING,                   ONLY: C_ASSOCIATED, C_NULL_PTR, C_PTR, C_SIZE_T
    USE cp_log_handling,                 ONLY: cp_to_string
    USE cp_spline_utils,                 ONLY: pw_interp,&
                                               pw_prolongate_s3,&
@@ -20,15 +21,23 @@ MODULE rs_pw_interface
    USE gaussian_gridlevels,             ONLY: gridlevel_info_type
    USE input_section_types,             ONLY: section_vals_val_get
    USE kinds,                           ONLY: dp
+   USE offload_api,                     ONLY: offload_grid_bind,&
+                                              offload_grid_device,&
+                                              offload_grid_host,&
+                                              offload_grid_prepare
    USE pw_env_types,                    ONLY: pw_env_get,&
                                               pw_env_type
    USE pw_gpu,                          ONLY: pw_gpu_res_density,&
+                                              pw_gpu_res_density_grid,&
+                                              pw_gpu_res_density_id,&
+                                              pw_gpu_res_enabled,&
                                               pw_gpu_res_ensure_host,&
                                               pw_gpu_res_potential
    USE pw_methods,                      ONLY: pw_axpy,&
                                               pw_copy,&
                                               pw_transfer,&
                                               pw_zero
+   USE pw_grid_types,                   ONLY: PW_MODE_LOCAL, pw_grid_type
    USE pw_pool_types,                   ONLY: pw_pool_p_type,&
                                               pw_pools_create_pws,&
                                               pw_pools_give_back_pws
@@ -48,9 +57,46 @@ MODULE rs_pw_interface
 ! *** Public subroutines ***
 
    PUBLIC :: density_rs2pw, &
-             potential_pw2rs
+             potential_pw2rs, rs_pw_grid_prepare
 
 CONTAINS
+
+! **************************************************************************************************
+!> \brief Only serial, unpadded grids share the PW FFT layout without communication.
+   FUNCTION grid_layout_ok(rs, grid) RESULT(ok)
+      TYPE(realspace_grid_type), INTENT(IN) :: rs
+      TYPE(pw_grid_type), POINTER :: grid
+      LOGICAL :: ok
+
+      ok = .FALSE.
+      IF (.NOT. ASSOCIATED(rs%desc) .OR. .NOT. ASSOCIATED(grid)) RETURN
+      IF (.NOT. ASSOCIATED(rs%desc%pw, grid)) RETURN
+      IF (rs%desc%distributed .OR. rs%desc%parallel .OR. rs%desc%border /= 0) RETURN
+      IF (grid%para%mode /= PW_MODE_LOCAL .OR. grid%spherical) RETURN
+      IF (ANY(rs%npts_local /= grid%npts)) RETURN
+      IF (INT(rs%ngpts_local, C_SIZE_T) /= PRODUCT(INT(grid%npts, C_SIZE_T))) RETURN
+      IF (ANY(rs%lb_local /= grid%bounds(1, :)) .OR. ANY(rs%ub_local /= grid%bounds(2, :))) RETURN
+      IF (.NOT. ASSOCIATED(rs%buffer%host_buffer)) RETURN
+      IF (SIZE(rs%buffer%host_buffer) < rs%ngpts_local) RETURN
+      ok = .TRUE.
+   END FUNCTION grid_layout_ok
+
+! **************************************************************************************************
+!> \brief Opt in only the collocation immediately followed by density_rs2pw.
+   SUBROUTINE rs_pw_grid_prepare(rs_grids)
+      TYPE(realspace_grid_type), DIMENSION(:), INTENT(IN) :: rs_grids
+      INTEGER :: l
+      LOGICAL :: defer
+
+      DO l = 1, SIZE(rs_grids)
+         defer = .FALSE.
+         IF (ASSOCIATED(rs_grids(l)%desc)) THEN
+            defer = pw_gpu_res_enabled(pw_gpu_res_density_id) .AND. &
+                    grid_layout_ok(rs_grids(l), rs_grids(l)%desc%pw)
+         END IF
+         CALL offload_grid_prepare(rs_grids(l)%buffer, defer)
+      END DO
+   END SUBROUTINE rs_pw_grid_prepare
 
 ! **************************************************************************************************
 !> \brief given partial densities on the realspace multigrids,
@@ -77,7 +123,8 @@ CONTAINS
       CHARACTER(LEN=*), PARAMETER                        :: routineN = 'density_rs2pw'
 
       INTEGER                                            :: handle, igrid_level, interp_kind
-      LOGICAL                                            :: lazy
+      LOGICAL                                            :: lazy, grid_done, any_device
+      TYPE(C_PTR)                                        :: rs_dev_ptrs(SIZE(rs_rho))
       TYPE(gridlevel_info_type), POINTER                 :: gridlevel_info
       TYPE(pw_c1d_gs_type), ALLOCATABLE, DIMENSION(:)    :: mgrid_gspace
       TYPE(pw_pool_p_type), DIMENSION(:), POINTER        :: pw_pools
@@ -99,7 +146,36 @@ CONTAINS
 
       CALL pw_pools_create_pws(pw_pools, mgrid_gspace)
 
-      IF (gridlevel_info%ngrid_levels == 1) THEN
+      rs_dev_ptrs = C_NULL_PTR
+      grid_done = .FALSE.
+      any_device = .FALSE.
+      IF (interp_kind == pw_interp) THEN
+         DO igrid_level = 1, gridlevel_info%ngrid_levels
+            IF (grid_layout_ok(rs_rho(igrid_level), mgrid_gspace(igrid_level)%pw_grid)) THEN
+               rs_dev_ptrs(igrid_level) = offload_grid_device(rs_rho(igrid_level)%buffer, &
+                                                             rs_rho(igrid_level)%ngpts_local)
+               any_device = any_device .OR. C_ASSOCIATED(rs_dev_ptrs(igrid_level))
+            END IF
+         END DO
+         IF (any_device) THEN
+            DO igrid_level = 1, gridlevel_info%ngrid_levels
+               IF (C_ASSOCIATED(rs_dev_ptrs(igrid_level))) CYCLE
+               CALL offload_grid_host(rs_rho(igrid_level)%buffer)
+               CALL transfer_rs2pw(rs_rho(igrid_level), mgrid_rspace(igrid_level))
+            END DO
+            grid_done = pw_gpu_res_density_grid(rs_dev_ptrs(1:gridlevel_info%ngrid_levels), &
+                                                mgrid_gspace(1:gridlevel_info%ngrid_levels), rho, rho_gspace, &
+                                                mgrid_rspace(1:gridlevel_info%ngrid_levels))
+         END IF
+      END IF
+      DO igrid_level = 1, gridlevel_info%ngrid_levels
+         IF (.NOT. grid_done) CALL offload_grid_host(rs_rho(igrid_level)%buffer)
+         CALL offload_grid_prepare(rs_rho(igrid_level)%buffer, .FALSE.)
+      END DO
+
+      IF (grid_done) THEN
+         ! The Grid allocations were read directly; all PW outputs are complete.
+      ELSE IF (gridlevel_info%ngrid_levels == 1) THEN
          CALL transfer_rs2pw(rs_rho(1), rho)
          CALL pw_transfer(rho, rho_gspace)
          IF (rho%pw_grid%spherical) THEN ! rho_gspace = rho
@@ -159,6 +235,7 @@ CONTAINS
 !> \param rs_v OUTPUT: the potential on the realspace multigrids
 !> \param v_rspace INPUT : the potential on a planewave grid in Rspace
 !> \param pw_env ...
+!> \param device_grid The caller immediately integrates these grids before any further PW operation.
 !> \par History
 !>      09.2006 created [Joost VandeVondele]
 !> \note
@@ -166,18 +243,21 @@ CONTAINS
 !>      should contain all parallel communication of integrate_v_rspace in the
 !>      case of replicated grids.
 ! **************************************************************************************************
-   SUBROUTINE potential_pw2rs(rs_v, v_rspace, pw_env)
+   SUBROUTINE potential_pw2rs(rs_v, v_rspace, pw_env, device_grid)
 
       TYPE(realspace_grid_type), DIMENSION(:), &
          INTENT(IN)                                      :: rs_v
       TYPE(pw_r3d_rs_type), INTENT(IN)                   :: v_rspace
       TYPE(pw_env_type), INTENT(IN)                      :: pw_env
+      LOGICAL, INTENT(IN), OPTIONAL                      :: device_grid
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'potential_pw2rs'
 
       INTEGER                                            :: auxbas_grid, handle, igrid_level, &
                                                             interp_kind
       REAL(KIND=dp)                                      :: scale
+      LOGICAL                                            :: done, bind_grid
+      TYPE(C_PTR)                                        :: aux_dev
       TYPE(gridlevel_info_type), POINTER                 :: gridlevel_info
       TYPE(pw_c1d_gs_type), ALLOCATABLE, DIMENSION(:)    :: mgrid_gspace
       TYPE(pw_pool_p_type), DIMENSION(:), POINTER        :: pw_pools
@@ -193,11 +273,23 @@ CONTAINS
 
       ! use either realspace or fft techniques to get the potential on the rs multigrids
       CALL section_vals_val_get(pw_env%interp_section, "KIND", i_val=interp_kind)
+      aux_dev = C_NULL_PTR
+      bind_grid = .FALSE.
+      IF (PRESENT(device_grid)) bind_grid = device_grid
+      bind_grid = bind_grid .AND. grid_layout_ok(rs_v(auxbas_grid), v_rspace%pw_grid)
+      DO igrid_level = 1, gridlevel_info%ngrid_levels
+         CALL offload_grid_prepare(rs_v(igrid_level)%buffer, .FALSE.)
+      END DO
       SELECT CASE (interp_kind)
       CASE (pw_interp)
          ! The same sequence on the GPU; the G-space multigrids never leave the device.
-         IF (.NOT. pw_gpu_res_potential(v_rspace, mgrid_rspace(1:gridlevel_info%ngrid_levels), &
-                                        auxbas_grid)) THEN
+         done = .FALSE.
+         IF (bind_grid) THEN
+            done = pw_gpu_res_potential(v_rspace, mgrid_rspace(1:gridlevel_info%ngrid_levels), auxbas_grid, aux_dev)
+         ELSE
+            done = pw_gpu_res_potential(v_rspace, mgrid_rspace(1:gridlevel_info%ngrid_levels), auxbas_grid)
+         END IF
+         IF (.NOT. done) THEN
             CALL pw_gpu_res_ensure_host(v_rspace)
             CALL pw_pools_create_pws(pw_pools, mgrid_gspace)
             CALL pw_transfer(v_rspace, mgrid_gspace(auxbas_grid))
@@ -240,6 +332,11 @@ CONTAINS
       END SELECT
 
       DO igrid_level = 1, gridlevel_info%ngrid_levels
+         IF (igrid_level == auxbas_grid .AND. C_ASSOCIATED(aux_dev)) THEN
+            done = offload_grid_bind(rs_v(igrid_level)%buffer, aux_dev, rs_v(igrid_level)%ngpts_local)
+            CPASSERT(done)
+            CYCLE
+         END IF
          CALL transfer_pw2rs(rs_v(igrid_level), &
                              mgrid_rspace(igrid_level))
       END DO

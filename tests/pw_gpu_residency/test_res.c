@@ -150,7 +150,7 @@ static int density_call(double *const *r, double *rho_g, double *rho_r, const in
   }
   pw_gpu_res_defer_density_c(token);
   return pw_gpu_res_density_c(NLEV, rp, npts, ng_, nm, ids, mp, gp, scale, dims[0],
-                              ng_[0], nmaps_, 1, map_[0], rho_g, rho_r);
+                              ng_[0], nmaps_, 1, map_[0], rho_g, rho_r, NULL);
 }
 
 // The SCF iteration density (deferred inside an open window).
@@ -182,7 +182,7 @@ static int potential_fused(const double *v, double *const *r, const double *rsca
     ids[l] = l + 1; nm[l] = nmaps_;
   }
   return pw_gpu_res_potential_c(v, NLEV, rp, npts, ng_, nm, ids, mp, gp, rscale, 0,
-                                1.0 / nr_[0]);
+                                1.0 / nr_[0], NULL);
 }
 
 // Hartree + DDAPC decoupling (qs_ks_build_kohn_sham_matrix with MULTIPOLE).

@@ -404,7 +404,12 @@ CONTAINS
                NULLIFY (${var_long_pw}$)
                ALLOCATE (${var_long_pw}$)
                #:endif
-               CALL xc_rho_set_recover_pw_low(${var_long_pw}$, rho_set%${var_long_rho}$, pw_grid, pw_pool#{if variable =="drho"}#, rho_set%drhoa(i)%array, rho_set%drhob(i)%array#{endif}#)
+               #:if variable == "drho"
+               CALL xc_rho_set_recover_pw_low(${var_long_pw}$, rho_set%${var_long_rho}$, pw_grid, pw_pool, &
+                                            rho_set%drhoa(i)%array, rho_set%drhob(i)%array)
+               #:else
+               CALL xc_rho_set_recover_pw_low(${var_long_pw}$, rho_set%${var_long_rho}$, pw_grid, pw_pool)
+               #:endif
                #:if not variable.startswith("drho")
                   NULLIFY (rho_set%${var_long_rho}$)
                #:else
@@ -460,7 +465,9 @@ CONTAINS
 
             INTEGER                                            :: i
 
-            #:for variable in ["rho", "drho", "norm_drho", "rhoa", "rhob", "norm_drhoa", "norm_drhob", "rho_1_3", "rhoa_1_3", "rhob_1_3", "laplace_rho", "laplace_rhoa", "laplace_rhob", "drhoa", "drhob", "tau", "tau_a", "tau_b"]
+            #:for variable in ["rho", "drho", "norm_drho", "rhoa", "rhob", "norm_drhoa", "norm_drhob", &
+                               "rho_1_3", "rhoa_1_3", "rhob_1_3", "laplace_rho", "laplace_rhoa", "laplace_rhob", &
+                               "drhoa", "drhob", "tau", "tau_a", "tau_b"]
                $:recover(variable)
             #:endfor
 
