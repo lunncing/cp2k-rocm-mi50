@@ -61,6 +61,7 @@ MODULE pw_grids
                                               pw_grid_type
    USE util,                            ONLY: get_limit,&
                                               sort
+!$ USE OMP_LIB, ONLY: omp_get_max_threads, omp_in_parallel
 #include "../base/base_uses.f90"
 
    IMPLICIT NONE
@@ -1778,34 +1779,43 @@ CONTAINS
       ALLOCATE (idx(ng))
 
       ! grids are (locally) ordered by length of G-vectors
-      CALL sort(pw_grid%gsq, ng, idx)
+      ! (a stable sort: the result is the same as that of util's sort, see sort_gsq)
+      CALL sort_gsq(pw_grid%gsq, ng, idx)
       ! within shells order wrt x,y,z
       CALL sort_shells(pw_grid%gsq, pw_grid%g_hat, idx)
 
       ALLOCATE (real_tmp(3, ng))
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(idx, ng, pw_grid, real_tmp) PRIVATE(i)
       DO i = 1, ng
          real_tmp(1, i) = pw_grid%g(1, idx(i))
          real_tmp(2, i) = pw_grid%g(2, idx(i))
          real_tmp(3, i) = pw_grid%g(3, idx(i))
       END DO
+!$OMP END PARALLEL DO
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(ng, pw_grid, real_tmp) PRIVATE(i)
       DO i = 1, ng
          pw_grid%g(1, i) = real_tmp(1, i)
          pw_grid%g(2, i) = real_tmp(2, i)
          pw_grid%g(3, i) = real_tmp(3, i)
       END DO
+!$OMP END PARALLEL DO
       DEALLOCATE (real_tmp)
 
       ALLOCATE (int_tmp(3, ng))
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(idx, int_tmp, ng, pw_grid) PRIVATE(i)
       DO i = 1, ng
          int_tmp(1, i) = pw_grid%g_hat(1, idx(i))
          int_tmp(2, i) = pw_grid%g_hat(2, idx(i))
          int_tmp(3, i) = pw_grid%g_hat(3, idx(i))
       END DO
+!$OMP END PARALLEL DO
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(int_tmp, ng, pw_grid) PRIVATE(i)
       DO i = 1, ng
          pw_grid%g_hat(1, i) = int_tmp(1, i)
          pw_grid%g_hat(2, i) = int_tmp(2, i)
          pw_grid%g_hat(3, i) = int_tmp(3, i)
       END DO
+!$OMP END PARALLEL DO
       DEALLOCATE (int_tmp)
 
       DEALLOCATE (idx)
@@ -1831,7 +1841,10 @@ CONTAINS
                it = ig
             END DO
             ! now for the ones that could not be done
-            IF (ng == ngr) THEN
+            IF (ng == ngr .AND. use_gidx_table(pw_grid, ref_grid)) THEN
+               ! for the case pw_grid <= ref_grid: direct lookup of the (unique) Miller indices
+               CALL gidx_from_table(pw_grid, ref_grid, it, ngr)
+            ELSE IF (ng == ngr) THEN
                ! for the case pw_grid <= ref_grid
                is = it
                DO ig = it + 1, ngr
@@ -1931,6 +1944,235 @@ CONTAINS
    END SUBROUTINE pw_grid_sort
 
 ! **************************************************************************************************
+!> \brief Stable ascending sort of arr, returning the original positions in idx. Chunks are sorted
+!>        concurrently with util's (stable merge) sort and merged pairwise, taking the right run
+!>        only if it is strictly smaller. Ties therefore keep their original order and the result
+!>        (arr and idx) is identical to CALL sort(arr, n, idx).
+!> \param arr ...
+!> \param n ...
+!> \param idx ...
+! **************************************************************************************************
+   SUBROUTINE sort_gsq(arr, n, idx)
+      INTEGER, INTENT(IN)                                :: n
+      REAL(KIND=dp), DIMENSION(1:n), INTENT(INOUT)       :: arr
+      INTEGER, DIMENSION(1:n), INTENT(INOUT)             :: idx
+
+      INTEGER                                            :: c, hi, i, lo, mid, nchunk, nthreads, &
+                                                            width
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bounds, tmp_idx
+      LOGICAL                                            :: in_tmp
+      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: tmp_arr
+
+      nthreads = 1
+!$    nthreads = omp_get_max_threads()
+!$    IF (omp_in_parallel()) nthreads = 1
+      IF (nthreads < 2 .OR. n < 65536) THEN
+         CALL sort(arr, n, idx)
+         RETURN
+      END IF
+
+      nchunk = 1
+      DO WHILE (nchunk < nthreads .AND. nchunk < 256)
+         nchunk = 2*nchunk
+      END DO
+      ALLOCATE (bounds(0:nchunk))
+      DO c = 0, nchunk
+         bounds(c) = INT(INT(c, int_8)*INT(n, int_8)/INT(nchunk, int_8))
+      END DO
+
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(arr, bounds, idx, nchunk) PRIVATE(c, hi, i, lo) &
+!$OMP             SCHEDULE(DYNAMIC, 1)
+      DO c = 1, nchunk
+         lo = bounds(c - 1) + 1
+         hi = bounds(c)
+         CALL sort(arr(lo:hi), hi - lo + 1, idx(lo:hi))
+         DO i = lo, hi
+            idx(i) = idx(i) + lo - 1
+         END DO
+      END DO
+!$OMP END PARALLEL DO
+
+      ALLOCATE (tmp_arr(n), tmp_idx(n))
+      in_tmp = .FALSE.
+      width = 1
+      DO WHILE (width < nchunk)
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(arr, bounds, idx, in_tmp, nchunk, tmp_arr, tmp_idx, width) &
+!$OMP             PRIVATE(c, hi, lo, mid) SCHEDULE(DYNAMIC, 1)
+         DO c = 0, nchunk - 1, 2*width
+            lo = bounds(c) + 1
+            mid = bounds(MIN(c + width, nchunk))
+            hi = bounds(MIN(c + 2*width, nchunk))
+            IF (in_tmp) THEN
+               CALL merge_runs(tmp_arr, tmp_idx, arr, idx, lo, mid, hi)
+            ELSE
+               CALL merge_runs(arr, idx, tmp_arr, tmp_idx, lo, mid, hi)
+            END IF
+         END DO
+!$OMP END PARALLEL DO
+         in_tmp = .NOT. in_tmp
+         width = 2*width
+      END DO
+
+      IF (in_tmp) THEN
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(arr, idx, n, tmp_arr, tmp_idx) PRIVATE(i)
+         DO i = 1, n
+            arr(i) = tmp_arr(i)
+            idx(i) = tmp_idx(i)
+         END DO
+!$OMP END PARALLEL DO
+      END IF
+      DEALLOCATE (bounds, tmp_arr, tmp_idx)
+
+   END SUBROUTINE sort_gsq
+
+! **************************************************************************************************
+!> \brief Stable merge of the sorted runs src(lo:mid) and src(mid+1:hi) into dst(lo:hi).
+!> \param src_a ...
+!> \param src_i ...
+!> \param dst_a ...
+!> \param dst_i ...
+!> \param lo ...
+!> \param mid ...
+!> \param hi ...
+! **************************************************************************************************
+   SUBROUTINE merge_runs(src_a, src_i, dst_a, dst_i, lo, mid, hi)
+      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: src_a
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: src_i
+      REAL(KIND=dp), DIMENSION(:), INTENT(INOUT)         :: dst_a
+      INTEGER, DIMENSION(:), INTENT(INOUT)               :: dst_i
+      INTEGER, INTENT(IN)                                :: lo, mid, hi
+
+      INTEGER                                            :: i, j, k
+
+      i = lo
+      j = mid + 1
+      k = lo
+      DO WHILE (i <= mid .AND. j <= hi)
+         IF (src_a(j) < src_a(i)) THEN
+            dst_a(k) = src_a(j)
+            dst_i(k) = src_i(j)
+            j = j + 1
+         ELSE
+            dst_a(k) = src_a(i)
+            dst_i(k) = src_i(i)
+            i = i + 1
+         END IF
+         k = k + 1
+      END DO
+      DO WHILE (i <= mid)
+         dst_a(k) = src_a(i)
+         dst_i(k) = src_i(i)
+         i = i + 1
+         k = k + 1
+      END DO
+      DO WHILE (j <= hi)
+         dst_a(k) = src_a(j)
+         dst_i(k) = src_i(j)
+         j = j + 1
+         k = k + 1
+      END DO
+
+   END SUBROUTINE merge_runs
+
+! **************************************************************************************************
+!> \brief Whether gidx_from_table applies: every reference Miller index lies within the bounds
+!>        of the reference grid and the lookup table stays within a modest size.
+!> \param pw_grid ...
+!> \param ref_grid ...
+!> \return ...
+! **************************************************************************************************
+   FUNCTION use_gidx_table(pw_grid, ref_grid) RESULT(ok)
+      TYPE(pw_grid_type), INTENT(IN)                     :: pw_grid, ref_grid
+      LOGICAL                                            :: ok
+
+      INTEGER                                            :: d
+      INTEGER(KIND=int_8)                                :: npts
+
+      ok = ALLOCATED(ref_grid%g_hat) .AND. ASSOCIATED(ref_grid%gsq) .AND. &
+           ALLOCATED(pw_grid%g_hat) .AND. ASSOCIATED(pw_grid%gidx)
+      IF (.NOT. ok) RETURN
+      npts = 1
+      DO d = 1, 3
+         ok = ok .AND. ref_grid%bounds(2, d) >= ref_grid%bounds(1, d)
+         IF (.NOT. ok) RETURN
+         npts = npts*INT(ref_grid%bounds(2, d) - ref_grid%bounds(1, d) + 1, int_8)
+      END DO
+      ! 4 bytes per point; the reference grids of the multigrids stay well below this limit
+      ok = npts <= 2_int_8**30
+      IF (.NOT. ok) RETURN
+      ok = SIZE(ref_grid%g_hat, 2) >= SIZE(ref_grid%gsq) .AND. SIZE(ref_grid%g_hat, 1) == 3 .AND. &
+           SIZE(pw_grid%g_hat, 1) == 3
+      IF (.NOT. ok) RETURN
+      DO d = 1, 3
+         ok = ok .AND. MINVAL(ref_grid%g_hat(d, 1:SIZE(ref_grid%gsq))) >= ref_grid%bounds(1, d) .AND. &
+              MAXVAL(ref_grid%g_hat(d, 1:SIZE(ref_grid%gsq))) <= ref_grid%bounds(2, d)
+      END DO
+
+   END FUNCTION use_gidx_table
+
+! **************************************************************************************************
+!> \brief gidx for pw_grid <= ref_grid. The Miller indices of a grid are unique, so the reference
+!>        position of every G is found by a direct lookup. It is accepted under the same condition
+!>        as in the sequential search of pw_grid_sort (|G|^2 agrees to 1.e-12 relative), which
+!>        makes the result identical to that search.
+!> \param pw_grid ...
+!> \param ref_grid ...
+!> \param it number of leading G-vectors that coincide with the reference grid
+!> \param ngr ...
+! **************************************************************************************************
+   SUBROUTINE gidx_from_table(pw_grid, ref_grid, it, ngr)
+      TYPE(pw_grid_type), INTENT(INOUT)                  :: pw_grid
+      TYPE(pw_grid_type), INTENT(IN)                     :: ref_grid
+      INTEGER, INTENT(IN)                                :: it, ngr
+
+      INTEGER                                            :: bad, ig, ih, l, m, n
+      INTEGER, ALLOCATABLE, DIMENSION(:, :, :)           :: table
+      INTEGER, DIMENSION(2, 3)                           :: rb
+      REAL(KIND=dp)                                      :: gig, gigr
+
+      rb = ref_grid%bounds
+      ALLOCATE (table(rb(1, 1):rb(2, 1), rb(1, 2):rb(2, 2), rb(1, 3):rb(2, 3)))
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(rb, table) PRIVATE(n)
+      DO n = rb(1, 3), rb(2, 3)
+         table(:, :, n) = 0
+      END DO
+!$OMP END PARALLEL DO
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(ref_grid, table) PRIVATE(ih)
+      DO ih = 1, SIZE(ref_grid%gsq)
+         table(ref_grid%g_hat(1, ih), ref_grid%g_hat(2, ih), ref_grid%g_hat(3, ih)) = ih
+      END DO
+!$OMP END PARALLEL DO
+
+      bad = HUGE(0)
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(it, ngr, pw_grid, rb, ref_grid, table) &
+!$OMP             PRIVATE(gig, gigr, ig, ih, l, m, n) REDUCTION(MIN:bad)
+      DO ig = it + 1, ngr
+         l = pw_grid%g_hat(1, ig)
+         m = pw_grid%g_hat(2, ig)
+         n = pw_grid%g_hat(3, ig)
+         ih = 0
+         IF (l >= rb(1, 1) .AND. l <= rb(2, 1) .AND. m >= rb(1, 2) .AND. m <= rb(2, 2) .AND. &
+             n >= rb(1, 3) .AND. n <= rb(2, 3)) ih = table(l, m, n)
+         IF (ih > 0) THEN
+            gig = pw_grid%gsq(ig)
+            gigr = MAX(1._dp, gig)
+            IF (ABS(gig - ref_grid%gsq(ih))/gigr > 1.e-12_dp) ih = 0
+         END IF
+         pw_grid%gidx(ig) = ih
+         IF (ih == 0) bad = MIN(bad, ig)
+      END DO
+!$OMP END PARALLEL DO
+      DEALLOCATE (table)
+
+      IF (bad /= HUGE(0)) THEN
+         WRITE (*, "(A,I10,3I6,F20.10)") &
+            " G-vector", bad, pw_grid%g_hat(1:3, bad), pw_grid%gsq(bad)
+         CPABORT("G vector not found")
+      END IF
+
+   END SUBROUTINE gidx_from_table
+
+! **************************************************************************************************
 !> \brief ...
 !> \param gsq ...
 !> \param g_hat ...
@@ -1946,7 +2188,8 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'sort_shells'
       REAL(KIND=dp), PARAMETER                           :: small = 5.e-16_dp
 
-      INTEGER                                            :: handle, ig, ng, s1, s2
+      INTEGER                                            :: handle, ig, ish, ng, nshell
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: shell_start
       REAL(KIND=dp)                                      :: s_begin
 
       CALL timeset(routineN, handle)
@@ -1954,22 +2197,37 @@ CONTAINS
 ! Juergs temporary hack to get the grids sorted for large (4000Ry) cutoffs.
 ! might need to call lapack for machine precision.
 
+      ! A shell starts where gsq leaves the first value of the current shell by at least small.
+      ! The shells are found sequentially; each one is then reordered independently.
       ng = SIZE(gsq)
+      nshell = 0
       s_begin = -1.0_dp
-      s1 = 0
-      s2 = 0
-      ig = 1
       DO ig = 1, ng
-         IF (ABS(gsq(ig) - s_begin) < small) THEN
-            s2 = ig
-         ELSE
-            CALL redist(g_hat, idx, s1, s2)
+         IF (.NOT. (ABS(gsq(ig) - s_begin) < small)) THEN
+            nshell = nshell + 1
             s_begin = gsq(ig)
-            s1 = ig
-            s2 = ig
          END IF
       END DO
-      CALL redist(g_hat, idx, s1, s2)
+      ALLOCATE (shell_start(nshell + 1))
+      nshell = 0
+      s_begin = -1.0_dp
+      DO ig = 1, ng
+         IF (.NOT. (ABS(gsq(ig) - s_begin) < small)) THEN
+            nshell = nshell + 1
+            shell_start(nshell) = ig
+            s_begin = gsq(ig)
+         END IF
+      END DO
+      shell_start(nshell + 1) = ng + 1
+
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(g_hat, idx, nshell, shell_start) PRIVATE(ish) &
+!$OMP             SCHEDULE(DYNAMIC, 4096)
+      DO ish = 1, nshell
+         IF (shell_start(ish + 1) - shell_start(ish) > 1) &
+            CALL redist(g_hat, idx, shell_start(ish), shell_start(ish + 1) - 1)
+      END DO
+!$OMP END PARALLEL DO
+      DEALLOCATE (shell_start)
 
       CALL timestop(handle)
 

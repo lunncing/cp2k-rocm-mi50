@@ -82,7 +82,8 @@ MODULE qs_ks_utils
                                               MIXED_PERIODIC_BC,&
                                               NEUMANN_BC,&
                                               PERIODIC_BC
-   USE pw_gpu,                          ONLY: pw_gpu_res_ensure_host,&
+   USE pw_gpu,                          ONLY: pw_gpu_res_discard,&
+                                              pw_gpu_res_ensure_host,&
                                               pw_gpu_res_vtot_prepare,&
                                               pw_gpu_res_vtot_skip_host
    USE pw_env_types,                    ONLY: pw_env_get,&
@@ -1566,7 +1567,8 @@ CONTAINS
                                        calculate_forces=calculate_forces, &
                                        gapw=gapw)
             END IF
-            CALL pw_gpu_res_ensure_host(v_rspace_new(ispin))
+            ! The potential is released unread: drop a device-only copy instead of downloading it.
+            CALL pw_gpu_res_discard(v_rspace_new(ispin))
             CALL auxbas_pw_pool%give_back_pw(v_rspace_new(ispin))
          END DO ! ispin
 

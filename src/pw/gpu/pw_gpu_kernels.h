@@ -160,6 +160,12 @@ int pw_gpu_res_vtot_prepare_c(const double *vh_host, const double *vxc_host,
     size_t n, double dvol);
 int pw_gpu_res_vtot_commit_c(const double *vtot_host, size_t n);
 int pw_gpu_res_vtot_skip_host_c(void);
+// Lazy window of the SCF driver (on != 0 opens it; closing writes every live
+// result to its host array), the one deferred density of an SCF iteration, and
+// release of a host array that is not read again (drops its device copy).
+void pw_gpu_res_set_lazy_c(int on);
+void pw_gpu_res_defer_density_c(int on);
+void pw_gpu_res_discard_c(const void *host_ptr);
 int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host,
     const double *infl_host, double *rho_tot_host, size_t ngpts, size_t nprefix,
     const int *npts);

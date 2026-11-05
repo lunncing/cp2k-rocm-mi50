@@ -84,7 +84,11 @@ def main():
             n += 1
         print(f"PASS {n} Hermes C mock cases")
         cases = [(name, {"CP2K_PW_GPU_RES_LAZY_DENSITY": "0"}) for name in RES_CASES]
-        cases += [(name, {}) for name in ("lazy_density", "integrate", "chain", "lazy_vtot", "borrowed")]
+        # Hermes's lazy cases cover the lazy density alone; the stage 3a cases the window,
+        # the density token and the lazy Vxc/V_H.
+        cases += [(name, {"CP2K_PW_GPU_RES_LAZY_POT": "0"})
+                  for name in ("lazy_density", "integrate", "chain", "lazy_vtot", "borrowed")]
+        cases += [(name, {}) for name in ("lazy_grant", "lazy_pot")]
         for name, overrides in cases:
             for threads in ("1", "3"):
                 r = subprocess.run([str(exes["test_res"]), name],
@@ -92,7 +96,9 @@ def main():
                                    text=True, capture_output=True, timeout=120)
                 assert r.returncode == 0 and r.stdout.strip() == "PASS", (name, r.stdout, r.stderr)
                 assert "AddressSanitizer" not in r.stderr and "runtime error:" not in r.stderr, r.stderr
-            print(f"PASS residency {name} ({'eager' if overrides else 'lazy'}, OMP=1/3)")
+            mode = "eager" if "CP2K_PW_GPU_RES_LAZY_DENSITY" in overrides else \
+                "lazy density" if overrides else "lazy window"
+            print(f"PASS residency {name} ({mode}, OMP=1/3)")
         run_fortran_tests(build, cc, flags, inc, blas, env)
 
 

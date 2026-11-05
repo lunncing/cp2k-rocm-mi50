@@ -148,6 +148,25 @@ PROGRAM test_res_bindings
    CALL pw_gpu_res_ensure_host(rho)
    IF (ANY(rho%array /= 7 + grid%dvol*expected)) ERROR STOP 'vtot host synchronization'
    CALL res_fixture_end()
+   ! Stage 3a: closing the SCF window writes a live density back.
+   rho%array = expected
+   CALL res_fixture_begin(C_LOC(rho%array), C_LOC(g%array), 12_C_SIZE_T)
+   CALL pw_gpu_res_set_lazy(.TRUE.)
+   CALL pw_gpu_res_defer_density(.TRUE.)
+   CALL pw_gpu_res_defer_density(.FALSE.)
+   CALL pw_gpu_res_discard(copy) ! not resident: no effect
+   CALL pw_gpu_res_set_lazy(.FALSE.)
+   IF (ANY(rho%array /= expected)) ERROR STOP 'window exit synchronization'
+   CALL res_fixture_end()
+   ! Releasing an array drops its device copy without a download.
+   rho%array = expected
+   CALL res_fixture_begin(C_LOC(rho%array), C_LOC(g%array), 12_C_SIZE_T)
+   CALL pw_gpu_res_discard(rho)
+   CALL pw_gpu_res_ensure_host(rho)
+   IF (enabled .AND. ANY(rho%array /= 0)) ERROR STOP 'discard downloaded'
+   IF (.NOT. enabled .AND. ANY(rho%array /= expected)) ERROR STOP 'discard changed host'
+   CALL pw_gpu_res_ensure_host(g)
+   CALL res_fixture_end()
    DEALLOCATE (grid%gsq, grid%g_hatmap)
    DEALLOCATE (grid, rho%array, copy%array, vh%array, g%array)
    PRINT *, 'PASS residency Fortran bindings'

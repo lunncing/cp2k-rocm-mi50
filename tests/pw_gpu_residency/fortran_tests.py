@@ -17,7 +17,8 @@ def run_fortran_tests(build, cc, flags, include, blas, env):
     wrapper = (ROOT / "src/pw/pw_gpu.F").read_text()
     functions = ("pw_gpu_res_enabled", "pw_gpu_res_integrate_r", "res_grid_ok", "res_rs_ok",
                  "pw_gpu_res_vtot_prepare", "pw_gpu_res_vtot_skip_host")
-    subroutines = ("pw_gpu_res_ensure_host_ptr", "pw_gpu_res_ensure_host_r", "pw_gpu_res_ensure_host_g")
+    subroutines = ("pw_gpu_res_ensure_host_ptr", "pw_gpu_res_ensure_host_r", "pw_gpu_res_ensure_host_g",
+                   "pw_gpu_res_set_lazy", "pw_gpu_res_defer_density", "pw_gpu_res_discard")
     bindings = "\n".join(routine(wrapper, n, True) for n in functions)
     bindings += "\n".join(routine(wrapper, n) for n in subroutines)
     (build / "res_bindings.inc").write_text(bindings)

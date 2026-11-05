@@ -68,6 +68,7 @@ MODULE pw_gpu
              pw_gpu_res_hartree_finish, pw_gpu_res_hartree_cancel
    PUBLIC :: pw_gpu_res_vtot_prepare, pw_gpu_res_vtot_commit
    PUBLIC :: pw_gpu_res_vtot_skip_host
+   PUBLIC :: pw_gpu_res_set_lazy, pw_gpu_res_defer_density, pw_gpu_res_discard
    PUBLIC :: pw_gpu_res_density_id, pw_gpu_res_hartree_id, pw_gpu_res_xcin_id, pw_gpu_res_pot_id
 
    ! Residency features, see pw_gpu_res_enabled.
@@ -1503,6 +1504,80 @@ CONTAINS
       CALL pw_gpu_res_invalidate_c()
 #endif
    END SUBROUTINE pw_gpu_res_invalidate
+
+! **************************************************************************************************
+!> \brief Opens (on) or closes the lazy window of an SCF. Closing writes every result that is
+!>        still only on the device to its host array.
+!> \param on ...
+! **************************************************************************************************
+   SUBROUTINE pw_gpu_res_set_lazy(on)
+      LOGICAL, INTENT(IN)                                :: on
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTERFACE
+         SUBROUTINE pw_gpu_res_set_lazy_c(on) BIND(C, name="pw_gpu_res_set_lazy_c")
+            IMPORT :: C_INT
+            INTEGER(KIND=C_INT), VALUE                   :: on
+         END SUBROUTINE pw_gpu_res_set_lazy_c
+      END INTERFACE
+
+      IF (on) THEN
+         CALL pw_gpu_res_set_lazy_c(1_C_INT)
+      ELSE
+         CALL pw_gpu_res_set_lazy_c(0_C_INT)
+      END IF
+#else
+      MARK_USED(on)
+#endif
+   END SUBROUTINE pw_gpu_res_set_lazy
+
+! **************************************************************************************************
+!> \brief Lets the next density computation leave its result on the device (lazy window only).
+!> \param on ...
+! **************************************************************************************************
+   SUBROUTINE pw_gpu_res_defer_density(on)
+      LOGICAL, INTENT(IN)                                :: on
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTERFACE
+         SUBROUTINE pw_gpu_res_defer_density_c(on) BIND(C, name="pw_gpu_res_defer_density_c")
+            IMPORT :: C_INT
+            INTEGER(KIND=C_INT), VALUE                   :: on
+         END SUBROUTINE pw_gpu_res_defer_density_c
+      END INTERFACE
+
+      IF (on) THEN
+         CALL pw_gpu_res_defer_density_c(1_C_INT)
+      ELSE
+         CALL pw_gpu_res_defer_density_c(0_C_INT)
+      END IF
+#else
+      MARK_USED(on)
+#endif
+   END SUBROUTINE pw_gpu_res_defer_density
+
+! **************************************************************************************************
+!> \brief Forgets the device copy of an array that is released without being read again.
+!> \param pw ...
+! **************************************************************************************************
+   SUBROUTINE pw_gpu_res_discard(pw)
+      TYPE(pw_r3d_rs_type), INTENT(IN)                   :: pw
+
+#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+      INTERFACE
+         SUBROUTINE pw_gpu_res_discard_c(host) BIND(C, name="pw_gpu_res_discard_c")
+            IMPORT :: C_PTR
+            TYPE(C_PTR), VALUE                           :: host
+         END SUBROUTINE pw_gpu_res_discard_c
+      END INTERFACE
+
+      IF (.NOT. ASSOCIATED(pw%array)) RETURN
+      IF (SIZE(pw%array) == 0) RETURN
+      CALL pw_gpu_res_discard_c(C_LOC(pw%array))
+#else
+      MARK_USED(pw)
+#endif
+   END SUBROUTINE pw_gpu_res_discard
 
 ! **************************************************************************************************
 !> \brief Materialize a lazy PW array before host access (also accepts an array slice).

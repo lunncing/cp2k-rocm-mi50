@@ -157,11 +157,18 @@ static bool opt_res = true, opt_res_density = true, opt_res_hartree = true;
 static bool opt_res_xcin = true, opt_res_pot = true, opt_res_verify = false;
 static bool opt_res_stats = true;
 static bool opt_res_lazy_density = true;
+static bool opt_res_lazy_pot = true; // lazy Vxc and V_H (inside the granted window)
+// Lazy (device-authoritative) results are only created inside a window that
+// the SCF driver grants for setups without host readers between a result and
+// its device consumer (pw_gpu_res_set_lazy_c). The density token marks the
+// one density computation of the SCF iteration that may stay on the device.
+static bool res_lazy_grant = false, res_density_token = false;
 static size_t res_reserve_bytes = (size_t)1536 * 1024 * 1024;
 static struct {
   unsigned long density, density_fail, hartree, hartree_fail, potential,
       potential_fail, vtot, vtot_fail, xc_in;
-  size_t upload_saved;
+  unsigned long lazy_density, lazy_vxc, lazy_vhr, discards, syncs;
+  size_t upload_saved, download_saved, sync_bytes;
 } res_stats;
 // Hartree/DDAPC chain state between its Fortran-driven steps.
 static struct {
@@ -173,6 +180,7 @@ static struct {
 static void res_evict_all(void);
 static bool res_evict_one(void);
 static void res_invalidate_borrowed(void);
+static void res_invalidate(const int id);
 static void res_print_stats(void);
 void pw_gpu_res_ensure_host_c(const int id, void *host_ptr);
 
@@ -468,6 +476,7 @@ void pw_gpu_init(void) {
   opt_res_pot = opt_res && env_flag("CP2K_PW_GPU_RES_POT", true);
   opt_res_verify = opt_res && env_flag("CP2K_PW_GPU_RES_VERIFY", false);
   opt_res_lazy_density = opt_res && env_flag("CP2K_PW_GPU_RES_LAZY_DENSITY", true);
+  opt_res_lazy_pot = opt_res && env_flag("CP2K_PW_GPU_RES_LAZY_POT", true);
   opt_res_stats = opt_res && env_flag("CP2K_PW_GPU_RES_STATS", true);
   {
     size_t mb;
@@ -477,6 +486,7 @@ void pw_gpu_init(void) {
   }
   memset(res, 0, sizeof(res));
   memset(&res_stats, 0, sizeof(res_stats));
+  res_lazy_grant = res_density_token = false;
   memset(&res_hartree, 0, sizeof(res_hartree));
   res_pinned = 0;
   res_small_dev = NULL;
@@ -565,6 +575,18 @@ void pw_gpu_finalize(void) {
   for (int i = 0; i < PW_GPU_GRID_CACHE_SIZE; i++) {
     grid_cache_clear_entry(&grid_cache[i]);
   }
+  // The host arrays may already be released here: forget live results instead
+  // of writing them back. The SCF exit and force boundaries leave none.
+  int live = 0;
+  for (int i = 0; i < RES_NSLOTS; i++) {
+    live += res[i].dev_authoritative ? 1 : 0;
+    res_invalidate(i);
+  }
+  if (live != 0) {
+    fprintf(stderr, "[PW_GPU] residency: %d device-only result(s) dropped at finalization.\n",
+            live);
+  }
+  res_lazy_grant = res_density_token = false;
   release_work_buffers();
   res_print_stats();
   for (int i = 0; i < RES_NSLOTS; i++) {
@@ -685,12 +707,14 @@ static void res_sync(const int id) {
   res_slot *s = &res[id];
   if (!s->dev_authoritative) return;
   assert(s->state == RES_VALID && s->dev != NULL && s->host != NULL);
-  assert(s->width == s->host_width && s->epoch == xc_epoch);
+  assert(s->width == s->host_width && (s->owned_bytes != 0 || s->epoch == xc_epoch));
   offload_activate_chosen_device();
-  offloadMemcpyAsyncDtoH((void *)s->host, s->dev,
-                        s->n * (size_t)s->width * sizeof(double), stream);
+  const size_t bytes = s->n * (size_t)s->width * sizeof(double);
+  offloadMemcpyAsyncDtoH((void *)s->host, s->dev, bytes, stream);
   offloadStreamSynchronize(stream);
   s->dev_authoritative = false;
+  res_stats.syncs++;
+  res_stats.sync_bytes += bytes;
 }
 
 // id == -1 searches all slots, as a real PW can be either RHO_R or VXC.
@@ -717,9 +741,23 @@ static void res_invalidate(const int id) {
 }
 
 static void res_invalidate_borrowed(void) {
-  // The old contents are dead when XC/density reuses these grids. Callers
-  // needing a host copy must request it before dropping the borrowed slots.
+  // Before the XC grids are reused, a live result is copied to its host array
+  // unless its consumer has just read it (see res_retire_borrowed).
   for (int id = 0; id <= RES_VXC; id++) {
+    res_sync(id);
+    res_invalidate(id);
+  }
+  xc_epoch++;
+}
+
+// The fused XC pipeline is the device consumer of a lazy density: inside the
+// granted window the host copies of RHO_G/RHO_R are dead once XC has read them
+// (the next density overwrites them, the SCF exit is never reached with a
+// consumed density). Anything else that is still live is synchronized first.
+static void res_retire_borrowed(const unsigned consumed) {
+  for (int id = 0; id <= RES_VXC; id++) {
+    const bool dead = res_lazy_grant && id != RES_VXC && (consumed & (1u << id));
+    if (!dead) res_sync(id);
     res_invalidate(id);
   }
   xc_epoch++;
@@ -728,6 +766,7 @@ static void res_invalidate_borrowed(void) {
 static void res_free_owned(const int id) {
   res_slot *s = &res[id];
   if (s->owned_bytes != 0) {
+    res_sync(id); // a lazy owned result (V_H_R) must survive eviction
     offloadStreamSynchronize(stream);
     offloadStreamSynchronize(stream_copy);
     device_free(s->dev, s->owned_bytes);
@@ -1029,6 +1068,12 @@ static void res_print_stats(void) {
           res_stats.hartree_fail, res_stats.xc_in, res_stats.vtot,
           res_stats.vtot_fail, res_stats.potential, res_stats.potential_fail,
           (double)res_stats.upload_saved / 1e9);
+  fprintf(stderr,
+          "[PW_GPU] residency lazy: density %lu, vxc %lu, v_h %lu, discarded %lu, "
+          "host syncs %lu (%.1f GB), downloads avoided %.1f GB\n",
+          res_stats.lazy_density, res_stats.lazy_vxc, res_stats.lazy_vhr,
+          res_stats.discards, res_stats.syncs, (double)res_stats.sync_bytes / 1e9,
+          (double)res_stats.download_saved / 1e9);
   fprintf(stderr, "[PW_GPU] residency slots (hits/misses):");
   for (int id = 0; id < RES_NSLOTS; id++) {
     fprintf(stderr, " %s %lu/%lu", res_names[id], res[id].hits, res[id].misses);
@@ -1068,6 +1113,55 @@ void pw_gpu_res_invalidate_c(void) {
     res_invalidate(id);
   }
   res_hartree.pending = false;
+}
+
+/*******************************************************************************
+ * \brief Lazy window of the SCF driver. on != 0 grants lazy results until the
+ *        call with on == 0, which synchronizes every live result to its host
+ *        array (resident copies stay valid). Outside the window all results
+ *        are written to the host as soon as they are computed.
+ ******************************************************************************/
+void pw_gpu_res_set_lazy_c(const int on) {
+  if (!is_initialized) return;
+  res_density_token = false;
+  if (on) {
+    res_lazy_grant = opt_res && (opt_res_lazy_density || opt_res_lazy_pot) && !opt_res_verify;
+    return;
+  }
+  res_lazy_grant = false;
+  offload_activate_chosen_device();
+  for (int id = 0; id < RES_NSLOTS; id++) {
+    res_sync(id);
+  }
+}
+
+// The next density computation (and only that one) may stay on the device.
+void pw_gpu_res_defer_density_c(const int on) {
+  res_density_token = is_initialized && res_lazy_grant && on != 0;
+}
+
+// The host array is about to be released without being read again: forget a
+// device copy (live or not) without downloading it.
+void pw_gpu_res_discard_c(const void *host_ptr) {
+  if (host_ptr == NULL) return;
+#pragma omp critical(pw_gpu_res_host)
+  {
+    if (is_initialized) {
+      const uintptr_t p = (uintptr_t)host_ptr;
+      for (int i = 0; i < RES_NSLOTS; i++) {
+        res_slot *s = &res[i];
+        const uintptr_t base = (uintptr_t)s->host;
+        if (s->state != RES_INVALID && s->host != NULL && p >= base &&
+            p - base < s->n * (size_t)s->host_width * sizeof(double)) {
+          if (s->dev_authoritative) {
+            res_stats.discards++;
+            res_stats.download_saved += s->n * (size_t)s->width * sizeof(double);
+          }
+          res_invalidate(i);
+        }
+      }
+    }
+  }
 }
 
 // Reserve the complete operation before uploading or changing any output.
@@ -1519,6 +1613,17 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
   }
   protected_grid_entry = entry;
   const int fits = pw_gpu_ensure_xc_c(4 * real_size);
+  // A lazy Vxc stays in the first XC grid for its device consumers (V_TOT,
+  // potential_pw2rs); only its fingerprint and the energy are downloaded.
+  bool lazy_vxc = fits && res_lazy_grant && opt_res_lazy_pot && opt_res_pot;
+  double *vxc_samples = NULL;
+  if (lazy_vxc) {
+    protected_xc_buffer = true;
+    vxc_samples = res_small(pw_res_sample_count(nr));
+    protected_xc_buffer = false;
+    lazy_vxc = vxc_samples != NULL &&
+               res_sample_buffer(&res[RES_VXC], pw_res_sample_count(nr));
+  }
   protected_grid_entry = NULL;
   if (!fits) return 0;
   const int *map_dev = entry == NULL ? NULL : entry->map_dev;
@@ -1545,7 +1650,8 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
     pw_gpu_launch_copy(res_g, gbuf_dev, (size_t)ngpts, (size_t)ngpts, 2, 2, 1.0, stream);
   if (res_r != NULL) pw_gpu_launch_copy(res_r, rho_dev, nr, nr, 1, 1, 1.0, stream);
   if (res_g != NULL || res_r != NULL) res_stats.xc_in++;
-  res_invalidate_borrowed();
+  res_retire_borrowed((res_g != NULL ? 1u << RES_RHO_G : 0u) |
+                      (res_r != NULL ? 1u << RES_RHO_R : 0u));
   for (int d = 0; d < 3; d++) {
     offloadMemsetAsync(buffer_dev_2, 0, buffer_size, stream);
     if (ngpts)
@@ -1611,8 +1717,16 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
   pw_gpu_launch_xc_cutoff(dout_dev, rho_dev, nr, epsilon_rho * smooth_range,
                           smooth_range, stream);
   // These are the only downloads: the final potential and one energy scalar.
-  offloadMemcpyAsyncDtoH(dout_vxc_r, dout_dev, real_size, stream);
   offloadMemcpyAsyncDtoH(exc_out, norm_dev, sizeof(double), stream);
+  if (lazy_vxc) {
+    res_register_lazy(RES_VXC, dout_vxc_r, nr, 1, dout_dev, vxc_samples);
+    offloadStreamSynchronize(stream);
+    res_stats.lazy_vxc++;
+    res_stats.download_saved += real_size;
+    if (!opt_map_cache) pw_gpu_grid_invalidate(grid_id);
+    return 1;
+  }
+  offloadMemcpyAsyncDtoH(dout_vxc_r, dout_dev, real_size, stream);
   offloadStreamSynchronize(stream);
   if (!opt_map_cache) pw_gpu_grid_invalidate(grid_id);
   // Vxc stays in the first XC grid for pw_gpu_res_vtot_prepare_c.
@@ -1683,7 +1797,8 @@ static void res_host_copy(double *dst, const double *src, const size_t n) {
  *        the XC grids until a host consumer or scratch reuse requires them.
  *        Returns 0 with all host outputs untouched if anything is unsupported.
  ******************************************************************************/
-static int res_density(const int nlevels, void *const *r_host, const int *npts,
+static int res_density(const bool lazy_allowed, const int nlevels,
+                       void *const *r_host, const int *npts,
                        const int *ngpts, const int *nmaps, const int *grid_id,
                        void *const *maps, void *const *gidx, const double *scale,
                        const int *t_npts, const int t_ngpts, const int t_nmaps,
@@ -1732,7 +1847,7 @@ static int res_density(const int nlevels, void *const *r_host, const int *npts,
   double *rho_g_dev = xc_dev, *rho_r_dev = xc_dev_hi;
   res_invalidate_borrowed(); // the XC grids are overwritten below
   protected_xc_buffer = true; // grid cache uploads must not release them
-  const bool lazy = opt_res_lazy_density && !opt_res_verify;
+  const bool lazy = lazy_allowed && res_lazy_grant && opt_res_lazy_density;
   double *samples = NULL;
   if (lazy) {
     const size_t gs = 2 * pw_res_sample_count((size_t)t_ngpts);
@@ -1795,6 +1910,8 @@ static int res_density(const int nlevels, void *const *r_host, const int *npts,
     res_register_lazy(RES_RHO_R, rho_r_host, t_nr, 1, rho_r_dev, samples);
     offloadStreamSynchronize(stream);
     res_stats.density++;
+    res_stats.lazy_density++;
+    res_stats.download_saved += sizeof(double) * (2 * (size_t)t_ngpts + t_nr);
     return 1;
   }
   // The G-space download overlaps the inverse FFT.
@@ -1818,9 +1935,12 @@ int pw_gpu_res_density_c(const int nlevels, void *const *r_host, const int *npts
                          const int *t_npts, const int t_ngpts, const int t_nmaps,
                          const int t_grid_id, const int *t_map, double *rho_g_host,
                          double *rho_r_host) {
-  const int done = res_density(nlevels, r_host, npts, ngpts, nmaps, grid_id, maps,
-                               gidx, scale, t_npts, t_ngpts, t_nmaps, t_grid_id,
-                               t_map, rho_g_host, rho_r_host);
+  // The token is consumed by every attempt, including rejected ones.
+  const bool lazy_allowed = res_density_token;
+  res_density_token = false;
+  const int done = res_density(lazy_allowed, nlevels, r_host, npts, ngpts, nmaps,
+                               grid_id, maps, gidx, scale, t_npts, t_ngpts,
+                               t_nmaps, t_grid_id, t_map, rho_g_host, rho_r_host);
   protected_xc_buffer = false;
   return done;
 }
@@ -1984,6 +2104,7 @@ int pw_gpu_res_vtot_prepare_c(const double *vh_host, const double *vxc_host,
     protected_xc_buffer = false;
     if (!ok || s->epoch != xc_epoch) {
       res_pinned = 0;
+      if (s->epoch == xc_epoch) res_sync(RES_VXC); // a lazy Vxc is still intact
       res_invalidate(RES_VXC);
       res_stats.vtot_fail++;
       return 0;
@@ -2233,6 +2354,21 @@ int pw_gpu_res_hartree_finish_c(double *v_h_r_host, const int *npts,
   const bool resident = opt_res_pot && res_ensure_owned(RES_V_H_R, sizeof(double) * nr);
   if (resident) {
     dst = res[RES_V_H_R].dev;
+    // A live V_H of another host array is written back before it is replaced.
+    if (res[RES_V_H_R].host != v_h_r_host) res_sync(RES_V_H_R);
+  }
+  // Inside the lazy window V_H stays on the device for V_TOT; the host copy is
+  // written when a host consumer asks for it or at the end of the SCF.
+  bool lazy = resident && res_lazy_grant && opt_res_lazy_pot;
+  double *samples = NULL;
+  if (lazy) {
+    // Reclaiming memory for the fingerprint scratch must keep the map and V_H.
+    res_pinned |= 1u << RES_V_H_R;
+    protected_grid_entry = e;
+    samples = res_small(pw_res_sample_count(nr));
+    protected_grid_entry = NULL;
+    res_pinned &= ~(1u << RES_V_H_R);
+    lazy = samples != NULL && res_sample_buffer(&res[RES_V_H_R], pw_res_sample_count(nr));
   }
   offloadMemsetAsync(buffer_dev_2, 0, 2 * sizeof(double) * nr, stream);
   pw_gpu_launch_scatter(buffer_dev_2, gbuf_dev, 1.0, ngpts, nmaps, e->map_dev,
@@ -2240,10 +2376,17 @@ int pw_gpu_res_hartree_finish_c(double *v_h_r_host, const int *npts,
   fft_3d(OFFLOAD_FFT_INVERSE, npts[2], npts[1], npts[0], buffer_dev_2);
   pw_gpu_launch_complex_to_real(buffer_dev_2, dst, (int)nr, stream);
   pw_gpu_launch_copy(dst, dst, nr, nr, 1, 1, dvol, stream); // pw_scale
-  offloadMemcpyAsyncDtoH(v_h_r_host, dst, sizeof(double) * nr, stream);
-  offloadStreamSynchronize(stream);
-  if (resident) {
-    res_register(RES_V_H_R, v_h_r_host, nr, 1, 1, dst);
+  if (lazy) {
+    res_register_lazy(RES_V_H_R, v_h_r_host, nr, 1, dst, samples);
+    offloadStreamSynchronize(stream);
+    res_stats.lazy_vhr++;
+    res_stats.download_saved += sizeof(double) * nr;
+  } else {
+    offloadMemcpyAsyncDtoH(v_h_r_host, dst, sizeof(double) * nr, stream);
+    offloadStreamSynchronize(stream);
+    if (resident) {
+      res_register(RES_V_H_R, v_h_r_host, nr, 1, 1, dst);
+    }
   }
   res_hartree.pending = false;
   res_stats.hartree++;

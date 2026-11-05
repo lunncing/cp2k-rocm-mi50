@@ -36,6 +36,8 @@ static void start(const int mb) {
   pw_gpu_set_memory_limit(mb);
   mock_limit = max_gpu_memory_bytes;
   pw_gpu_init();
+  // The lazy cases run inside an SCF window (the Fortran SCF driver opens it).
+  if (opt_res_lazy_density) pw_gpu_res_set_lazy_c(1);
   mock_reset_trace();
   accounting();
 }
@@ -137,7 +139,7 @@ static void density_reference(double *const *r, double *rho_g, double *rho_r) {
   pw_gpu_sfffc_cached(rho_g, rho_r, map_[0], dims[0], ng_[0], nmaps_, 1.0, 1);
 }
 
-static int density_fused(double *const *r, double *rho_g, double *rho_r) {
+static int density_call(double *const *r, double *rho_g, double *rho_r, const int token) {
   void *rp[NLEV], *mp[NLEV], *gp[NLEV];
   int npts[3 * NLEV], ids[NLEV], nm[NLEV];
   double scale[NLEV];
@@ -146,8 +148,14 @@ static int density_fused(double *const *r, double *rho_g, double *rho_r) {
     memcpy(npts + 3 * l, dims[l], sizeof(dims[l]));
     ids[l] = l + 1; nm[l] = nmaps_; scale[l] = 1.0 / nr_[l];
   }
+  pw_gpu_res_defer_density_c(token);
   return pw_gpu_res_density_c(NLEV, rp, npts, ng_, nm, ids, mp, gp, scale, dims[0],
                               ng_[0], nmaps_, 1, map_[0], rho_g, rho_r);
+}
+
+// The SCF iteration density (deferred inside an open window).
+static int density_fused(double *const *r, double *rho_g, double *rho_r) {
+  return density_call(r, rho_g, rho_r, 1);
 }
 
 // potential_pw2rs, pw_interp, auxbas = level 0
@@ -582,6 +590,244 @@ static void lazy_density(void) {
   }
 }
 
+// Stage 3a: lazy results exist only inside the window granted by the SCF
+// driver, the density token covers exactly one density, closing the window
+// writes every live result to its host array, and XC drops only the densities
+// it consumed inside the window.
+static size_t density_bytes(void) {
+  return sizeof(double) * (2 * (size_t)ng_[0] + (size_t)nr_[0]);
+}
+
+static void lazy_grant(void) {
+  for (int nmaps = 1; nmaps <= 2; nmaps++) {
+    grids(nmaps);
+    start(0);
+    assert(res_lazy_grant);
+    double *r[NLEV];
+    for (int l = 0; l < NLEV; l++) {
+      r[l] = rarray((size_t)nr_[l]);
+      for (int i = 0; i < nr_[l]; i++) r[l][i] = 0.5 + 0.2 * r[l][i];
+    }
+    double ref_g[128], ref_r[64], g[128], rr[64], g2[128], rr2[64];
+    density_reference(r, ref_g, ref_r);
+    const size_t ng2 = 2 * (size_t)ng_[0], nr = (size_t)nr_[0];
+
+    // Closed window: a token is ignored, the result is written to the host.
+    pw_gpu_res_set_lazy_c(0);
+    pw_gpu_res_defer_density_c(1);
+    assert(!res_density_token);
+    memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
+    mock_reset_trace();
+    assert(density_call(r, g, rr, 1));
+    same(ref_g, g, ng2, "closed window g");
+    same(ref_r, rr, nr, "closed window r");
+    assert(mock_download_bytes == density_bytes());
+    assert(!res[RES_RHO_G].dev_authoritative && !res[RES_RHO_R].dev_authoritative);
+
+    // Open window without a token: still written to the host.
+    pw_gpu_res_set_lazy_c(1);
+    memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
+    assert(density_call(r, g, rr, 0));
+    same(ref_g, g, ng2, "no token g");
+    assert(!res[RES_RHO_R].dev_authoritative);
+
+    // The token defers exactly one density.
+    memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
+    mock_reset_trace();
+    assert(density_call(r, g, rr, 1));
+    assert(!res_density_token);
+    assert(res[RES_RHO_G].dev_authoritative && res[RES_RHO_R].dev_authoritative);
+    for (size_t i = 0; i < ng2; i++) assert(g[i] == 0.0);
+    for (size_t i = 0; i < mock_operation_count; i++) { // fingerprints only
+      if (mock_operations[i].kind == MOCK_DOWNLOAD) assert(mock_operations[i].buffer == res_small_dev);
+    }
+    // The next density (other host arrays, no token) first writes back the
+    // live one whose XC grids it overwrites.
+    mock_reset_trace();
+    pw_gpu_res_defer_density_c(0);
+    assert(density_call(r, g2, rr2, 0));
+    assert(mock_download_bytes == 2 * density_bytes());
+    same(ref_g, g, ng2, "overwritten live g synchronized");
+    same(ref_r, rr, nr, "overwritten live r synchronized");
+    same(ref_g, g2, ng2, "next density g");
+
+    // A rejected attempt consumes the token as well.
+    opt_res_density = false;
+    pw_gpu_res_defer_density_c(1);
+    assert(res_density_token);
+    assert(!density_call(r, g, rr, 1));
+    assert(!res_density_token);
+    opt_res_density = true;
+
+    // Closing the window writes the live density back and keeps it resident.
+    memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
+    assert(density_call(r, g, rr, 1));
+    assert(res[RES_RHO_R].dev_authoritative);
+    mock_reset_trace();
+    pw_gpu_res_set_lazy_c(0);
+    assert(mock_download_bytes == density_bytes());
+    same(ref_g, g, ng2, "window exit g");
+    same(ref_r, rr, nr, "window exit r");
+    assert(res[RES_RHO_G].state == RES_VALID && res[RES_RHO_R].state == RES_VALID);
+    assert(res_lookup(RES_RHO_R, rr, nr, false) != NULL);
+    mock_reset_trace();
+    pw_gpu_res_set_lazy_c(0); // idempotent
+    assert(mock_operation_count == 0);
+
+    // XC drops the densities it consumed only inside the window. Outside of
+    // it, a live density is written back first.
+    double vxc[64], vref[64], exc, eref;
+    assert(xc_call(ref_g, ref_r, vref, &eref)); // closed window: eager reference
+    pw_gpu_res_set_lazy_c(1);
+    memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
+    assert(density_call(r, g, rr, 1));
+    res_lazy_grant = false; // e.g. a window closed without a full write back
+    mock_reset_trace();
+    assert(xc_call(g, rr, vxc, &exc));
+    same(vref, vxc, nr, "xc outside window");
+    same(&eref, &exc, 1, "xc energy outside window");
+    same(ref_g, g, ng2, "consumed g written back outside window");
+    same(ref_r, rr, nr, "consumed r written back outside window");
+    assert(mock_download_bytes == density_bytes() + sizeof(double) * (nr + 1));
+    res_lazy_grant = true;
+    memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
+    assert(density_call(r, g, rr, 1));
+    mock_reset_trace();
+    double sentinel[64];
+    for (size_t i = 0; i < nr; i++) vxc[i] = sentinel[i] = -77.0;
+    assert(xc_call(g, rr, vxc, &exc));
+    same(&eref, &exc, 1, "xc energy inside window");
+    for (size_t i = 0; i < ng2; i++) assert(g[i] == 0.0); // consumed, dead on the host
+    // Inside the window (lazy Vxc) only the energy and two fingerprints return.
+    assert(mock_download_bytes == sizeof(double) * (1 + pw_res_sample_count(nr)));
+    same(sentinel, vxc, nr, "lazy vxc leaves the host array");
+    assert(res[RES_VXC].dev_authoritative && res[RES_VXC].state == RES_VALID);
+    pw_gpu_res_ensure_host_c(-1, vxc + 3);
+    same(vref, vxc, nr, "lazy vxc materialized");
+    pw_gpu_res_set_lazy_c(0);
+    finish();
+    for (int l = 0; l < NLEV; l++) free(r[l]);
+  }
+}
+
+// The SCF chain inside the window: lazy density, V_H and Vxc, the device
+// V_TOT feeding potential_pw2rs, and release of the potential without a
+// download. Every result agrees bit for bit with the original sequence.
+static void lazy_pot(void) {
+  for (int nmaps = 1; nmaps <= 2; nmaps++) {
+    grids(nmaps);
+    const int n = ng_[0], nr = nr_[0];
+    double *r[NLEV];
+    for (int l = 0; l < NLEV; l++) {
+      r[l] = rarray((size_t)nr_[l]);
+      for (int i = 0; i < nr_[l]; i++) r[l][i] = 0.5 + 0.2 * r[l][i];
+    }
+    const double rscale[NLEV] = {1.0, 8.0, 0.5};
+    double ref_g[2 * 64], ref_r[64], ref_vxc[64], ref_exc, ref_tot[2 * 64], ref_vh[64], e_ref;
+    double ref_vtot[64], *ref_pot[NLEV], *pot[NLEV];
+    for (int l = 0; l < NLEV; l++) { ref_pot[l] = rarray((size_t)nr_[l]); pot[l] = rarray((size_t)nr_[l]); }
+    hartree_in h = hartree_inputs();
+    start(0);
+    pw_gpu_res_set_lazy_c(0); // reference: original sequence, host results
+    density_reference(r, ref_g, ref_r);
+    memcpy(h.rho_g, ref_g, sizeof(double) * 2 * (size_t)n);
+    hartree_reference(&h, ref_tot, ref_vh, &e_ref);
+    assert(xc_call(ref_g, ref_r, ref_vxc, &ref_exc));
+    for (int i = 0; i < nr; i++) ref_vtot[i] = ref_vxc[i] * h.dvol;
+    for (int i = 0; i < nr; i++) ref_vtot[i] = ref_vtot[i] + ref_vh[i];
+    potential_reference(ref_vtot, ref_pot, rscale);
+    finish();
+
+    start(0);
+    assert(res_lazy_grant && opt_res_lazy_pot);
+    double *rho_g = calloc(2 * (size_t)n, sizeof(double)), *rho_r = calloc((size_t)nr, sizeof(double));
+    free(h.rho_g);
+    h.rho_g = rho_g;
+    double tot[2 * 64], vh[64], vxc[64], exc, e, sentinel[64];
+    for (int iter = 0; iter < 2; iter++) {
+      for (int i = 0; i < nr; i++) vh[i] = vxc[i] = sentinel[i] = -5.0 - iter;
+      assert(density_fused(r, rho_g, rho_r));
+      mock_reset_trace();
+      assert(hartree_fused(&h, tot, vh, &e, 0));
+      assert(fabs(e - e_ref) <= 1e-14 * fabs(e_ref));
+      same(sentinel, vh, (size_t)nr, "lazy v_h leaves the host array");
+      assert(res[RES_V_H_R].dev_authoritative && res[RES_V_H_R].owned_bytes != 0);
+      for (size_t i = 0; i < mock_operation_count; i++) {
+        if (mock_operations[i].kind == MOCK_DOWNLOAD) assert(mock_operations[i].buffer != res[RES_V_H_R].dev);
+      }
+      assert(xc_call(rho_g, rho_r, vxc, &exc));
+      same(&ref_exc, &exc, 1, "lazy chain exc");
+      same(sentinel, vxc, (size_t)nr, "lazy vxc leaves the host array");
+      // V_TOT from the two device-only results: no upload at all.
+      const size_t up = mock_upload_bytes;
+      assert(pw_gpu_res_vtot_prepare_c(vh, vxc, (size_t)nr, h.dvol));
+      assert(pw_gpu_res_vtot_skip_host_c());
+      assert(mock_upload_bytes == up);
+      assert(potential_fused(vxc, pot, rscale));
+      assert(mock_upload_bytes == up);
+      for (int l = 0; l < NLEV; l++) same(ref_pot[l], pot[l], (size_t)nr_[l], "lazy chain potential");
+      same(sentinel, vxc, (size_t)nr, "potential keeps vtot on the device");
+      // Release of the potential: nothing is downloaded.
+      mock_reset_trace();
+      pw_gpu_res_discard_c(vh + nr); // one past the array: not an owner
+      assert(res[RES_V_H_R].dev_authoritative);
+      pw_gpu_res_discard_c(vxc + 1);
+      assert(mock_operation_count == 0);
+      assert(res[RES_VXC].state == RES_INVALID && !res[RES_VXC].dev_authoritative);
+      same(sentinel, vxc, (size_t)nr, "discard leaves the host array");
+      if (iter == 0) {
+        // A host consumer of V_H gets the device result.
+        pw_gpu_res_ensure_host_c(-1, vh);
+        same(ref_vh, vh, (size_t)nr, "lazy v_h materialized");
+        assert(res[RES_V_H_R].state == RES_VALID && !res[RES_V_H_R].dev_authoritative);
+      }
+    }
+    // A live V_H of another host array is written back before the slot is reused.
+    double vh2[64];
+    assert(res[RES_V_H_R].dev_authoritative && res[RES_V_H_R].host == vh);
+    for (int i = 0; i < nr; i++) vh[i] = vh2[i] = 0.0;
+    assert(density_fused(r, rho_g, rho_r));
+    assert(hartree_fused(&h, tot, vh2, &e, 0));
+    same(ref_vh, vh, (size_t)nr, "other host v_h written back");
+    assert(res[RES_V_H_R].dev_authoritative && res[RES_V_H_R].host == vh2);
+    for (int i = 0; i < nr; i++) vh[i] = 0.0;
+    assert(density_fused(r, rho_g, rho_r));
+    assert(hartree_fused(&h, tot, vh, &e, 0));
+    same(ref_vh, vh2, (size_t)nr, "other host v_h written back (2)");
+    // A live V_H survives eviction of its slot under memory pressure.
+    assert(res[RES_V_H_R].dev_authoritative && res[RES_V_H_R].host == vh);
+    size_t owned = 0;
+    for (int i = RES_V_H_R; i < RES_NSLOTS; i++) owned += res[i].owned_bytes;
+    max_gpu_memory_bytes = mock_limit = current_gpu_allocated_bytes;
+    mock_reset_trace();
+    assert(pw_gpu_ensure_gbuf_c(allocated_gbuf_size + owned));
+    assert(res[RES_V_H_R].owned_bytes == 0 && res[RES_V_H_R].state == RES_INVALID);
+    same(ref_vh, vh, (size_t)nr, "evicted lazy v_h written back");
+    assert(mock_download_bytes == sizeof(double) * (size_t)nr);
+    max_gpu_memory_bytes = mock_limit = 0;
+    // A Vxc that is still live when the next density reuses the XC grids is
+    // written back first (V_TOT semantics: the skipped host AXPY).
+    assert(density_fused(r, rho_g, rho_r));
+    assert(hartree_fused(&h, tot, vh, &e, 0));
+    assert(xc_call(rho_g, rho_r, vxc, &exc));
+    assert(pw_gpu_res_vtot_prepare_c(vh, vxc, (size_t)nr, h.dvol));
+    assert(pw_gpu_res_vtot_skip_host_c());
+    double g2[128], r2[64];
+    assert(density_call(r, g2, r2, 0));
+    same(ref_vtot, vxc, (size_t)nr, "live vtot written back before reuse");
+    // Window exit writes back the remaining live V_H.
+    assert(res[RES_V_H_R].dev_authoritative);
+    for (int i = 0; i < nr; i++) vh[i] = 0.0;
+    pw_gpu_res_set_lazy_c(0);
+    same(ref_vh, vh, (size_t)nr, "window exit v_h");
+    for (int id = 0; id < RES_NSLOTS; id++) assert(!res[id].dev_authoritative);
+    finish();
+    for (int l = 0; l < NLEV; l++) { free(r[l]); free(ref_pot[l]); free(pot[l]); }
+    free(rho_r);
+    hartree_free(&h);
+  }
+}
+
 // Large resident arrays exercise partial fingerprinting and three reduction
 // levels without the mock's deliberately slow direct DFT.
 static void integrate(void) {
@@ -738,7 +984,7 @@ static void borrowed(void) {
   memcpy(host_r, rho_r, sizeof(double) * (size_t)nr_[0]);
   const unsigned long epoch = xc_epoch;
   mock_reset_trace();
-  res_invalidate_borrowed();
+  res_retire_borrowed((1u << RES_RHO_G) | (1u << RES_RHO_R)); // consumed by XC
   assert(xc_epoch != epoch);
   for (int id = 0; id <= RES_VXC; id++) {
     assert(res[id].state == RES_INVALID && !res[id].dev_authoritative && !res[id].vtot);
@@ -815,6 +1061,8 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[1], "lazy_density")) lazy_density();
   else if (!strcmp(argv[1], "integrate")) integrate();
   else if (!strcmp(argv[1], "lazy_vtot")) lazy_vtot();
+  else if (!strcmp(argv[1], "lazy_grant")) lazy_grant();
+  else if (!strcmp(argv[1], "lazy_pot")) lazy_pot();
   else assert(!"unknown test");
   for (int l = 0; l < NLEV; l++) { free(map_[l]); free(gidx_[l]); }
   free(g_fine); free(gsq_fine);

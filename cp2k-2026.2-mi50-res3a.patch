@@ -1,0 +1,1342 @@
+diff --git a/src/pw/gpu/pw_gpu_internal.c b/src/pw/gpu/pw_gpu_internal.c
+index 93d1ea0..4b3a92c 100644
+--- a/src/pw/gpu/pw_gpu_internal.c
++++ b/src/pw/gpu/pw_gpu_internal.c
+@@ -157,11 +157,18 @@ static bool opt_res = true, opt_res_density = true, opt_res_hartree = true;
+ static bool opt_res_xcin = true, opt_res_pot = true, opt_res_verify = false;
+ static bool opt_res_stats = true;
+ static bool opt_res_lazy_density = true;
++static bool opt_res_lazy_pot = true; // lazy Vxc and V_H (inside the granted window)
++// Lazy (device-authoritative) results are only created inside a window that
++// the SCF driver grants for setups without host readers between a result and
++// its device consumer (pw_gpu_res_set_lazy_c). The density token marks the
++// one density computation of the SCF iteration that may stay on the device.
++static bool res_lazy_grant = false, res_density_token = false;
+ static size_t res_reserve_bytes = (size_t)1536 * 1024 * 1024;
+ static struct {
+   unsigned long density, density_fail, hartree, hartree_fail, potential,
+       potential_fail, vtot, vtot_fail, xc_in;
+-  size_t upload_saved;
++  unsigned long lazy_density, lazy_vxc, lazy_vhr, discards, syncs;
++  size_t upload_saved, download_saved, sync_bytes;
+ } res_stats;
+ // Hartree/DDAPC chain state between its Fortran-driven steps.
+ static struct {
+@@ -173,6 +180,7 @@ static struct {
+ static void res_evict_all(void);
+ static bool res_evict_one(void);
+ static void res_invalidate_borrowed(void);
++static void res_invalidate(const int id);
+ static void res_print_stats(void);
+ void pw_gpu_res_ensure_host_c(const int id, void *host_ptr);
+ 
+@@ -468,6 +476,7 @@ void pw_gpu_init(void) {
+   opt_res_pot = opt_res && env_flag("CP2K_PW_GPU_RES_POT", true);
+   opt_res_verify = opt_res && env_flag("CP2K_PW_GPU_RES_VERIFY", false);
+   opt_res_lazy_density = opt_res && env_flag("CP2K_PW_GPU_RES_LAZY_DENSITY", true);
++  opt_res_lazy_pot = opt_res && env_flag("CP2K_PW_GPU_RES_LAZY_POT", true);
+   opt_res_stats = opt_res && env_flag("CP2K_PW_GPU_RES_STATS", true);
+   {
+     size_t mb;
+@@ -477,6 +486,7 @@ void pw_gpu_init(void) {
+   }
+   memset(res, 0, sizeof(res));
+   memset(&res_stats, 0, sizeof(res_stats));
++  res_lazy_grant = res_density_token = false;
+   memset(&res_hartree, 0, sizeof(res_hartree));
+   res_pinned = 0;
+   res_small_dev = NULL;
+@@ -565,6 +575,18 @@ void pw_gpu_finalize(void) {
+   for (int i = 0; i < PW_GPU_GRID_CACHE_SIZE; i++) {
+     grid_cache_clear_entry(&grid_cache[i]);
+   }
++  // The host arrays may already be released here: forget live results instead
++  // of writing them back. The SCF exit and force boundaries leave none.
++  int live = 0;
++  for (int i = 0; i < RES_NSLOTS; i++) {
++    live += res[i].dev_authoritative ? 1 : 0;
++    res_invalidate(i);
++  }
++  if (live != 0) {
++    fprintf(stderr, "[PW_GPU] residency: %d device-only result(s) dropped at finalization.\n",
++            live);
++  }
++  res_lazy_grant = res_density_token = false;
+   release_work_buffers();
+   res_print_stats();
+   for (int i = 0; i < RES_NSLOTS; i++) {
+@@ -685,12 +707,14 @@ static void res_sync(const int id) {
+   res_slot *s = &res[id];
+   if (!s->dev_authoritative) return;
+   assert(s->state == RES_VALID && s->dev != NULL && s->host != NULL);
+-  assert(s->width == s->host_width && s->epoch == xc_epoch);
++  assert(s->width == s->host_width && (s->owned_bytes != 0 || s->epoch == xc_epoch));
+   offload_activate_chosen_device();
+-  offloadMemcpyAsyncDtoH((void *)s->host, s->dev,
+-                        s->n * (size_t)s->width * sizeof(double), stream);
++  const size_t bytes = s->n * (size_t)s->width * sizeof(double);
++  offloadMemcpyAsyncDtoH((void *)s->host, s->dev, bytes, stream);
+   offloadStreamSynchronize(stream);
+   s->dev_authoritative = false;
++  res_stats.syncs++;
++  res_stats.sync_bytes += bytes;
+ }
+ 
+ // id == -1 searches all slots, as a real PW can be either RHO_R or VXC.
+@@ -717,9 +741,23 @@ static void res_invalidate(const int id) {
+ }
+ 
+ static void res_invalidate_borrowed(void) {
+-  // The old contents are dead when XC/density reuses these grids. Callers
+-  // needing a host copy must request it before dropping the borrowed slots.
++  // Before the XC grids are reused, a live result is copied to its host array
++  // unless its consumer has just read it (see res_retire_borrowed).
++  for (int id = 0; id <= RES_VXC; id++) {
++    res_sync(id);
++    res_invalidate(id);
++  }
++  xc_epoch++;
++}
++
++// The fused XC pipeline is the device consumer of a lazy density: inside the
++// granted window the host copies of RHO_G/RHO_R are dead once XC has read them
++// (the next density overwrites them, the SCF exit is never reached with a
++// consumed density). Anything else that is still live is synchronized first.
++static void res_retire_borrowed(const unsigned consumed) {
+   for (int id = 0; id <= RES_VXC; id++) {
++    const bool dead = res_lazy_grant && id != RES_VXC && (consumed & (1u << id));
++    if (!dead) res_sync(id);
+     res_invalidate(id);
+   }
+   xc_epoch++;
+@@ -728,6 +766,7 @@ static void res_invalidate_borrowed(void) {
+ static void res_free_owned(const int id) {
+   res_slot *s = &res[id];
+   if (s->owned_bytes != 0) {
++    res_sync(id); // a lazy owned result (V_H_R) must survive eviction
+     offloadStreamSynchronize(stream);
+     offloadStreamSynchronize(stream_copy);
+     device_free(s->dev, s->owned_bytes);
+@@ -1029,6 +1068,12 @@ static void res_print_stats(void) {
+           res_stats.hartree_fail, res_stats.xc_in, res_stats.vtot,
+           res_stats.vtot_fail, res_stats.potential, res_stats.potential_fail,
+           (double)res_stats.upload_saved / 1e9);
++  fprintf(stderr,
++          "[PW_GPU] residency lazy: density %lu, vxc %lu, v_h %lu, discarded %lu, "
++          "host syncs %lu (%.1f GB), downloads avoided %.1f GB\n",
++          res_stats.lazy_density, res_stats.lazy_vxc, res_stats.lazy_vhr,
++          res_stats.discards, res_stats.syncs, (double)res_stats.sync_bytes / 1e9,
++          (double)res_stats.download_saved / 1e9);
+   fprintf(stderr, "[PW_GPU] residency slots (hits/misses):");
+   for (int id = 0; id < RES_NSLOTS; id++) {
+     fprintf(stderr, " %s %lu/%lu", res_names[id], res[id].hits, res[id].misses);
+@@ -1070,6 +1115,55 @@ void pw_gpu_res_invalidate_c(void) {
+   res_hartree.pending = false;
+ }
+ 
++/*******************************************************************************
++ * \brief Lazy window of the SCF driver. on != 0 grants lazy results until the
++ *        call with on == 0, which synchronizes every live result to its host
++ *        array (resident copies stay valid). Outside the window all results
++ *        are written to the host as soon as they are computed.
++ ******************************************************************************/
++void pw_gpu_res_set_lazy_c(const int on) {
++  if (!is_initialized) return;
++  res_density_token = false;
++  if (on) {
++    res_lazy_grant = opt_res && (opt_res_lazy_density || opt_res_lazy_pot) && !opt_res_verify;
++    return;
++  }
++  res_lazy_grant = false;
++  offload_activate_chosen_device();
++  for (int id = 0; id < RES_NSLOTS; id++) {
++    res_sync(id);
++  }
++}
++
++// The next density computation (and only that one) may stay on the device.
++void pw_gpu_res_defer_density_c(const int on) {
++  res_density_token = is_initialized && res_lazy_grant && on != 0;
++}
++
++// The host array is about to be released without being read again: forget a
++// device copy (live or not) without downloading it.
++void pw_gpu_res_discard_c(const void *host_ptr) {
++  if (host_ptr == NULL) return;
++#pragma omp critical(pw_gpu_res_host)
++  {
++    if (is_initialized) {
++      const uintptr_t p = (uintptr_t)host_ptr;
++      for (int i = 0; i < RES_NSLOTS; i++) {
++        res_slot *s = &res[i];
++        const uintptr_t base = (uintptr_t)s->host;
++        if (s->state != RES_INVALID && s->host != NULL && p >= base &&
++            p - base < s->n * (size_t)s->host_width * sizeof(double)) {
++          if (s->dev_authoritative) {
++            res_stats.discards++;
++            res_stats.download_saved += s->n * (size_t)s->width * sizeof(double);
++          }
++          res_invalidate(i);
++        }
++      }
++    }
++  }
++}
++
+ // Reserve the complete operation before uploading or changing any output.
+ // All parts except an optional trailing int map are double-aligned. Reusing
+ // compact scratch keeps these operations in the existing budget and lifecycle.
+@@ -1519,6 +1613,17 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
+   }
+   protected_grid_entry = entry;
+   const int fits = pw_gpu_ensure_xc_c(4 * real_size);
++  // A lazy Vxc stays in the first XC grid for its device consumers (V_TOT,
++  // potential_pw2rs); only its fingerprint and the energy are downloaded.
++  bool lazy_vxc = fits && res_lazy_grant && opt_res_lazy_pot && opt_res_pot;
++  double *vxc_samples = NULL;
++  if (lazy_vxc) {
++    protected_xc_buffer = true;
++    vxc_samples = res_small(pw_res_sample_count(nr));
++    protected_xc_buffer = false;
++    lazy_vxc = vxc_samples != NULL &&
++               res_sample_buffer(&res[RES_VXC], pw_res_sample_count(nr));
++  }
+   protected_grid_entry = NULL;
+   if (!fits) return 0;
+   const int *map_dev = entry == NULL ? NULL : entry->map_dev;
+@@ -1545,7 +1650,8 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
+     pw_gpu_launch_copy(res_g, gbuf_dev, (size_t)ngpts, (size_t)ngpts, 2, 2, 1.0, stream);
+   if (res_r != NULL) pw_gpu_launch_copy(res_r, rho_dev, nr, nr, 1, 1, 1.0, stream);
+   if (res_g != NULL || res_r != NULL) res_stats.xc_in++;
+-  res_invalidate_borrowed();
++  res_retire_borrowed((res_g != NULL ? 1u << RES_RHO_G : 0u) |
++                      (res_r != NULL ? 1u << RES_RHO_R : 0u));
+   for (int d = 0; d < 3; d++) {
+     offloadMemsetAsync(buffer_dev_2, 0, buffer_size, stream);
+     if (ngpts)
+@@ -1611,8 +1717,16 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
+   pw_gpu_launch_xc_cutoff(dout_dev, rho_dev, nr, epsilon_rho * smooth_range,
+                           smooth_range, stream);
+   // These are the only downloads: the final potential and one energy scalar.
+-  offloadMemcpyAsyncDtoH(dout_vxc_r, dout_dev, real_size, stream);
+   offloadMemcpyAsyncDtoH(exc_out, norm_dev, sizeof(double), stream);
++  if (lazy_vxc) {
++    res_register_lazy(RES_VXC, dout_vxc_r, nr, 1, dout_dev, vxc_samples);
++    offloadStreamSynchronize(stream);
++    res_stats.lazy_vxc++;
++    res_stats.download_saved += real_size;
++    if (!opt_map_cache) pw_gpu_grid_invalidate(grid_id);
++    return 1;
++  }
++  offloadMemcpyAsyncDtoH(dout_vxc_r, dout_dev, real_size, stream);
+   offloadStreamSynchronize(stream);
+   if (!opt_map_cache) pw_gpu_grid_invalidate(grid_id);
+   // Vxc stays in the first XC grid for pw_gpu_res_vtot_prepare_c.
+@@ -1683,7 +1797,8 @@ static void res_host_copy(double *dst, const double *src, const size_t n) {
+  *        the XC grids until a host consumer or scratch reuse requires them.
+  *        Returns 0 with all host outputs untouched if anything is unsupported.
+  ******************************************************************************/
+-static int res_density(const int nlevels, void *const *r_host, const int *npts,
++static int res_density(const bool lazy_allowed, const int nlevels,
++                       void *const *r_host, const int *npts,
+                        const int *ngpts, const int *nmaps, const int *grid_id,
+                        void *const *maps, void *const *gidx, const double *scale,
+                        const int *t_npts, const int t_ngpts, const int t_nmaps,
+@@ -1732,7 +1847,7 @@ static int res_density(const int nlevels, void *const *r_host, const int *npts,
+   double *rho_g_dev = xc_dev, *rho_r_dev = xc_dev_hi;
+   res_invalidate_borrowed(); // the XC grids are overwritten below
+   protected_xc_buffer = true; // grid cache uploads must not release them
+-  const bool lazy = opt_res_lazy_density && !opt_res_verify;
++  const bool lazy = lazy_allowed && res_lazy_grant && opt_res_lazy_density;
+   double *samples = NULL;
+   if (lazy) {
+     const size_t gs = 2 * pw_res_sample_count((size_t)t_ngpts);
+@@ -1795,6 +1910,8 @@ static int res_density(const int nlevels, void *const *r_host, const int *npts,
+     res_register_lazy(RES_RHO_R, rho_r_host, t_nr, 1, rho_r_dev, samples);
+     offloadStreamSynchronize(stream);
+     res_stats.density++;
++    res_stats.lazy_density++;
++    res_stats.download_saved += sizeof(double) * (2 * (size_t)t_ngpts + t_nr);
+     return 1;
+   }
+   // The G-space download overlaps the inverse FFT.
+@@ -1818,9 +1935,12 @@ int pw_gpu_res_density_c(const int nlevels, void *const *r_host, const int *npts
+                          const int *t_npts, const int t_ngpts, const int t_nmaps,
+                          const int t_grid_id, const int *t_map, double *rho_g_host,
+                          double *rho_r_host) {
+-  const int done = res_density(nlevels, r_host, npts, ngpts, nmaps, grid_id, maps,
+-                               gidx, scale, t_npts, t_ngpts, t_nmaps, t_grid_id,
+-                               t_map, rho_g_host, rho_r_host);
++  // The token is consumed by every attempt, including rejected ones.
++  const bool lazy_allowed = res_density_token;
++  res_density_token = false;
++  const int done = res_density(lazy_allowed, nlevels, r_host, npts, ngpts, nmaps,
++                               grid_id, maps, gidx, scale, t_npts, t_ngpts,
++                               t_nmaps, t_grid_id, t_map, rho_g_host, rho_r_host);
+   protected_xc_buffer = false;
+   return done;
+ }
+@@ -1984,6 +2104,7 @@ int pw_gpu_res_vtot_prepare_c(const double *vh_host, const double *vxc_host,
+     protected_xc_buffer = false;
+     if (!ok || s->epoch != xc_epoch) {
+       res_pinned = 0;
++      if (s->epoch == xc_epoch) res_sync(RES_VXC); // a lazy Vxc is still intact
+       res_invalidate(RES_VXC);
+       res_stats.vtot_fail++;
+       return 0;
+@@ -2233,6 +2354,21 @@ int pw_gpu_res_hartree_finish_c(double *v_h_r_host, const int *npts,
+   const bool resident = opt_res_pot && res_ensure_owned(RES_V_H_R, sizeof(double) * nr);
+   if (resident) {
+     dst = res[RES_V_H_R].dev;
++    // A live V_H of another host array is written back before it is replaced.
++    if (res[RES_V_H_R].host != v_h_r_host) res_sync(RES_V_H_R);
++  }
++  // Inside the lazy window V_H stays on the device for V_TOT; the host copy is
++  // written when a host consumer asks for it or at the end of the SCF.
++  bool lazy = resident && res_lazy_grant && opt_res_lazy_pot;
++  double *samples = NULL;
++  if (lazy) {
++    // Reclaiming memory for the fingerprint scratch must keep the map and V_H.
++    res_pinned |= 1u << RES_V_H_R;
++    protected_grid_entry = e;
++    samples = res_small(pw_res_sample_count(nr));
++    protected_grid_entry = NULL;
++    res_pinned &= ~(1u << RES_V_H_R);
++    lazy = samples != NULL && res_sample_buffer(&res[RES_V_H_R], pw_res_sample_count(nr));
+   }
+   offloadMemsetAsync(buffer_dev_2, 0, 2 * sizeof(double) * nr, stream);
+   pw_gpu_launch_scatter(buffer_dev_2, gbuf_dev, 1.0, ngpts, nmaps, e->map_dev,
+@@ -2240,10 +2376,17 @@ int pw_gpu_res_hartree_finish_c(double *v_h_r_host, const int *npts,
+   fft_3d(OFFLOAD_FFT_INVERSE, npts[2], npts[1], npts[0], buffer_dev_2);
+   pw_gpu_launch_complex_to_real(buffer_dev_2, dst, (int)nr, stream);
+   pw_gpu_launch_copy(dst, dst, nr, nr, 1, 1, dvol, stream); // pw_scale
+-  offloadMemcpyAsyncDtoH(v_h_r_host, dst, sizeof(double) * nr, stream);
+-  offloadStreamSynchronize(stream);
+-  if (resident) {
+-    res_register(RES_V_H_R, v_h_r_host, nr, 1, 1, dst);
++  if (lazy) {
++    res_register_lazy(RES_V_H_R, v_h_r_host, nr, 1, dst, samples);
++    offloadStreamSynchronize(stream);
++    res_stats.lazy_vhr++;
++    res_stats.download_saved += sizeof(double) * nr;
++  } else {
++    offloadMemcpyAsyncDtoH(v_h_r_host, dst, sizeof(double) * nr, stream);
++    offloadStreamSynchronize(stream);
++    if (resident) {
++      res_register(RES_V_H_R, v_h_r_host, nr, 1, 1, dst);
++    }
+   }
+   res_hartree.pending = false;
+   res_stats.hartree++;
+diff --git a/src/pw/gpu/pw_gpu_kernels.h b/src/pw/gpu/pw_gpu_kernels.h
+index 152c116..e3d7210 100644
+--- a/src/pw/gpu/pw_gpu_kernels.h
++++ b/src/pw/gpu/pw_gpu_kernels.h
+@@ -160,6 +160,12 @@ int pw_gpu_res_vtot_prepare_c(const double *vh_host, const double *vxc_host,
+     size_t n, double dvol);
+ int pw_gpu_res_vtot_commit_c(const double *vtot_host, size_t n);
+ int pw_gpu_res_vtot_skip_host_c(void);
++// Lazy window of the SCF driver (on != 0 opens it; closing writes every live
++// result to its host array), the one deferred density of an SCF iteration, and
++// release of a host array that is not read again (drops its device copy).
++void pw_gpu_res_set_lazy_c(int on);
++void pw_gpu_res_defer_density_c(int on);
++void pw_gpu_res_discard_c(const void *host_ptr);
+ int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host,
+     const double *infl_host, double *rho_tot_host, size_t ngpts, size_t nprefix,
+     const int *npts);
+diff --git a/src/pw/pw_gpu.F b/src/pw/pw_gpu.F
+index 7b362e6..2fbf052 100644
+--- a/src/pw/pw_gpu.F
++++ b/src/pw/pw_gpu.F
+@@ -68,6 +68,7 @@ MODULE pw_gpu
+              pw_gpu_res_hartree_finish, pw_gpu_res_hartree_cancel
+    PUBLIC :: pw_gpu_res_vtot_prepare, pw_gpu_res_vtot_commit
+    PUBLIC :: pw_gpu_res_vtot_skip_host
++   PUBLIC :: pw_gpu_res_set_lazy, pw_gpu_res_defer_density, pw_gpu_res_discard
+    PUBLIC :: pw_gpu_res_density_id, pw_gpu_res_hartree_id, pw_gpu_res_xcin_id, pw_gpu_res_pot_id
+ 
+    ! Residency features, see pw_gpu_res_enabled.
+@@ -1504,6 +1505,80 @@ CONTAINS
+ #endif
+    END SUBROUTINE pw_gpu_res_invalidate
+ 
++! **************************************************************************************************
++!> \brief Opens (on) or closes the lazy window of an SCF. Closing writes every result that is
++!>        still only on the device to its host array.
++!> \param on ...
++! **************************************************************************************************
++   SUBROUTINE pw_gpu_res_set_lazy(on)
++      LOGICAL, INTENT(IN)                                :: on
++
++#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
++      INTERFACE
++         SUBROUTINE pw_gpu_res_set_lazy_c(on) BIND(C, name="pw_gpu_res_set_lazy_c")
++            IMPORT :: C_INT
++            INTEGER(KIND=C_INT), VALUE                   :: on
++         END SUBROUTINE pw_gpu_res_set_lazy_c
++      END INTERFACE
++
++      IF (on) THEN
++         CALL pw_gpu_res_set_lazy_c(1_C_INT)
++      ELSE
++         CALL pw_gpu_res_set_lazy_c(0_C_INT)
++      END IF
++#else
++      MARK_USED(on)
++#endif
++   END SUBROUTINE pw_gpu_res_set_lazy
++
++! **************************************************************************************************
++!> \brief Lets the next density computation leave its result on the device (lazy window only).
++!> \param on ...
++! **************************************************************************************************
++   SUBROUTINE pw_gpu_res_defer_density(on)
++      LOGICAL, INTENT(IN)                                :: on
++
++#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
++      INTERFACE
++         SUBROUTINE pw_gpu_res_defer_density_c(on) BIND(C, name="pw_gpu_res_defer_density_c")
++            IMPORT :: C_INT
++            INTEGER(KIND=C_INT), VALUE                   :: on
++         END SUBROUTINE pw_gpu_res_defer_density_c
++      END INTERFACE
++
++      IF (on) THEN
++         CALL pw_gpu_res_defer_density_c(1_C_INT)
++      ELSE
++         CALL pw_gpu_res_defer_density_c(0_C_INT)
++      END IF
++#else
++      MARK_USED(on)
++#endif
++   END SUBROUTINE pw_gpu_res_defer_density
++
++! **************************************************************************************************
++!> \brief Forgets the device copy of an array that is released without being read again.
++!> \param pw ...
++! **************************************************************************************************
++   SUBROUTINE pw_gpu_res_discard(pw)
++      TYPE(pw_r3d_rs_type), INTENT(IN)                   :: pw
++
++#if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
++      INTERFACE
++         SUBROUTINE pw_gpu_res_discard_c(host) BIND(C, name="pw_gpu_res_discard_c")
++            IMPORT :: C_PTR
++            TYPE(C_PTR), VALUE                           :: host
++         END SUBROUTINE pw_gpu_res_discard_c
++      END INTERFACE
++
++      IF (.NOT. ASSOCIATED(pw%array)) RETURN
++      IF (SIZE(pw%array) == 0) RETURN
++      CALL pw_gpu_res_discard_c(C_LOC(pw%array))
++#else
++      MARK_USED(pw)
++#endif
++   END SUBROUTINE pw_gpu_res_discard
++
+ ! **************************************************************************************************
+ !> \brief Materialize a lazy PW array before host access (also accepts an array slice).
+ ! **************************************************************************************************
+diff --git a/src/pw/pw_grids.F b/src/pw/pw_grids.F
+index 9a798d0..26e7173 100644
+--- a/src/pw/pw_grids.F
++++ b/src/pw/pw_grids.F
+@@ -61,6 +61,7 @@ MODULE pw_grids
+                                               pw_grid_type
+    USE util,                            ONLY: get_limit,&
+                                               sort
++!$ USE OMP_LIB, ONLY: omp_get_max_threads, omp_in_parallel
+ #include "../base/base_uses.f90"
+ 
+    IMPLICIT NONE
+@@ -1778,34 +1779,43 @@ CONTAINS
+       ALLOCATE (idx(ng))
+ 
+       ! grids are (locally) ordered by length of G-vectors
+-      CALL sort(pw_grid%gsq, ng, idx)
++      ! (a stable sort: the result is the same as that of util's sort, see sort_gsq)
++      CALL sort_gsq(pw_grid%gsq, ng, idx)
+       ! within shells order wrt x,y,z
+       CALL sort_shells(pw_grid%gsq, pw_grid%g_hat, idx)
+ 
+       ALLOCATE (real_tmp(3, ng))
++!$OMP PARALLEL DO DEFAULT(NONE) SHARED(idx, ng, pw_grid, real_tmp) PRIVATE(i)
+       DO i = 1, ng
+          real_tmp(1, i) = pw_grid%g(1, idx(i))
+          real_tmp(2, i) = pw_grid%g(2, idx(i))
+          real_tmp(3, i) = pw_grid%g(3, idx(i))
+       END DO
++!$OMP END PARALLEL DO
++!$OMP PARALLEL DO DEFAULT(NONE) SHARED(ng, pw_grid, real_tmp) PRIVATE(i)
+       DO i = 1, ng
+          pw_grid%g(1, i) = real_tmp(1, i)
+          pw_grid%g(2, i) = real_tmp(2, i)
+          pw_grid%g(3, i) = real_tmp(3, i)
+       END DO
++!$OMP END PARALLEL DO
+       DEALLOCATE (real_tmp)
+ 
+       ALLOCATE (int_tmp(3, ng))
++!$OMP PARALLEL DO DEFAULT(NONE) SHARED(idx, int_tmp, ng, pw_grid) PRIVATE(i)
+       DO i = 1, ng
+          int_tmp(1, i) = pw_grid%g_hat(1, idx(i))
+          int_tmp(2, i) = pw_grid%g_hat(2, idx(i))
+          int_tmp(3, i) = pw_grid%g_hat(3, idx(i))
+       END DO
++!$OMP END PARALLEL DO
++!$OMP PARALLEL DO DEFAULT(NONE) SHARED(int_tmp, ng, pw_grid) PRIVATE(i)
+       DO i = 1, ng
+          pw_grid%g_hat(1, i) = int_tmp(1, i)
+          pw_grid%g_hat(2, i) = int_tmp(2, i)
+          pw_grid%g_hat(3, i) = int_tmp(3, i)
+       END DO
++!$OMP END PARALLEL DO
+       DEALLOCATE (int_tmp)
+ 
+       DEALLOCATE (idx)
+@@ -1831,7 +1841,10 @@ CONTAINS
+                it = ig
+             END DO
+             ! now for the ones that could not be done
+-            IF (ng == ngr) THEN
++            IF (ng == ngr .AND. use_gidx_table(pw_grid, ref_grid)) THEN
++               ! for the case pw_grid <= ref_grid: direct lookup of the (unique) Miller indices
++               CALL gidx_from_table(pw_grid, ref_grid, it, ngr)
++            ELSE IF (ng == ngr) THEN
+                ! for the case pw_grid <= ref_grid
+                is = it
+                DO ig = it + 1, ngr
+@@ -1930,6 +1943,235 @@ CONTAINS
+ 
+    END SUBROUTINE pw_grid_sort
+ 
++! **************************************************************************************************
++!> \brief Stable ascending sort of arr, returning the original positions in idx. Chunks are sorted
++!>        concurrently with util's (stable merge) sort and merged pairwise, taking the right run
++!>        only if it is strictly smaller. Ties therefore keep their original order and the result
++!>        (arr and idx) is identical to CALL sort(arr, n, idx).
++!> \param arr ...
++!> \param n ...
++!> \param idx ...
++! **************************************************************************************************
++   SUBROUTINE sort_gsq(arr, n, idx)
++      INTEGER, INTENT(IN)                                :: n
++      REAL(KIND=dp), DIMENSION(1:n), INTENT(INOUT)       :: arr
++      INTEGER, DIMENSION(1:n), INTENT(INOUT)             :: idx
++
++      INTEGER                                            :: c, hi, i, lo, mid, nchunk, nthreads, &
++                                                            width
++      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bounds, tmp_idx
++      LOGICAL                                            :: in_tmp
++      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: tmp_arr
++
++      nthreads = 1
++!$    nthreads = omp_get_max_threads()
++!$    IF (omp_in_parallel()) nthreads = 1
++      IF (nthreads < 2 .OR. n < 65536) THEN
++         CALL sort(arr, n, idx)
++         RETURN
++      END IF
++
++      nchunk = 1
++      DO WHILE (nchunk < nthreads .AND. nchunk < 256)
++         nchunk = 2*nchunk
++      END DO
++      ALLOCATE (bounds(0:nchunk))
++      DO c = 0, nchunk
++         bounds(c) = INT(INT(c, int_8)*INT(n, int_8)/INT(nchunk, int_8))
++      END DO
++
++!$OMP PARALLEL DO DEFAULT(NONE) SHARED(arr, bounds, idx, nchunk) PRIVATE(c, hi, i, lo) &
++!$OMP             SCHEDULE(DYNAMIC, 1)
++      DO c = 1, nchunk
++         lo = bounds(c - 1) + 1
++         hi = bounds(c)
++         CALL sort(arr(lo:hi), hi - lo + 1, idx(lo:hi))
++         DO i = lo, hi
++            idx(i) = idx(i) + lo - 1
++         END DO
++      END DO
++!$OMP END PARALLEL DO
++
++      ALLOCATE (tmp_arr(n), tmp_idx(n))
++      in_tmp = .FALSE.
++      width = 1
++      DO WHILE (width < nchunk)
++!$OMP PARALLEL DO DEFAULT(NONE) SHARED(arr, bounds, idx, in_tmp, nchunk, tmp_arr, tmp_idx, width) &
++!$OMP             PRIVATE(c, hi, lo, mid) SCHEDULE(DYNAMIC, 1)
++         DO c = 0, nchunk - 1, 2*width
++            lo = bounds(c) + 1
++            mid = bounds(MIN(c + width, nchunk))
++            hi = bounds(MIN(c + 2*width, nchunk))
++            IF (in_tmp) THEN
++               CALL merge_runs(tmp_arr, tmp_idx, arr, idx, lo, mid, hi)
++            ELSE
++               CALL merge_runs(arr, idx, tmp_arr, tmp_idx, lo, mid, hi)
++            END IF
++         END DO
++!$OMP END PARALLEL DO
++         in_tmp = .NOT. in_tmp
++         width = 2*width
++      END DO
++
++      IF (in_tmp) THEN
++!$OMP PARALLEL DO DEFAULT(NONE) SHARED(arr, idx, n, tmp_arr, tmp_idx) PRIVATE(i)
++         DO i = 1, n
++            arr(i) = tmp_arr(i)
++            idx(i) = tmp_idx(i)
++         END DO
++!$OMP END PARALLEL DO
++      END IF
++      DEALLOCATE (bounds, tmp_arr, tmp_idx)
++
++   END SUBROUTINE sort_gsq
++
++! **************************************************************************************************
++!> \brief Stable merge of the sorted runs src(lo:mid) and src(mid+1:hi) into dst(lo:hi).
++!> \param src_a ...
++!> \param src_i ...
++!> \param dst_a ...
++!> \param dst_i ...
++!> \param lo ...
++!> \param mid ...
++!> \param hi ...
++! **************************************************************************************************
++   SUBROUTINE merge_runs(src_a, src_i, dst_a, dst_i, lo, mid, hi)
++      REAL(KIND=dp), DIMENSION(:), INTENT(IN)            :: src_a
++      INTEGER, DIMENSION(:), INTENT(IN)                  :: src_i
++      REAL(KIND=dp), DIMENSION(:), INTENT(INOUT)         :: dst_a
++      INTEGER, DIMENSION(:), INTENT(INOUT)               :: dst_i
++      INTEGER, INTENT(IN)                                :: lo, mid, hi
++
++      INTEGER                                            :: i, j, k
++
++      i = lo
++      j = mid + 1
++      k = lo
++      DO WHILE (i <= mid .AND. j <= hi)
++         IF (src_a(j) < src_a(i)) THEN
++            dst_a(k) = src_a(j)
++            dst_i(k) = src_i(j)
++            j = j + 1
++         ELSE
++            dst_a(k) = src_a(i)
++            dst_i(k) = src_i(i)
++            i = i + 1
++         END IF
++         k = k + 1
++      END DO
++      DO WHILE (i <= mid)
++         dst_a(k) = src_a(i)
++         dst_i(k) = src_i(i)
++         i = i + 1
++         k = k + 1
++      END DO
++      DO WHILE (j <= hi)
++         dst_a(k) = src_a(j)
++         dst_i(k) = src_i(j)
++         j = j + 1
++         k = k + 1
++      END DO
++
++   END SUBROUTINE merge_runs
++
++! **************************************************************************************************
++!> \brief Whether gidx_from_table applies: every reference Miller index lies within the bounds
++!>        of the reference grid and the lookup table stays within a modest size.
++!> \param pw_grid ...
++!> \param ref_grid ...
++!> \return ...
++! **************************************************************************************************
++   FUNCTION use_gidx_table(pw_grid, ref_grid) RESULT(ok)
++      TYPE(pw_grid_type), INTENT(IN)                     :: pw_grid, ref_grid
++      LOGICAL                                            :: ok
++
++      INTEGER                                            :: d
++      INTEGER(KIND=int_8)                                :: npts
++
++      ok = ALLOCATED(ref_grid%g_hat) .AND. ASSOCIATED(ref_grid%gsq) .AND. &
++           ALLOCATED(pw_grid%g_hat) .AND. ASSOCIATED(pw_grid%gidx)
++      IF (.NOT. ok) RETURN
++      npts = 1
++      DO d = 1, 3
++         ok = ok .AND. ref_grid%bounds(2, d) >= ref_grid%bounds(1, d)
++         IF (.NOT. ok) RETURN
++         npts = npts*INT(ref_grid%bounds(2, d) - ref_grid%bounds(1, d) + 1, int_8)
++      END DO
++      ! 4 bytes per point; the reference grids of the multigrids stay well below this limit
++      ok = npts <= 2_int_8**30
++      IF (.NOT. ok) RETURN
++      ok = SIZE(ref_grid%g_hat, 2) >= SIZE(ref_grid%gsq) .AND. SIZE(ref_grid%g_hat, 1) == 3 .AND. &
++           SIZE(pw_grid%g_hat, 1) == 3
++      IF (.NOT. ok) RETURN
++      DO d = 1, 3
++         ok = ok .AND. MINVAL(ref_grid%g_hat(d, 1:SIZE(ref_grid%gsq))) >= ref_grid%bounds(1, d) .AND. &
++              MAXVAL(ref_grid%g_hat(d, 1:SIZE(ref_grid%gsq))) <= ref_grid%bounds(2, d)
++      END DO
++
++   END FUNCTION use_gidx_table
++
++! **************************************************************************************************
++!> \brief gidx for pw_grid <= ref_grid. The Miller indices of a grid are unique, so the reference
++!>        position of every G is found by a direct lookup. It is accepted under the same condition
++!>        as in the sequential search of pw_grid_sort (|G|^2 agrees to 1.e-12 relative), which
++!>        makes the result identical to that search.
++!> \param pw_grid ...
++!> \param ref_grid ...
++!> \param it number of leading G-vectors that coincide with the reference grid
++!> \param ngr ...
++! **************************************************************************************************
++   SUBROUTINE gidx_from_table(pw_grid, ref_grid, it, ngr)
++      TYPE(pw_grid_type), INTENT(INOUT)                  :: pw_grid
++      TYPE(pw_grid_type), INTENT(IN)                     :: ref_grid
++      INTEGER, INTENT(IN)                                :: it, ngr
++
++      INTEGER                                            :: bad, ig, ih, l, m, n
++      INTEGER, ALLOCATABLE, DIMENSION(:, :, :)           :: table
++      INTEGER, DIMENSION(2, 3)                           :: rb
++      REAL(KIND=dp)                                      :: gig, gigr
++
++      rb = ref_grid%bounds
++      ALLOCATE (table(rb(1, 1):rb(2, 1), rb(1, 2):rb(2, 2), rb(1, 3):rb(2, 3)))
++!$OMP PARALLEL DO DEFAULT(NONE) SHARED(rb, table) PRIVATE(n)
++      DO n = rb(1, 3), rb(2, 3)
++         table(:, :, n) = 0
++      END DO
++!$OMP END PARALLEL DO
++!$OMP PARALLEL DO DEFAULT(NONE) SHARED(ref_grid, table) PRIVATE(ih)
++      DO ih = 1, SIZE(ref_grid%gsq)
++         table(ref_grid%g_hat(1, ih), ref_grid%g_hat(2, ih), ref_grid%g_hat(3, ih)) = ih
++      END DO
++!$OMP END PARALLEL DO
++
++      bad = HUGE(0)
++!$OMP PARALLEL DO DEFAULT(NONE) SHARED(it, ngr, pw_grid, rb, ref_grid, table) &
++!$OMP             PRIVATE(gig, gigr, ig, ih, l, m, n) REDUCTION(MIN:bad)
++      DO ig = it + 1, ngr
++         l = pw_grid%g_hat(1, ig)
++         m = pw_grid%g_hat(2, ig)
++         n = pw_grid%g_hat(3, ig)
++         ih = 0
++         IF (l >= rb(1, 1) .AND. l <= rb(2, 1) .AND. m >= rb(1, 2) .AND. m <= rb(2, 2) .AND. &
++             n >= rb(1, 3) .AND. n <= rb(2, 3)) ih = table(l, m, n)
++         IF (ih > 0) THEN
++            gig = pw_grid%gsq(ig)
++            gigr = MAX(1._dp, gig)
++            IF (ABS(gig - ref_grid%gsq(ih))/gigr > 1.e-12_dp) ih = 0
++         END IF
++         pw_grid%gidx(ig) = ih
++         IF (ih == 0) bad = MIN(bad, ig)
++      END DO
++!$OMP END PARALLEL DO
++      DEALLOCATE (table)
++
++      IF (bad /= HUGE(0)) THEN
++         WRITE (*, "(A,I10,3I6,F20.10)") &
++            " G-vector", bad, pw_grid%g_hat(1:3, bad), pw_grid%gsq(bad)
++         CPABORT("G vector not found")
++      END IF
++
++   END SUBROUTINE gidx_from_table
++
+ ! **************************************************************************************************
+ !> \brief ...
+ !> \param gsq ...
+@@ -1946,7 +2188,8 @@ CONTAINS
+       CHARACTER(len=*), PARAMETER                        :: routineN = 'sort_shells'
+       REAL(KIND=dp), PARAMETER                           :: small = 5.e-16_dp
+ 
+-      INTEGER                                            :: handle, ig, ng, s1, s2
++      INTEGER                                            :: handle, ig, ish, ng, nshell
++      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: shell_start
+       REAL(KIND=dp)                                      :: s_begin
+ 
+       CALL timeset(routineN, handle)
+@@ -1954,22 +2197,37 @@ CONTAINS
+ ! Juergs temporary hack to get the grids sorted for large (4000Ry) cutoffs.
+ ! might need to call lapack for machine precision.
+ 
++      ! A shell starts where gsq leaves the first value of the current shell by at least small.
++      ! The shells are found sequentially; each one is then reordered independently.
+       ng = SIZE(gsq)
++      nshell = 0
+       s_begin = -1.0_dp
+-      s1 = 0
+-      s2 = 0
+-      ig = 1
+       DO ig = 1, ng
+-         IF (ABS(gsq(ig) - s_begin) < small) THEN
+-            s2 = ig
+-         ELSE
+-            CALL redist(g_hat, idx, s1, s2)
++         IF (.NOT. (ABS(gsq(ig) - s_begin) < small)) THEN
++            nshell = nshell + 1
+             s_begin = gsq(ig)
+-            s1 = ig
+-            s2 = ig
+          END IF
+       END DO
+-      CALL redist(g_hat, idx, s1, s2)
++      ALLOCATE (shell_start(nshell + 1))
++      nshell = 0
++      s_begin = -1.0_dp
++      DO ig = 1, ng
++         IF (.NOT. (ABS(gsq(ig) - s_begin) < small)) THEN
++            nshell = nshell + 1
++            shell_start(nshell) = ig
++            s_begin = gsq(ig)
++         END IF
++      END DO
++      shell_start(nshell + 1) = ng + 1
++
++!$OMP PARALLEL DO DEFAULT(NONE) SHARED(g_hat, idx, nshell, shell_start) PRIVATE(ish) &
++!$OMP             SCHEDULE(DYNAMIC, 4096)
++      DO ish = 1, nshell
++         IF (shell_start(ish + 1) - shell_start(ish) > 1) &
++            CALL redist(g_hat, idx, shell_start(ish), shell_start(ish + 1) - 1)
++      END DO
++!$OMP END PARALLEL DO
++      DEALLOCATE (shell_start)
+ 
+       CALL timestop(handle)
+ 
+diff --git a/src/qs_ks_utils.F b/src/qs_ks_utils.F
+index 94a1beb..f70c596 100644
+--- a/src/qs_ks_utils.F
++++ b/src/qs_ks_utils.F
+@@ -82,7 +82,8 @@ MODULE qs_ks_utils
+                                               MIXED_PERIODIC_BC,&
+                                               NEUMANN_BC,&
+                                               PERIODIC_BC
+-   USE pw_gpu,                          ONLY: pw_gpu_res_ensure_host,&
++   USE pw_gpu,                          ONLY: pw_gpu_res_discard,&
++                                              pw_gpu_res_ensure_host,&
+                                               pw_gpu_res_vtot_prepare,&
+                                               pw_gpu_res_vtot_skip_host
+    USE pw_env_types,                    ONLY: pw_env_get,&
+@@ -1566,7 +1567,8 @@ CONTAINS
+                                        calculate_forces=calculate_forces, &
+                                        gapw=gapw)
+             END IF
+-            CALL pw_gpu_res_ensure_host(v_rspace_new(ispin))
++            ! The potential is released unread: drop a device-only copy instead of downloading it.
++            CALL pw_gpu_res_discard(v_rspace_new(ispin))
+             CALL auxbas_pw_pool%give_back_pw(v_rspace_new(ispin))
+          END DO ! ispin
+ 
+diff --git a/src/qs_scf.F b/src/qs_scf.F
+index 30865f7..0003c37 100644
+--- a/src/qs_scf.F
++++ b/src/qs_scf.F
+@@ -83,7 +83,7 @@ MODULE qs_scf
+         cdft2ot, history_guess, ot2cdft, ot_precond_full_all, ot_precond_full_single, &
+         ot_precond_full_single_inverse, ot_precond_none, ot_precond_s_inverse, &
+         outer_scf_becke_constraint, outer_scf_hirshfeld_constraint, outer_scf_optimizer_broyden, &
+-        outer_scf_optimizer_newton_ls, tblite_scc_mixer_tblite
++        outer_scf_optimizer_newton_ls, sic_none, tblite_scc_mixer_tblite
+    USE input_section_types,             ONLY: section_vals_get_subs_vals,&
+                                               section_vals_type
+    USE kinds,                           ONLY: default_path_length,&
+@@ -102,6 +102,8 @@ MODULE qs_scf
+                                               restart_preconditioner
+    USE pw_env_types,                    ONLY: pw_env_get,&
+                                               pw_env_type
++   USE pw_gpu,                          ONLY: pw_gpu_res_defer_density,&
++                                              pw_gpu_res_set_lazy
+    USE pw_pool_types,                   ONLY: pw_pool_type
+    USE qs_block_davidson_types,         ONLY: block_davidson_deallocate
+    USE qs_cdft_scf_utils,               ONLY: build_diagonal_jacobian,&
+@@ -364,7 +366,7 @@ CONTAINS
+                                                             scf_energy_message_tag, total_steps
+       LOGICAL :: density_full_step, diis_step, do_kpoints, energy_only, exit_inner_loop, &
+          exit_outer_loop, inner_loop_converged, internal_tblite_density_full_step, &
+-         internal_tblite_mixer, just_energy, outer_loop_converged, tblite_native_mixer
++         internal_tblite_mixer, just_energy, lazy_window, outer_loop_converged, tblite_native_mixer
+       REAL(KIND=dp)                                      :: t1, t2
+       REAL(KIND=dp), DIMENSION(3)                        :: res_val_3
+       TYPE(atomic_kind_type), DIMENSION(:), POINTER      :: atomic_kind_set
+@@ -483,6 +485,35 @@ CONTAINS
+       ext_master_id = NINT(res_val_3(2))
+       scf_energy_message_tag = NINT(res_val_3(3))
+ 
++      ! Device-resident PW results may skip their host copies between a result and its device
++      ! consumer only in setups without other host readers in the SCF loop (OT without density
++      ! mixing, closed shell GPW without ADMM, GAPW, external or embedding potentials, ...).
++      ! Closing the window at the end of the SCF writes every live result to its host array.
++      lazy_window = scf_env%method == ot_method_nr .AND. scf_env%mixing_method < gspace_mixing_nr .AND. &
++                    dft_control%nspins == 1 .AND. .NOT. do_kpoints .AND. &
++                    dft_control%sic_method_id == sic_none .AND. &
++                    .NOT. (dft_control%qs_control%gapw .OR. dft_control%qs_control%gapw_xc .OR. &
++                           dft_control%qs_control%lrigpw .OR. dft_control%qs_control%rigpw .OR. &
++                           dft_control%qs_control%semi_empirical .OR. dft_control%qs_control%dftb .OR. &
++                           dft_control%qs_control%xtb .OR. dft_control%qs_control%do_ls_scf .OR. &
++                           dft_control%qs_control%cdft .OR. dft_control%qs_control%ddapc_restraint .OR. &
++                           dft_control%qs_control%ddapc_explicit_potential .OR. &
++                           dft_control%qs_control%mulliken_restraint .OR. dft_control%qs_control%s2_restraint .OR. &
++                           dft_control%qs_control%do_kg) .AND. &
++                    .NOT. (dft_control%do_admm .OR. dft_control%use_kinetic_energy_density .OR. &
++                           dft_control%do_sccs .OR. dft_control%apply_external_potential .OR. &
++                           dft_control%apply_external_density .OR. dft_control%apply_external_vxc .OR. &
++                           dft_control%apply_embed_pot .OR. dft_control%apply_dmfet_pot .OR. &
++                           dft_control%apply_efield .OR. dft_control%apply_efield_field .OR. &
++                           dft_control%apply_vector_potential .OR. dft_control%apply_period_efield .OR. &
++                           dft_control%correct_surf_dip .OR. dft_control%correct_el_density_dip .OR. &
++                           dft_control%hairy_probes .OR. dft_control%do_paep .OR. dft_control%do_pcc .OR. &
++                           dft_control%use_gauxc .OR. dft_control%do_xas_calculation .OR. &
++                           dft_control%do_xas_tdp_calculation) .AND. &
++                    .NOT. (qs_env%qmmm .OR. qs_env%mimic .OR. qs_env%energy_correction .OR. &
++                           scf_control%gce%do_gce)
++      CALL pw_gpu_res_set_lazy(lazy_window)
++
+       ! *** outer loop of the scf, can treat other variables,
+       ! *** such as lagrangian multipliers
+       scf_env%outer_scf%iter_count = 0
+@@ -654,8 +685,12 @@ CONTAINS
+                END DO
+             END IF
+ 
++            ! Only this density of the iteration may stay on the device: its consumer is the
++            ! next Kohn-Sham build. The final density (qs_scf_inner_finalize) is written to the host.
++            CALL pw_gpu_res_defer_density(lazy_window)
+             CALL qs_scf_rho_update(rho, qs_env, scf_env, ks_env, &
+                                    mix_rho=scf_env%mixing_method >= gspace_mixing_nr)
++            CALL pw_gpu_res_defer_density(.FALSE.)
+ 
+             CALL timestop(handle2)
+ 
+@@ -688,6 +723,8 @@ CONTAINS
+ 
+       END DO scf_outer_loop
+ 
++      CALL pw_gpu_res_set_lazy(.FALSE.)
++
+       converged = inner_loop_converged .AND. outer_loop_converged
+       total_scf_steps = total_steps
+ 
+diff --git a/src/qs_vxc.F b/src/qs_vxc.F
+index 924ff30..93a159b 100644
+--- a/src/qs_vxc.F
++++ b/src/qs_vxc.F
+@@ -31,6 +31,7 @@ MODULE qs_vxc
+    USE particle_types,                  ONLY: particle_type
+    USE pw_env_types,                    ONLY: pw_env_get,&
+                                               pw_env_type
++   USE pw_gpu,                          ONLY: pw_gpu_res_ensure_host
+    USE pw_grids,                        ONLY: pw_grid_compare
+    USE pw_methods,                      ONLY: pw_axpy,&
+                                               pw_copy,&
+@@ -331,6 +332,14 @@ CONTAINS
+          ! here the rho_r, rho_g, tau is what it should be
+          ! we get back the right my_vxc_rho and my_vxc_tau as required
+          !
++         ! Only the fused GPU XC path (in xc_vxc_pw_create) reads a device-resident density
++         ! directly; these paths and the nonlocal vdW term below read the host arrays.
++         IF (native_skala_grid .OR. my_just_energy .OR. vdW_nl) THEN
++            DO ispin = 1, SIZE(rho_r)
++               CALL pw_gpu_res_ensure_host(rho_r(ispin))
++               IF (ASSOCIATED(rho_g)) CALL pw_gpu_res_ensure_host(rho_g(ispin))
++            END DO
++         END IF
+          IF (native_skala_grid) THEN
+             CALL skala_gpw_eval(vxc_rho=my_vxc_rho, vxc_tau=my_vxc_tau, exc=exc, &
+                                 rho_r=rho_r, rho_g=rho_g, tau=tau, xc_section=xc_section, &
+diff --git a/src/xc/xc.F b/src/xc/xc.F
+index 0509ac7..c669623 100644
+--- a/src/xc/xc.F
++++ b/src/xc/xc.F
+@@ -37,6 +37,7 @@ MODULE xc
+    USE mathconstants, ONLY: pi
+    USE pw_gpu, ONLY: pw_gpu_filter_r3d, &
+                      pw_gpu_fused_xc_available, &
++                     pw_gpu_res_ensure_host, &
+                      pw_gpu_xc_full_pipeline, pw_gpu_xc_full_pipeline_available
+    USE pw_grid_types, ONLY: PW_MODE_DISTRIBUTED, &
+                             pw_grid_type
+@@ -558,6 +559,12 @@ CONTAINS
+       bo = rho_r(1)%pw_grid%bounds_local
+       npoints = (bo(2, 1) - bo(1, 1) + 1)*(bo(2, 2) - bo(1, 2) + 1)*(bo(2, 3) - bo(1, 3) + 1)
+ 
++      ! The host path reads the arrays directly: materialize device-resident densities.
++      DO ispin = 1, nspins
++         CALL pw_gpu_res_ensure_host(rho_r(ispin))
++         IF (ASSOCIATED(rho_g)) CALL pw_gpu_res_ensure_host(rho_g(ispin))
++      END DO
++
+       ! calculate the potential derivatives
+       CALL xc_rho_set_and_dset_create(rho_set=rho_set, deriv_set=deriv_set, &
+                                       deriv_order=1, rho_r=rho_r, rho_g=rho_g, tau=tau, &
+diff --git a/tests/pw_gpu_residency/fortran_tests.py b/tests/pw_gpu_residency/fortran_tests.py
+index 1503c69..083bfc9 100644
+--- a/tests/pw_gpu_residency/fortran_tests.py
++++ b/tests/pw_gpu_residency/fortran_tests.py
+@@ -17,7 +17,8 @@ def run_fortran_tests(build, cc, flags, include, blas, env):
+     wrapper = (ROOT / "src/pw/pw_gpu.F").read_text()
+     functions = ("pw_gpu_res_enabled", "pw_gpu_res_integrate_r", "res_grid_ok", "res_rs_ok",
+                  "pw_gpu_res_vtot_prepare", "pw_gpu_res_vtot_skip_host")
+-    subroutines = ("pw_gpu_res_ensure_host_ptr", "pw_gpu_res_ensure_host_r", "pw_gpu_res_ensure_host_g")
++    subroutines = ("pw_gpu_res_ensure_host_ptr", "pw_gpu_res_ensure_host_r", "pw_gpu_res_ensure_host_g",
++                   "pw_gpu_res_set_lazy", "pw_gpu_res_defer_density", "pw_gpu_res_discard")
+     bindings = "\n".join(routine(wrapper, n, True) for n in functions)
+     bindings += "\n".join(routine(wrapper, n) for n in subroutines)
+     (build / "res_bindings.inc").write_text(bindings)
+diff --git a/tests/pw_gpu_residency/run_tests.py b/tests/pw_gpu_residency/run_tests.py
+index 46bc12a..ef611f7 100644
+--- a/tests/pw_gpu_residency/run_tests.py
++++ b/tests/pw_gpu_residency/run_tests.py
+@@ -84,7 +84,11 @@ def main():
+             n += 1
+         print(f"PASS {n} Hermes C mock cases")
+         cases = [(name, {"CP2K_PW_GPU_RES_LAZY_DENSITY": "0"}) for name in RES_CASES]
+-        cases += [(name, {}) for name in ("lazy_density", "integrate", "chain", "lazy_vtot", "borrowed")]
++        # Hermes's lazy cases cover the lazy density alone; the stage 3a cases the window,
++        # the density token and the lazy Vxc/V_H.
++        cases += [(name, {"CP2K_PW_GPU_RES_LAZY_POT": "0"})
++                  for name in ("lazy_density", "integrate", "chain", "lazy_vtot", "borrowed")]
++        cases += [(name, {}) for name in ("lazy_grant", "lazy_pot")]
+         for name, overrides in cases:
+             for threads in ("1", "3"):
+                 r = subprocess.run([str(exes["test_res"]), name],
+@@ -92,7 +96,9 @@ def main():
+                                    text=True, capture_output=True, timeout=120)
+                 assert r.returncode == 0 and r.stdout.strip() == "PASS", (name, r.stdout, r.stderr)
+                 assert "AddressSanitizer" not in r.stderr and "runtime error:" not in r.stderr, r.stderr
+-            print(f"PASS residency {name} ({'eager' if overrides else 'lazy'}, OMP=1/3)")
++            mode = "eager" if "CP2K_PW_GPU_RES_LAZY_DENSITY" in overrides else \
++                "lazy density" if overrides else "lazy window"
++            print(f"PASS residency {name} ({mode}, OMP=1/3)")
+         run_fortran_tests(build, cc, flags, inc, blas, env)
+ 
+ 
+diff --git a/tests/pw_gpu_residency/test_res.c b/tests/pw_gpu_residency/test_res.c
+index da371d7..f3ca7c8 100644
+--- a/tests/pw_gpu_residency/test_res.c
++++ b/tests/pw_gpu_residency/test_res.c
+@@ -36,6 +36,8 @@ static void start(const int mb) {
+   pw_gpu_set_memory_limit(mb);
+   mock_limit = max_gpu_memory_bytes;
+   pw_gpu_init();
++  // The lazy cases run inside an SCF window (the Fortran SCF driver opens it).
++  if (opt_res_lazy_density) pw_gpu_res_set_lazy_c(1);
+   mock_reset_trace();
+   accounting();
+ }
+@@ -137,7 +139,7 @@ static void density_reference(double *const *r, double *rho_g, double *rho_r) {
+   pw_gpu_sfffc_cached(rho_g, rho_r, map_[0], dims[0], ng_[0], nmaps_, 1.0, 1);
+ }
+ 
+-static int density_fused(double *const *r, double *rho_g, double *rho_r) {
++static int density_call(double *const *r, double *rho_g, double *rho_r, const int token) {
+   void *rp[NLEV], *mp[NLEV], *gp[NLEV];
+   int npts[3 * NLEV], ids[NLEV], nm[NLEV];
+   double scale[NLEV];
+@@ -146,10 +148,16 @@ static int density_fused(double *const *r, double *rho_g, double *rho_r) {
+     memcpy(npts + 3 * l, dims[l], sizeof(dims[l]));
+     ids[l] = l + 1; nm[l] = nmaps_; scale[l] = 1.0 / nr_[l];
+   }
++  pw_gpu_res_defer_density_c(token);
+   return pw_gpu_res_density_c(NLEV, rp, npts, ng_, nm, ids, mp, gp, scale, dims[0],
+                               ng_[0], nmaps_, 1, map_[0], rho_g, rho_r);
+ }
+ 
++// The SCF iteration density (deferred inside an open window).
++static int density_fused(double *const *r, double *rho_g, double *rho_r) {
++  return density_call(r, rho_g, rho_r, 1);
++}
++
+ // potential_pw2rs, pw_interp, auxbas = level 0
+ static void potential_reference(const double *v, double *const *r, const double *rscale) {
+   double gaux[2 * 64], gl[2 * 64];
+@@ -582,6 +590,244 @@ static void lazy_density(void) {
+   }
+ }
+ 
++// Stage 3a: lazy results exist only inside the window granted by the SCF
++// driver, the density token covers exactly one density, closing the window
++// writes every live result to its host array, and XC drops only the densities
++// it consumed inside the window.
++static size_t density_bytes(void) {
++  return sizeof(double) * (2 * (size_t)ng_[0] + (size_t)nr_[0]);
++}
++
++static void lazy_grant(void) {
++  for (int nmaps = 1; nmaps <= 2; nmaps++) {
++    grids(nmaps);
++    start(0);
++    assert(res_lazy_grant);
++    double *r[NLEV];
++    for (int l = 0; l < NLEV; l++) {
++      r[l] = rarray((size_t)nr_[l]);
++      for (int i = 0; i < nr_[l]; i++) r[l][i] = 0.5 + 0.2 * r[l][i];
++    }
++    double ref_g[128], ref_r[64], g[128], rr[64], g2[128], rr2[64];
++    density_reference(r, ref_g, ref_r);
++    const size_t ng2 = 2 * (size_t)ng_[0], nr = (size_t)nr_[0];
++
++    // Closed window: a token is ignored, the result is written to the host.
++    pw_gpu_res_set_lazy_c(0);
++    pw_gpu_res_defer_density_c(1);
++    assert(!res_density_token);
++    memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
++    mock_reset_trace();
++    assert(density_call(r, g, rr, 1));
++    same(ref_g, g, ng2, "closed window g");
++    same(ref_r, rr, nr, "closed window r");
++    assert(mock_download_bytes == density_bytes());
++    assert(!res[RES_RHO_G].dev_authoritative && !res[RES_RHO_R].dev_authoritative);
++
++    // Open window without a token: still written to the host.
++    pw_gpu_res_set_lazy_c(1);
++    memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
++    assert(density_call(r, g, rr, 0));
++    same(ref_g, g, ng2, "no token g");
++    assert(!res[RES_RHO_R].dev_authoritative);
++
++    // The token defers exactly one density.
++    memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
++    mock_reset_trace();
++    assert(density_call(r, g, rr, 1));
++    assert(!res_density_token);
++    assert(res[RES_RHO_G].dev_authoritative && res[RES_RHO_R].dev_authoritative);
++    for (size_t i = 0; i < ng2; i++) assert(g[i] == 0.0);
++    for (size_t i = 0; i < mock_operation_count; i++) { // fingerprints only
++      if (mock_operations[i].kind == MOCK_DOWNLOAD) assert(mock_operations[i].buffer == res_small_dev);
++    }
++    // The next density (other host arrays, no token) first writes back the
++    // live one whose XC grids it overwrites.
++    mock_reset_trace();
++    pw_gpu_res_defer_density_c(0);
++    assert(density_call(r, g2, rr2, 0));
++    assert(mock_download_bytes == 2 * density_bytes());
++    same(ref_g, g, ng2, "overwritten live g synchronized");
++    same(ref_r, rr, nr, "overwritten live r synchronized");
++    same(ref_g, g2, ng2, "next density g");
++
++    // A rejected attempt consumes the token as well.
++    opt_res_density = false;
++    pw_gpu_res_defer_density_c(1);
++    assert(res_density_token);
++    assert(!density_call(r, g, rr, 1));
++    assert(!res_density_token);
++    opt_res_density = true;
++
++    // Closing the window writes the live density back and keeps it resident.
++    memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
++    assert(density_call(r, g, rr, 1));
++    assert(res[RES_RHO_R].dev_authoritative);
++    mock_reset_trace();
++    pw_gpu_res_set_lazy_c(0);
++    assert(mock_download_bytes == density_bytes());
++    same(ref_g, g, ng2, "window exit g");
++    same(ref_r, rr, nr, "window exit r");
++    assert(res[RES_RHO_G].state == RES_VALID && res[RES_RHO_R].state == RES_VALID);
++    assert(res_lookup(RES_RHO_R, rr, nr, false) != NULL);
++    mock_reset_trace();
++    pw_gpu_res_set_lazy_c(0); // idempotent
++    assert(mock_operation_count == 0);
++
++    // XC drops the densities it consumed only inside the window. Outside of
++    // it, a live density is written back first.
++    double vxc[64], vref[64], exc, eref;
++    assert(xc_call(ref_g, ref_r, vref, &eref)); // closed window: eager reference
++    pw_gpu_res_set_lazy_c(1);
++    memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
++    assert(density_call(r, g, rr, 1));
++    res_lazy_grant = false; // e.g. a window closed without a full write back
++    mock_reset_trace();
++    assert(xc_call(g, rr, vxc, &exc));
++    same(vref, vxc, nr, "xc outside window");
++    same(&eref, &exc, 1, "xc energy outside window");
++    same(ref_g, g, ng2, "consumed g written back outside window");
++    same(ref_r, rr, nr, "consumed r written back outside window");
++    assert(mock_download_bytes == density_bytes() + sizeof(double) * (nr + 1));
++    res_lazy_grant = true;
++    memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
++    assert(density_call(r, g, rr, 1));
++    mock_reset_trace();
++    double sentinel[64];
++    for (size_t i = 0; i < nr; i++) vxc[i] = sentinel[i] = -77.0;
++    assert(xc_call(g, rr, vxc, &exc));
++    same(&eref, &exc, 1, "xc energy inside window");
++    for (size_t i = 0; i < ng2; i++) assert(g[i] == 0.0); // consumed, dead on the host
++    // Inside the window (lazy Vxc) only the energy and two fingerprints return.
++    assert(mock_download_bytes == sizeof(double) * (1 + pw_res_sample_count(nr)));
++    same(sentinel, vxc, nr, "lazy vxc leaves the host array");
++    assert(res[RES_VXC].dev_authoritative && res[RES_VXC].state == RES_VALID);
++    pw_gpu_res_ensure_host_c(-1, vxc + 3);
++    same(vref, vxc, nr, "lazy vxc materialized");
++    pw_gpu_res_set_lazy_c(0);
++    finish();
++    for (int l = 0; l < NLEV; l++) free(r[l]);
++  }
++}
++
++// The SCF chain inside the window: lazy density, V_H and Vxc, the device
++// V_TOT feeding potential_pw2rs, and release of the potential without a
++// download. Every result agrees bit for bit with the original sequence.
++static void lazy_pot(void) {
++  for (int nmaps = 1; nmaps <= 2; nmaps++) {
++    grids(nmaps);
++    const int n = ng_[0], nr = nr_[0];
++    double *r[NLEV];
++    for (int l = 0; l < NLEV; l++) {
++      r[l] = rarray((size_t)nr_[l]);
++      for (int i = 0; i < nr_[l]; i++) r[l][i] = 0.5 + 0.2 * r[l][i];
++    }
++    const double rscale[NLEV] = {1.0, 8.0, 0.5};
++    double ref_g[2 * 64], ref_r[64], ref_vxc[64], ref_exc, ref_tot[2 * 64], ref_vh[64], e_ref;
++    double ref_vtot[64], *ref_pot[NLEV], *pot[NLEV];
++    for (int l = 0; l < NLEV; l++) { ref_pot[l] = rarray((size_t)nr_[l]); pot[l] = rarray((size_t)nr_[l]); }
++    hartree_in h = hartree_inputs();
++    start(0);
++    pw_gpu_res_set_lazy_c(0); // reference: original sequence, host results
++    density_reference(r, ref_g, ref_r);
++    memcpy(h.rho_g, ref_g, sizeof(double) * 2 * (size_t)n);
++    hartree_reference(&h, ref_tot, ref_vh, &e_ref);
++    assert(xc_call(ref_g, ref_r, ref_vxc, &ref_exc));
++    for (int i = 0; i < nr; i++) ref_vtot[i] = ref_vxc[i] * h.dvol;
++    for (int i = 0; i < nr; i++) ref_vtot[i] = ref_vtot[i] + ref_vh[i];
++    potential_reference(ref_vtot, ref_pot, rscale);
++    finish();
++
++    start(0);
++    assert(res_lazy_grant && opt_res_lazy_pot);
++    double *rho_g = calloc(2 * (size_t)n, sizeof(double)), *rho_r = calloc((size_t)nr, sizeof(double));
++    free(h.rho_g);
++    h.rho_g = rho_g;
++    double tot[2 * 64], vh[64], vxc[64], exc, e, sentinel[64];
++    for (int iter = 0; iter < 2; iter++) {
++      for (int i = 0; i < nr; i++) vh[i] = vxc[i] = sentinel[i] = -5.0 - iter;
++      assert(density_fused(r, rho_g, rho_r));
++      mock_reset_trace();
++      assert(hartree_fused(&h, tot, vh, &e, 0));
++      assert(fabs(e - e_ref) <= 1e-14 * fabs(e_ref));
++      same(sentinel, vh, (size_t)nr, "lazy v_h leaves the host array");
++      assert(res[RES_V_H_R].dev_authoritative && res[RES_V_H_R].owned_bytes != 0);
++      for (size_t i = 0; i < mock_operation_count; i++) {
++        if (mock_operations[i].kind == MOCK_DOWNLOAD) assert(mock_operations[i].buffer != res[RES_V_H_R].dev);
++      }
++      assert(xc_call(rho_g, rho_r, vxc, &exc));
++      same(&ref_exc, &exc, 1, "lazy chain exc");
++      same(sentinel, vxc, (size_t)nr, "lazy vxc leaves the host array");
++      // V_TOT from the two device-only results: no upload at all.
++      const size_t up = mock_upload_bytes;
++      assert(pw_gpu_res_vtot_prepare_c(vh, vxc, (size_t)nr, h.dvol));
++      assert(pw_gpu_res_vtot_skip_host_c());
++      assert(mock_upload_bytes == up);
++      assert(potential_fused(vxc, pot, rscale));
++      assert(mock_upload_bytes == up);
++      for (int l = 0; l < NLEV; l++) same(ref_pot[l], pot[l], (size_t)nr_[l], "lazy chain potential");
++      same(sentinel, vxc, (size_t)nr, "potential keeps vtot on the device");
++      // Release of the potential: nothing is downloaded.
++      mock_reset_trace();
++      pw_gpu_res_discard_c(vh + nr); // one past the array: not an owner
++      assert(res[RES_V_H_R].dev_authoritative);
++      pw_gpu_res_discard_c(vxc + 1);
++      assert(mock_operation_count == 0);
++      assert(res[RES_VXC].state == RES_INVALID && !res[RES_VXC].dev_authoritative);
++      same(sentinel, vxc, (size_t)nr, "discard leaves the host array");
++      if (iter == 0) {
++        // A host consumer of V_H gets the device result.
++        pw_gpu_res_ensure_host_c(-1, vh);
++        same(ref_vh, vh, (size_t)nr, "lazy v_h materialized");
++        assert(res[RES_V_H_R].state == RES_VALID && !res[RES_V_H_R].dev_authoritative);
++      }
++    }
++    // A live V_H of another host array is written back before the slot is reused.
++    double vh2[64];
++    assert(res[RES_V_H_R].dev_authoritative && res[RES_V_H_R].host == vh);
++    for (int i = 0; i < nr; i++) vh[i] = vh2[i] = 0.0;
++    assert(density_fused(r, rho_g, rho_r));
++    assert(hartree_fused(&h, tot, vh2, &e, 0));
++    same(ref_vh, vh, (size_t)nr, "other host v_h written back");
++    assert(res[RES_V_H_R].dev_authoritative && res[RES_V_H_R].host == vh2);
++    for (int i = 0; i < nr; i++) vh[i] = 0.0;
++    assert(density_fused(r, rho_g, rho_r));
++    assert(hartree_fused(&h, tot, vh, &e, 0));
++    same(ref_vh, vh2, (size_t)nr, "other host v_h written back (2)");
++    // A live V_H survives eviction of its slot under memory pressure.
++    assert(res[RES_V_H_R].dev_authoritative && res[RES_V_H_R].host == vh);
++    size_t owned = 0;
++    for (int i = RES_V_H_R; i < RES_NSLOTS; i++) owned += res[i].owned_bytes;
++    max_gpu_memory_bytes = mock_limit = current_gpu_allocated_bytes;
++    mock_reset_trace();
++    assert(pw_gpu_ensure_gbuf_c(allocated_gbuf_size + owned));
++    assert(res[RES_V_H_R].owned_bytes == 0 && res[RES_V_H_R].state == RES_INVALID);
++    same(ref_vh, vh, (size_t)nr, "evicted lazy v_h written back");
++    assert(mock_download_bytes == sizeof(double) * (size_t)nr);
++    max_gpu_memory_bytes = mock_limit = 0;
++    // A Vxc that is still live when the next density reuses the XC grids is
++    // written back first (V_TOT semantics: the skipped host AXPY).
++    assert(density_fused(r, rho_g, rho_r));
++    assert(hartree_fused(&h, tot, vh, &e, 0));
++    assert(xc_call(rho_g, rho_r, vxc, &exc));
++    assert(pw_gpu_res_vtot_prepare_c(vh, vxc, (size_t)nr, h.dvol));
++    assert(pw_gpu_res_vtot_skip_host_c());
++    double g2[128], r2[64];
++    assert(density_call(r, g2, r2, 0));
++    same(ref_vtot, vxc, (size_t)nr, "live vtot written back before reuse");
++    // Window exit writes back the remaining live V_H.
++    assert(res[RES_V_H_R].dev_authoritative);
++    for (int i = 0; i < nr; i++) vh[i] = 0.0;
++    pw_gpu_res_set_lazy_c(0);
++    same(ref_vh, vh, (size_t)nr, "window exit v_h");
++    for (int id = 0; id < RES_NSLOTS; id++) assert(!res[id].dev_authoritative);
++    finish();
++    for (int l = 0; l < NLEV; l++) { free(r[l]); free(ref_pot[l]); free(pot[l]); }
++    free(rho_r);
++    hartree_free(&h);
++  }
++}
++
+ // Large resident arrays exercise partial fingerprinting and three reduction
+ // levels without the mock's deliberately slow direct DFT.
+ static void integrate(void) {
+@@ -738,7 +984,7 @@ static void borrowed(void) {
+   memcpy(host_r, rho_r, sizeof(double) * (size_t)nr_[0]);
+   const unsigned long epoch = xc_epoch;
+   mock_reset_trace();
+-  res_invalidate_borrowed();
++  res_retire_borrowed((1u << RES_RHO_G) | (1u << RES_RHO_R)); // consumed by XC
+   assert(xc_epoch != epoch);
+   for (int id = 0; id <= RES_VXC; id++) {
+     assert(res[id].state == RES_INVALID && !res[id].dev_authoritative && !res[id].vtot);
+@@ -815,6 +1061,8 @@ int main(int argc, char **argv) {
+   else if (!strcmp(argv[1], "lazy_density")) lazy_density();
+   else if (!strcmp(argv[1], "integrate")) integrate();
+   else if (!strcmp(argv[1], "lazy_vtot")) lazy_vtot();
++  else if (!strcmp(argv[1], "lazy_grant")) lazy_grant();
++  else if (!strcmp(argv[1], "lazy_pot")) lazy_pot();
+   else assert(!"unknown test");
+   for (int l = 0; l < NLEV; l++) { free(map_[l]); free(gidx_[l]); }
+   free(g_fine); free(gsq_fine);
+diff --git a/tests/pw_gpu_residency/test_res_bindings.F b/tests/pw_gpu_residency/test_res_bindings.F
+index 6d69473..eedc141 100644
+--- a/tests/pw_gpu_residency/test_res_bindings.F
++++ b/tests/pw_gpu_residency/test_res_bindings.F
+@@ -148,6 +148,25 @@ PROGRAM test_res_bindings
+    CALL pw_gpu_res_ensure_host(rho)
+    IF (ANY(rho%array /= 7 + grid%dvol*expected)) ERROR STOP 'vtot host synchronization'
+    CALL res_fixture_end()
++   ! Stage 3a: closing the SCF window writes a live density back.
++   rho%array = expected
++   CALL res_fixture_begin(C_LOC(rho%array), C_LOC(g%array), 12_C_SIZE_T)
++   CALL pw_gpu_res_set_lazy(.TRUE.)
++   CALL pw_gpu_res_defer_density(.TRUE.)
++   CALL pw_gpu_res_defer_density(.FALSE.)
++   CALL pw_gpu_res_discard(copy) ! not resident: no effect
++   CALL pw_gpu_res_set_lazy(.FALSE.)
++   IF (ANY(rho%array /= expected)) ERROR STOP 'window exit synchronization'
++   CALL res_fixture_end()
++   ! Releasing an array drops its device copy without a download.
++   rho%array = expected
++   CALL res_fixture_begin(C_LOC(rho%array), C_LOC(g%array), 12_C_SIZE_T)
++   CALL pw_gpu_res_discard(rho)
++   CALL pw_gpu_res_ensure_host(rho)
++   IF (enabled .AND. ANY(rho%array /= 0)) ERROR STOP 'discard downloaded'
++   IF (.NOT. enabled .AND. ANY(rho%array /= expected)) ERROR STOP 'discard changed host'
++   CALL pw_gpu_res_ensure_host(g)
++   CALL res_fixture_end()
+    DEALLOCATE (grid%gsq, grid%g_hatmap)
+    DEALLOCATE (grid, rho%array, copy%array, vh%array, g%array)
+    PRINT *, 'PASS residency Fortran bindings'

@@ -37,6 +37,7 @@ MODULE xc
    USE mathconstants, ONLY: pi
    USE pw_gpu, ONLY: pw_gpu_filter_r3d, &
                      pw_gpu_fused_xc_available, &
+                     pw_gpu_res_ensure_host, &
                      pw_gpu_xc_full_pipeline, pw_gpu_xc_full_pipeline_available
    USE pw_grid_types, ONLY: PW_MODE_DISTRIBUTED, &
                             pw_grid_type
@@ -557,6 +558,12 @@ CONTAINS
 
       bo = rho_r(1)%pw_grid%bounds_local
       npoints = (bo(2, 1) - bo(1, 1) + 1)*(bo(2, 2) - bo(1, 2) + 1)*(bo(2, 3) - bo(1, 3) + 1)
+
+      ! The host path reads the arrays directly: materialize device-resident densities.
+      DO ispin = 1, nspins
+         CALL pw_gpu_res_ensure_host(rho_r(ispin))
+         IF (ASSOCIATED(rho_g)) CALL pw_gpu_res_ensure_host(rho_g(ispin))
+      END DO
 
       ! calculate the potential derivatives
       CALL xc_rho_set_and_dset_create(rho_set=rho_set, deriv_set=deriv_set, &
