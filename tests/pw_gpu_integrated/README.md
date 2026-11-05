@@ -21,7 +21,9 @@ directory and are removed automatically.
 The tests compile the actual `pw_gpu_internal.c` and production headers, with only
 the offload runtime, FFT library, and kernel launchers mocked. The mock tracks every
 allocation and free, enforces its own allocation ceiling, checks device pointer
-bounds, and rejects freeing memory with pending asynchronous operations. Its FFT is
+bounds, and rejects freeing memory with pending asynchronous operations. Per-stream
+vector clocks model event dependencies and reject unordered accesses across streams,
+even though numerical operations execute immediately on the CPU. Its FFT is
 an independent direct DFT, used to check the production CPU fallback numerically.
 
 Coverage includes:
@@ -36,6 +38,15 @@ Coverage includes:
 - Every public GPU transform, including fused gradient/divergence/filter,
   one/two-map layouts, distributed FFT layouts, aliased outputs, empty grids,
   fallback at each allocation stage, a single notice, and disabled-fallback failure.
+- Dual-stream gradient downloads and divergence uploads, including independent
+  transfer/FFT scheduling, buffer reuse dependencies, repeated event recordings,
+  and completion of both streams at the public boundary. Serial and dual-buffer
+  results are compared byte for byte for one/two-map layouts and aliased divergence
+  outputs. Exact serial/dual budgets and a budget one byte short of dual allocation
+  exercise GPU-only fallback with host fallback enabled and disabled.
+- Optional buffer reuse, growth with pending work on both streams, reclamation
+  before required scratch, active-grid protection and LRU eviction, lowering a
+  live limit, and stream/event/buffer cleanup across reinitialization.
 - Prime and mixed-radix host FFT sizes, no-offload compilation, input keyword and
   C-binding declarations, and the 132-character line limit in the modified Fortran files.
 - `pw_cpu_dot_complex_c` linked to real BLAS: deterministic random vectors of
@@ -86,8 +97,9 @@ inside C regardless of whether the input hook is called. No files outside the
 specified implementation files, necessary GPU header, and this test directory
 are changed.
 
-The accounting covers the two shared work buffers, the legacy map, compact
-G-space scratch, and every cached map and g-vector allocation. Opaque FFT-library
+The accounting covers the two shared work buffers, the optional real/complex
+secondary pair, the legacy map, compact G-space scratch, and every cached map and
+g-vector allocation. Opaque FFT-library
 workspaces and allocations from other CP2K components are outside this budget.
 These mocks do not replace a full CP2K build or CUDA/HIP integration run.
 

@@ -45,10 +45,12 @@ def source_checks() -> None:
 
 
 def cases():
-    for name in ("limits", "eviction", "fallback", "late_fallback", "empty", "fft_sizes", "environment_once"):
+    for name in ("limits", "eviction", "fallback", "late_fallback", "empty", "fft_sizes", "environment_once",
+                 "dual_stream", "dual_buffer_memory"):
         yield name, [name], {}, 0, int(name in ("limits", "fallback", "late_fallback"))
     yield "fallback disabled by setter", ["disabled"], {}, -1, 0
     yield "fallback disabled by environment", ["disabled"], {"CP2K_GPU_HOST_FALLBACK": "FALSE"}, -1, 0
+    yield "dual stream with host fallback disabled", ["dual_stream"], {"CP2K_GPU_HOST_FALLBACK": "FALSE"}, 0, 0
     yield "automatic rank budget enforcement", ["environment_limit"], {
         "OMPI_COMM_WORLD_RANK": "1", "CP2K_GPU_MEM_LIMIT_MB": "3", "CP2K_GPU_MEM_LIMIT_MB_RANK1": "1"}, 0, 1
     # A setting is read exactly once, on either first query or initialization.
