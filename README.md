@@ -29,3 +29,7 @@ bash "$package/scripts/run.sh" --prefix "$HOME/cp2k-mi50-stage6-release-r3" --ch
 具体构建、算例和测试结果按归档摘要记录在同一 Release 的 `VALIDATION.md`。PW residency 与 ELPA mock、真实 MI50 运行、独立打包审查分别报告。独立的旧 `pw_gpu_integrated` 测试入口仍缺两个自然序内核的 mock，链接失败；不能宣称全部 CP2K 测试通过。真实 ELPA 对角化、多 rank、GEO_OPT/MD、UKS 与非正交输入尚未全面验收，累积 Stage 6 物理源码也尚无完整独立审查。
 
 旧 `deliver_stage6_full_20261106.tar.gz` 是增量覆盖包，保留用于追溯，已被上述完整源码包替代。原版 CP2K 及各组件版权和许可证继续适用，详见包内 `LICENSE`、`NOTICE` 与源码文件头。
+
+## ELPA 调用封装优化
+
+Stage 6 r3 已包含 ELPA 对象/setup 复用、GPU/CPU kernel 选择及 QR 状态处理；本次将根目录 mock 测试与 r3 已接受版本对齐，生产代码未变。参见[优化与启用说明](docs/ELPA-OPTIMIZATION.md)和[测试说明](tests/elpa_gpu/README.md)。现有套件通过 32 个 mock 配置及无 ELPA 编译检查；真实 GPU 对角化、多 MPI rank、ELPA 数值准确性与性能仍待验收。

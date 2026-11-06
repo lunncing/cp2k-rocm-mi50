@@ -15,11 +15,34 @@ The tests cover persistent allocation/setup reuse, invalidation for every layout
 and solver input, a simulated remote-rank cache miss, communicator retention and
 release ordering, finalization and reinitialization, GPU backend changes, and QR
 diagnostics followed by another solve. ELPA's abstract base type is modeled to
-check the cache's polymorphic declaration.
+check the cache's polymorphic declaration. Explicit CPU selection must leave all
+GPU flags disabled, including in HIP builds and after AUTO selected a GPU.
+Explicit AMD selection probes both `gpu` and `amd-gpu` before setting the kernel;
+OpenMP threads are set only when that option is supported.
 
-CPU, HIP, CUDA, and OpenCL builds each exercise all eight combinations of generic
-GPU, AMD GPU, and OpenMP option support. The HIP build also enables IEEE exception
-handling. Compilation without ELPA is checked separately.
+The runner compiles the complete production Fortran module with `__ELPA` in four
+build variants. Each runs masks 0–7: bit 0 enables mock `gpu` support, bit 1
+`amd-gpu`, and bit 2 `omp_threads`, covering all eight capability combinations.
 
-These tests validate wrapper behavior; real MPI collectives, ROCm performance,
-GPU numerical results, and ELPA integration require a full CP2K installation.
+| Build variant | Additional preprocessor definitions | Mock runs |
+|---|---|---:|
+| CPU | None | 8 |
+| HIP | `__OFFLOAD_HIP`, `__HAS_IEEE_EXCEPTIONS` | 8 |
+| CUDA | `__OFFLOAD_CUDA` | 8 |
+| OpenCL | `__OFFLOAD_OPENCL` | 8 |
+
+This is **32 mock configurations plus a separate compilation without ELPA**.
+The HIP variant includes the IEEE exception-handling path. The runner does not
+add a separate `__NO_OFFLOAD_ELPA` build.
+
+`test_elpa.F` is a byte-for-byte copy of the accepted
+[Stage 6 r3 test](../../releases/stage6-r3/overrides/source/tests/elpa_gpu/test_elpa.F).
+It aligns the root suite with the wrapper already included in that release;
+the runner, mocks, and production wrapper are unchanged by this synchronization.
+
+These are compile-time backend variants using CPU-hosted mocks, with no real GPU
+or MPI execution. They validate wrapper control flow and returned mock values,
+not ELPA numerical accuracy, GPU runtime correctness, or performance. Real ELPA
+integration, multi-rank collectives, and diagonalization comparisons require a
+full CP2K installation. See the [ELPA optimization guide](../../docs/ELPA-OPTIMIZATION.md)
+for activation and release scope.
