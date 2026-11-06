@@ -138,7 +138,6 @@ static void natural_chain(void) {
     assert(density_fused(r, rg, rr));
     assert(res[RES_RHO_G].natural_g == natural);
     assert(res_verify_full(&res[RES_RHO_G], ref_g));
-    if (natural) no_target_map();
     const unsigned long hits = res[RES_RHO_CORE].hits;
     for (size_t i = 0; i < 2 * n; i++) tot[i] = -987.0;
     mock_reset_trace();
@@ -153,7 +152,6 @@ static void natural_chain(void) {
       assert(mock_natural_mul_n == n && mock_natural_prefix_n == nprefix);
       assert(res[RES_RHO_CORE].owned_bytes == 2 * n * sizeof(double));
       assert(res[RES_INFL].width == (pass == 2 ? 2 : 1));
-      no_target_map();
     }
     if (pass == 1) assert(res[RES_RHO_CORE].hits == hits + 1);
     assert(pw_gpu_res_hartree_modify_c(h.g0_delta, 1, g_fine + 3, gsq_fine + 1,
@@ -165,7 +163,6 @@ static void natural_chain(void) {
     mock_reset_trace();
     assert(pw_gpu_res_hartree_finish_c(vh, dims[0], (int)n, 1, 1, map_[0], h.dvol));
     if (natural) {
-      no_target_map();
       for (size_t i = 0; i < mock_operation_count; i++)
         assert(mock_operations[i].kind != MOCK_SCATTER && mock_operations[i].kind != MOCK_GATHER);
     }
@@ -282,9 +279,9 @@ static void natural_memory(void) {
   device_h.rho_g = rg;
   for (int pass = 0; pass < 3; pass++) {
     assert(density_fused(r, rg, rr));
-    no_target_map();
     const unsigned long hits = res[RES_RHO_CORE].hits;
     assert(hartree_fused(&device_h, tot, vh, &energy, 0));
+    no_target_map(); // evicted as the least recently used entry to fit the core
     assert(res[RES_RHO_CORE].owned_bytes == 2 * n * sizeof(double));
     assert(current_gpu_allocated_bytes == max_gpu_memory_bytes);
     if (pass) assert(res[RES_RHO_CORE].hits == hits + 1);
@@ -335,12 +332,88 @@ static void natural_chunked_sync(void) {
   free(map); free(host); free(box); free(ref);
 }
 
+// One SCF step after warm-up uploads only the real-space density inputs and
+// the small fingerprint/DDAPC data: the target map, its g-vectors and the
+// coarse indices (sorted and natural) stay cached.
+static void natural_traffic(void) {
+  full_grid();
+  start(0);
+  const int n = ng_[0], nr = nr_[0];
+  double *r[NLEV], *pot[NLEV], *ref_pot[NLEV];
+  const double rscale[NLEV] = {1.0, 8.0, 0.5};
+  for (int l = 0; l < NLEV; l++) {
+    r[l] = rarray((size_t)nr_[l]);
+    for (int i = 0; i < nr_[l]; i++) r[l][i] = 0.5 + 0.2 * r[l][i];
+    pot[l] = rarray((size_t)nr_[l]);
+    ref_pot[l] = rarray((size_t)nr_[l]);
+  }
+  double ref_g[128], ref_r[64], ref_vxc[64], ref_exc, ref_tot[128], ref_vh[64], ref_e;
+  density_reference(r, ref_g, ref_r);
+  hartree_in h = hartree_inputs();
+  memcpy(h.rho_g, ref_g, sizeof(double) * 2 * (size_t)n);
+  hartree_reference(&h, ref_tot, ref_vh, &ref_e);
+  assert(xc_call(ref_g, ref_r, ref_vxc, &ref_exc));
+  pw_gpu_res_ensure_host_c(RES_VXC, ref_vxc);
+  double ref_vtot[64];
+  for (int i = 0; i < nr; i++) ref_vtot[i] = ref_vxc[i] * h.dvol + ref_vh[i];
+  potential_reference(ref_vtot, ref_pot, rscale);
+  double *rg = rarray(2 * (size_t)n), *rr = rarray((size_t)nr);
+  free(h.rho_g);
+  h.rho_g = rg;
+  double tot[128], vh[64], vxc[64], exc, e;
+  const bool lazy = opt_res_lazy_density;
+  for (int step = 0; step < 3; step++) {
+    size_t up = mock_upload_bytes;
+    assert(density_fused(r, rg, rr));
+    const size_t up_density = mock_upload_bytes - up;
+    up = mock_upload_bytes;
+    assert(hartree_fused(&h, tot, vh, &e, 0));
+    up = mock_upload_bytes;
+    assert(xc_call(rg, rr, vxc, &exc));
+    const size_t up_xc = mock_upload_bytes - up;
+    assert(pw_gpu_res_vtot_prepare_c(vh, vxc, (size_t)nr, h.dvol));
+    if (lazy) {
+      assert(pw_gpu_res_vtot_skip_host_c());
+      assert(pw_gpu_res_vtot_skip_host_c());
+    } else {
+      for (int i = 0; i < nr; i++) vxc[i] = vxc[i] * h.dvol;
+      for (int i = 0; i < nr; i++) vxc[i] = vxc[i] + vh[i];
+      assert(pw_gpu_res_vtot_commit_c(vxc, (size_t)nr));
+    }
+    up = mock_upload_bytes;
+    assert(potential_fused(vxc, pot, rscale));
+    const size_t up_potential = mock_upload_bytes - up;
+    pw_gpu_res_ensure_host_c(RES_V_H_R, vh);
+    pw_gpu_res_ensure_host_c(RES_VXC, vxc);
+    same(vh, ref_vh, (size_t)nr, "traffic v_h");
+    same(&exc, &ref_exc, 1, "traffic exc");
+    for (int l = 0; l < NLEV; l++) same(pot[l], ref_pot[l], (size_t)nr_[l], "traffic potential");
+    if (step > 0) {
+      size_t inputs = 0;
+      for (int l = 0; l < NLEV; l++) inputs += sizeof(double) * (size_t)nr_[l];
+      // Natural order: fingerprint coordinates (lazy) or the chunked download map.
+      const size_t coords = sizeof(int) * (lazy ? pw_res_sample_count((size_t)n) : (size_t)n);
+      assert(up_xc == 0 && up_potential == 0);
+      if (up_density != inputs + (opt_res_natural_g ? coords : 0))
+        fprintf(stderr, "density uploads %zu, expected %zu\n", up_density,
+                inputs + (opt_res_natural_g ? coords : 0));
+      assert(up_density == inputs + (opt_res_natural_g ? coords : 0));
+    }
+  }
+  pw_gpu_res_set_lazy_c(0);
+  finish();
+  for (int l = 0; l < NLEV; l++) { free(r[l]); free(pot[l]); free(ref_pot[l]); }
+  free(rr);
+  hartree_free(&h);
+}
+
 int main(int argc, char **argv) {
   assert(argc == 2);
   if (!strcmp(argv[1], "chain")) natural_chain();
   else if (!strcmp(argv[1], "lifetime")) natural_lifetime();
   else if (!strcmp(argv[1], "memory")) natural_memory();
   else if (!strcmp(argv[1], "chunked_sync")) natural_chunked_sync();
+  else if (!strcmp(argv[1], "traffic")) natural_traffic();
   else assert(!"unknown natural test");
   for (int l = 0; l < NLEV; l++) { free(map_[l]); free(gidx_[l]); }
   free(g_fine); free(gsq_fine);
@@ -438,6 +511,9 @@ def main():
             ("lifetime", {}),
             ("memory", {}),
             ("chunked_sync", {}),
+            ("traffic", {}),
+            ("traffic", {"CP2K_PW_GPU_RES_LAZY_DENSITY": "0", "CP2K_PW_GPU_RES_LAZY_POT": "0"}),
+            ("traffic", {"CP2K_PW_GPU_RES_NATURAL_G": "0"}),
         ]
         for name, overrides in natural_cases:
             for threads in ("1", "3"):

@@ -549,10 +549,9 @@ CONTAINS
 
          ! Enabling the GPU must happen before setting the kernel. Probe both ROCm flags
          ! because the accepted options depend on the linked ELPA version and build.
+         ! Only the AMD GPU kernel (ELPA_KERNEL AMD_GPU, or AUTO in a HIP build
+         ! without __NO_OFFLOAD_ELPA) enables the device; a CPU kernel stays on the CPU.
          use_amd_gpu = elpa_kernel == ELPA_2STAGE_REAL_AMD_GPU
-#if defined(__OFFLOAD_HIP)
-         use_amd_gpu = .TRUE.
-#endif
          IF (use_amd_gpu) THEN
             IF (elpa_obj%can_set("gpu", 1) == ELPA_OK) THEN
                CALL elpa_obj%set("gpu", 1, success)

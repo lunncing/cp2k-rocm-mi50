@@ -89,7 +89,13 @@ typedef struct {
   const int *gidx_host; // reference-grid index (one-based), multigrid paths
   int *gidx_dev;
   int gidx_bound;       // validated upper bound of the gidx entries
-  const int *gidx_natural_map; // NULL: sorted G, otherwise target FFT box
+  // The same indices translated into the natural FFT box of the target grid
+  // (density_rs2pw), cached beside the sorted ones (potential_pw2rs): both are
+  // used in every SCF step.
+  const int *gidx_natural_map; // target map of gidx_nat_dev, NULL if none
+  const int *gidx_nat_host;
+  int *gidx_nat_dev;
+  int gidx_nat_bound;
   unsigned long last_use;
 } grid_cache_entry;
 
@@ -328,13 +334,15 @@ static void release_double_buffers(void) {
  * \brief Frees the device memory of a grid cache entry and empties the slot.
  ******************************************************************************/
 static void grid_cache_clear_entry(grid_cache_entry *e) {
-  if (e->map_dev != NULL || e->g_dev != NULL || e->gidx_dev != NULL) {
+  if (e->map_dev != NULL || e->g_dev != NULL || e->gidx_dev != NULL ||
+      e->gidx_nat_dev != NULL) {
     // Uploads are asynchronous, including entries reclaimed during preparation.
     offloadStreamSynchronize(stream);
   }
   device_free(e->map_dev, sizeof(int) * (size_t)e->ngpts * (size_t)e->nmaps);
   device_free(e->g_dev, 3 * sizeof(double) * (size_t)e->ngpts);
   device_free(e->gidx_dev, sizeof(int) * (size_t)e->ngpts);
+  device_free(e->gidx_nat_dev, sizeof(int) * (size_t)e->ngpts);
   memset(e, 0, sizeof(grid_cache_entry));
 }
 
@@ -788,10 +796,18 @@ static void res_natural_forget(void) {
       res_invalidate(id);
     }
   }
-  // Coarse-grid reference indices depend on the target's ordering too.
+  // Coarse-grid indices translated into the target's ordering are stale too;
+  // the sorted indices and the maps of the coarse grids remain valid.
   for (int i = 0; i < PW_GPU_GRID_CACHE_SIZE; i++) {
-    if (grid_cache[i].gidx_natural_map != NULL)
-      grid_cache_clear_entry(&grid_cache[i]);
+    grid_cache_entry *g = &grid_cache[i];
+    if (g->gidx_nat_dev != NULL) {
+      offloadStreamSynchronize(stream);
+      device_free(g->gidx_nat_dev, sizeof(int) * (size_t)g->ngpts);
+    }
+    g->gidx_nat_dev = NULL;
+    g->gidx_nat_host = NULL;
+    g->gidx_nat_bound = 0;
+    g->gidx_natural_map = NULL;
   }
   if (res_hartree.natural_g) res_hartree.pending = false;
   memset(&res_natural, 0, sizeof(res_natural));
@@ -1518,25 +1534,33 @@ static const int *grid_cache_get_gidx(grid_cache_entry *e, const int *gidx_host,
   if (e->ngpts <= 0) {
     return NULL;
   }
-  if (e->gidx_dev != NULL && e->gidx_host == gidx_host && e->gidx_bound == bound &&
-      e->gidx_natural_map == natural_map) {
-    return e->gidx_dev;
-  }
-  if (e->gidx_dev != NULL) {
-    offloadStreamSynchronize(stream);
-    device_free(e->gidx_dev, sizeof(int) * (size_t)e->ngpts);
-    e->gidx_dev = NULL;
-  }
-  for (int i = 0; i < e->ngpts; i++) {
-    if (gidx_host[i] < 1 || gidx_host[i] > bound) {
-      return NULL;
-    }
+  const bool nat = natural_map != NULL;
+  int **dev = nat ? &e->gidx_nat_dev : &e->gidx_dev;
+  const int **host = nat ? &e->gidx_nat_host : &e->gidx_host;
+  int *cached_bound = nat ? &e->gidx_nat_bound : &e->gidx_bound;
+  if (*dev != NULL && *host == gidx_host && *cached_bound == bound &&
+      (!nat || e->gidx_natural_map == natural_map)) {
+    return *dev;
   }
   const size_t size = sizeof(int) * (size_t)e->ngpts;
+  if (*dev != NULL) {
+    offloadStreamSynchronize(stream);
+    device_free(*dev, size);
+    *dev = NULL;
+  }
+  int bad = 0;
+#pragma omp parallel for schedule(static) reduction(| : bad) if (e->ngpts >= 65536)
+  for (int i = 0; i < e->ngpts; i++) {
+    bad |= gidx_host[i] < 1 || gidx_host[i] > bound;
+  }
+  if (bad) {
+    return NULL;
+  }
   int *translated = NULL;
-  if (natural_map != NULL) {
+  if (nat) {
     translated = malloc(size);
     if (translated == NULL) return NULL;
+#pragma omp parallel for schedule(static) if (e->ngpts >= 65536)
     for (int i = 0; i < e->ngpts; i++)
       translated[i] = natural_map[gidx_host[i] - 1] + 1;
   }
@@ -1548,17 +1572,17 @@ static const int *grid_cache_get_gidx(grid_cache_entry *e, const int *gidx_host,
     memory_limit_exceeded();
     return NULL;
   }
-  device_malloc((void **)&e->gidx_dev, size);
-  offloadMemcpyAsyncHtoD(e->gidx_dev, translated != NULL ? translated : gidx_host,
+  device_malloc((void **)dev, size);
+  offloadMemcpyAsyncHtoD(*dev, translated != NULL ? translated : gidx_host,
                          size, stream);
   if (translated != NULL) {
     offloadStreamSynchronize(stream);
     free(translated);
   }
-  e->gidx_host = gidx_host;
-  e->gidx_bound = bound;
-  e->gidx_natural_map = natural_map;
-  return e->gidx_dev;
+  *host = gidx_host;
+  *cached_bound = bound;
+  if (nat) e->gidx_natural_map = natural_map;
+  return *dev;
 }
 
 /*******************************************************************************
@@ -1926,11 +1950,10 @@ static bool res_natural_prepare(const int grid_id, const int *map,
     res_natural.n = n;
     memcpy(res_natural.npts, npts, sizeof(res_natural.npts));
   }
-  // Drop an old sorted-G map and its derivative vectors before reserving
-  // scratch or optional RHO_CORE/INFL. The coarse-grid maps remain useful.
-  for (int i = 0; i < PW_GPU_GRID_CACHE_SIZE; i++) {
-    if (grid_cache[i].grid_id == grid_id) grid_cache_clear_entry(&grid_cache[i]);
-  }
+  // The sorted map and g-vectors of the target grid stay cached: XC and
+  // potential_pw2rs need them in every SCF step (1.86 GB at 500 Ry would be
+  // uploaded again each step). Under memory pressure res_ensure_owned and
+  // check_and_reclaim_memory still evict them as the least recently used entry.
   const size_t count = n < PW_GPU_RES_NATURAL_CHUNK ? n : PW_GPU_RES_NATURAL_CHUNK;
   if (count > res_natural_capacity) {
     const size_t unit = 2 * sizeof(double) + sizeof(int);
