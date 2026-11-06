@@ -1842,14 +1842,15 @@ CONTAINS
 !> \param v_rspace ...
 !> \param mgrid_rspace ...
 !> \param aux the auxiliary (finest) level
-!> \param aux_dev Optional borrowed output, consumed by Grid before another PW operation.
+!> \param rs_dev Optional device memory of the real-space multigrids, one entry per level
+!>        (C_NULL_PTR: write mgrid_rspace). Levels with an entry are written there instead.
 !> \return ...
 ! **************************************************************************************************
-   FUNCTION pw_gpu_res_potential(v_rspace, mgrid_rspace, aux, aux_dev) RESULT(done)
+   FUNCTION pw_gpu_res_potential(v_rspace, mgrid_rspace, aux, rs_dev) RESULT(done)
       TYPE(pw_r3d_rs_type), INTENT(IN)                   :: v_rspace
       TYPE(pw_r3d_rs_type), DIMENSION(:), INTENT(INOUT)  :: mgrid_rspace
       INTEGER, INTENT(IN)                                :: aux
-      TYPE(C_PTR), INTENT(OUT), OPTIONAL                 :: aux_dev
+      TYPE(C_PTR), DIMENSION(:), INTENT(IN), OPTIONAL    :: rs_dev
       LOGICAL                                            :: done
 
 #if defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
@@ -1859,13 +1860,11 @@ CONTAINS
       INTEGER(KIND=C_INT), DIMENSION(3*max_levels)       :: npts
       INTEGER(KIND=C_INT), DIMENSION(max_levels)         :: grid_id, ngpts, nmaps
       REAL(KIND=C_DOUBLE), DIMENSION(max_levels)         :: rscale
-      TYPE(C_PTR), DIMENSION(max_levels)                 :: gidx, maps, r_host
-      TYPE(C_PTR), TARGET                               :: device
-      TYPE(C_PTR)                                       :: device_out
+      TYPE(C_PTR), DIMENSION(max_levels)                 :: gidx, maps, r_dev, r_host
       TYPE(pw_grid_type), POINTER                        :: aux_grid, grid
       INTERFACE
          FUNCTION pw_gpu_res_potential_c(v_host, nlevels, r_host, npts, ngpts, nmaps, grid_id, maps, &
-                                         gidx, rscale, aux, fwd_scale, aux_dev) &
+                                         gidx, rscale, aux, fwd_scale, r_dev) &
             BIND(C, name="pw_gpu_res_potential_c") RESULT(res)
             IMPORT :: C_PTR, C_INT, C_DOUBLE
             TYPE(C_PTR), VALUE                           :: v_host
@@ -1876,20 +1875,19 @@ CONTAINS
             REAL(KIND=C_DOUBLE), DIMENSION(*), INTENT(IN) :: rscale
             INTEGER(KIND=C_INT), VALUE                   :: aux
             REAL(KIND=C_DOUBLE), VALUE                   :: fwd_scale
-            TYPE(C_PTR), VALUE                           :: aux_dev
+            TYPE(C_PTR), DIMENSION(*), INTENT(IN)        :: r_dev
             INTEGER(KIND=C_INT)                          :: res
          END FUNCTION pw_gpu_res_potential_c
       END INTERFACE
 
       done = .FALSE.
-      device = C_NULL_PTR
-      device_out = C_NULL_PTR
-      IF (PRESENT(aux_dev)) THEN
-         aux_dev = C_NULL_PTR
-         device_out = C_LOC(device)
-      END IF
       nlevels = SIZE(mgrid_rspace)
       IF (nlevels < 1 .OR. nlevels > max_levels .OR. aux < 1 .OR. aux > nlevels) RETURN
+      r_dev = C_NULL_PTR
+      IF (PRESENT(rs_dev)) THEN
+         IF (SIZE(rs_dev) /= nlevels) RETURN
+         r_dev(1:nlevels) = rs_dev
+      END IF
       IF (.NOT. pw_gpu_res_enabled(pw_gpu_res_pot_id)) RETURN
       aux_grid => mgrid_rspace(aux)%pw_grid
       IF (.NOT. res_grid_ok(aux_grid)) RETURN
@@ -1919,13 +1917,12 @@ CONTAINS
       END DO
       done = pw_gpu_res_potential_c(C_LOC(v_rspace%array), INT(nlevels, C_INT), r_host, npts, ngpts, &
                                     nmaps, grid_id, maps, gidx, rscale, INT(aux - 1, C_INT), &
-                                    1.0_dp/REAL(v_rspace%pw_grid%ngpts, KIND=dp), device_out) /= 0_C_INT
-      IF (PRESENT(aux_dev)) aux_dev = device
+                                    1.0_dp/REAL(v_rspace%pw_grid%ngpts, KIND=dp), r_dev) /= 0_C_INT
 #else
       MARK_USED(v_rspace)
       MARK_USED(mgrid_rspace)
       MARK_USED(aux)
-      IF (PRESENT(aux_dev)) aux_dev = C_NULL_PTR
+      MARK_USED(rs_dev)
       done = .FALSE.
 #endif
    END FUNCTION pw_gpu_res_potential

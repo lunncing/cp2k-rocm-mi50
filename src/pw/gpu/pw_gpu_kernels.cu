@@ -472,6 +472,180 @@ void pw_gpu_launch_res_natural_extract_prefix(const double *src,
       src, prefix_out, coords, nprefix);
 }
 
+/*******************************************************************************
+ * \brief Natural FFT order of XC (stage 4), see pw_gpu_res_ops.h. Maps are the
+ *        ZERO-based g_hatmap.
+ ******************************************************************************/
+__global__ void pw_gpu_nat_deriv_kernel(double *c, const double *z,
+    const double *gt, int mode, size_t n0, size_t n1, int idir, double scale,
+    size_t n) {
+  for (size_t p = (size_t)blockIdx.x * blockDim.x + threadIdx.x; p < n;
+       p += (size_t)blockDim.x * gridDim.x)
+    pw_nat_deriv_elem(c, z, pw_nat_gd(gt, mode, n0, n1, p, idir), scale, p);
+}
+
+__global__ void pw_gpu_nat_deriv_acc_kernel(double *acc, const double *c,
+    const double *gt, int mode, size_t n0, size_t n1, int idir, double scale,
+    size_t n) {
+  for (size_t p = (size_t)blockIdx.x * blockDim.x + threadIdx.x; p < n;
+       p += (size_t)blockDim.x * gridDim.x)
+    pw_nat_deriv_acc_elem(acc, c, pw_nat_gd(gt, mode, n0, n1, p, idir), scale, p);
+}
+
+// Concurrent writes of one table entry store the same value if the g vectors
+// are separable; pw_gpu_gtab_check_kernel decides whether they are.
+__global__ void pw_gpu_gtab_build_kernel(double *gt, const double *g,
+    const int *map, size_t n0, size_t n1, size_t n) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x) {
+    const size_t p = (size_t)map[i], r = p / n0;
+    gt[p % n0] = g[3 * i];
+    gt[n0 + r % n1] = g[3 * i + 1];
+    gt[n0 + n1 + r / n1] = g[3 * i + 2];
+  }
+}
+
+__global__ void pw_gpu_gtab_check_kernel(double *flags, const double *g,
+    const int *map, const double *gt, size_t n0, size_t n1, size_t n) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x) {
+    const size_t p = (size_t)map[i];
+    int bad = 0;
+    for (int d = 0; d < 3; d++)
+      bad |= pw_res_bits_differ(g[3 * i + d], pw_nat_gd(gt, 1, n0, n1, p, d));
+    flags[i] = bad ? 1.0 : 0.0;
+  }
+}
+
+__global__ void pw_gpu_gtab_full_kernel(double *gt, const double *g,
+    const int *map, size_t n) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x) {
+    const size_t p = (size_t)map[i];
+    gt[3 * p] = g[3 * i];
+    gt[3 * p + 1] = g[3 * i + 1];
+    gt[3 * p + 2] = g[3 * i + 2];
+  }
+}
+
+void pw_gpu_launch_nat_deriv(double *c, const double *z, const double *gt,
+    int mode, size_t n0, size_t n1, int idir, double scale, size_t n,
+    offloadStream_t s) {
+  if (n) pw_gpu_nat_deriv_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      c, z, gt, mode, n0, n1, idir, scale, n);
+}
+
+void pw_gpu_launch_nat_deriv_acc(double *acc, const double *c, const double *gt,
+    int mode, size_t n0, size_t n1, int idir, double scale, size_t n,
+    offloadStream_t s) {
+  if (n) pw_gpu_nat_deriv_acc_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      acc, c, gt, mode, n0, n1, idir, scale, n);
+}
+
+void pw_gpu_launch_gtab_build(double *gt, const double *g, const int *map,
+    size_t n0, size_t n1, size_t n, offloadStream_t s) {
+  if (n) pw_gpu_gtab_build_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      gt, g, map, n0, n1, n);
+}
+
+void pw_gpu_launch_gtab_check(double *flags, const double *g, const int *map,
+    const double *gt, size_t n0, size_t n1, size_t n, offloadStream_t s) {
+  if (n) pw_gpu_gtab_check_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      flags, g, map, gt, n0, n1, n);
+}
+
+void pw_gpu_launch_gtab_full(double *gt, const double *g, const int *map,
+    size_t n, offloadStream_t s) {
+  if (n) pw_gpu_gtab_full_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      gt, g, map, n);
+}
+
+/*******************************************************************************
+ * \brief Stage 5: two real fields per FFT in the natural XC, see
+ *        pw_gpu_res_ops.h, and the fused Hartree begin.
+ ******************************************************************************/
+__global__ void pw_gpu_nat_grad2_kernel(double *z, const double *rho, const double *gt,
+    int mode, size_t n0, size_t n1, size_t n2, int a, int b, size_t n) {
+  for (size_t p = (size_t)blockIdx.x * blockDim.x + threadIdx.x; p < n;
+       p += (size_t)blockDim.x * gridDim.x)
+    pw_nat_grad2_elem(z, rho, gt, mode, n0, n1, n2, a, b, p);
+}
+
+__global__ void pw_gpu_nat_div2_kernel(double *acc, const double *w, const double *gt,
+    int mode, size_t n0, size_t n1, size_t n2, int a, int b, double scale,
+    int accumulate, size_t n) {
+  for (size_t p = (size_t)blockIdx.x * blockDim.x + threadIdx.x; p < n;
+       p += (size_t)blockDim.x * gridDim.x)
+    pw_nat_div2_elem(acc, w, gt, mode, n0, n1, n2, a, b, scale, accumulate, p);
+}
+
+__global__ void pw_gpu_pack2_kernel(const double *x, const double *y, double *c,
+    size_t n) {
+  for (size_t p = (size_t)blockIdx.x * blockDim.x + threadIdx.x; p < n;
+       p += (size_t)blockDim.x * gridDim.x) {
+    c[2 * p] = x[p];
+    c[2 * p + 1] = y[p];
+  }
+}
+
+__global__ void pw_gpu_unpack2_kernel(const double *c, double *x, double *y,
+    size_t n) {
+  for (size_t p = (size_t)blockIdx.x * blockDim.x + threadIdx.x; p < n;
+       p += (size_t)blockDim.x * gridDim.x) {
+    x[p] = c[2 * p];
+    y[p] = c[2 * p + 1];
+  }
+}
+
+__global__ void pw_gpu_res_tot_cmul_kernel(double *rho_tot, double *out,
+    const double *core, const double *rg, const double *w, int width, size_t n) {
+  for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (size_t)blockDim.x * gridDim.x)
+    pw_res_tot_cmul_elem(rho_tot, out, core, rg, w, width, i);
+}
+
+__global__ void pw_gpu_nat_rho_dz_kernel(double *z, const double *rho, const double *gt,
+    int mode, size_t n0, size_t n1, size_t n2, size_t n) {
+  for (size_t p = (size_t)blockIdx.x * blockDim.x + threadIdx.x; p < n;
+       p += (size_t)blockDim.x * gridDim.x)
+    pw_nat_rho_dz_elem(z, rho, gt, mode, n0, n1, n2, p);
+}
+
+void pw_gpu_launch_nat_rho_dz(double *z, const double *rho, const double *gt, int mode,
+    size_t n0, size_t n1, size_t n2, size_t n, offloadStream_t s) {
+  if (n) pw_gpu_nat_rho_dz_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      z, rho, gt, mode, n0, n1, n2, n);
+}
+
+void pw_gpu_launch_nat_grad2(double *z, const double *rho, const double *gt, int mode,
+    size_t n0, size_t n1, size_t n2, int a, int b, size_t n, offloadStream_t s) {
+  if (n) pw_gpu_nat_grad2_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      z, rho, gt, mode, n0, n1, n2, a, b, n);
+}
+
+void pw_gpu_launch_nat_div2(double *acc, const double *w, const double *gt, int mode,
+    size_t n0, size_t n1, size_t n2, int a, int b, double scale, int accumulate,
+    size_t n, offloadStream_t s) {
+  if (n) pw_gpu_nat_div2_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      acc, w, gt, mode, n0, n1, n2, a, b, scale, accumulate, n);
+}
+
+void pw_gpu_launch_pack2(const double *x, const double *y, double *c, size_t n,
+    offloadStream_t s) {
+  if (n) pw_gpu_pack2_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(x, y, c, n);
+}
+
+void pw_gpu_launch_unpack2(const double *c, double *x, double *y, size_t n,
+    offloadStream_t s) {
+  if (n) pw_gpu_unpack2_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(c, x, y, n);
+}
+
+void pw_gpu_launch_res_tot_cmul(double *rho_tot, double *out, const double *core,
+    const double *rg, const double *w, int width, size_t n, offloadStream_t s) {
+  if (n) pw_gpu_res_tot_cmul_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
+      rho_tot, out, core, rg, w, width, n);
+}
+
 #endif // defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
 
 // EOF

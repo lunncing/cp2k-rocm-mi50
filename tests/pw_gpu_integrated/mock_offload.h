@@ -15,6 +15,9 @@ extern size_t mock_upload_bytes, mock_download_bytes;
 extern int mock_fft_calls, mock_uploads, mock_live_plans;
 extern int mock_live_streams, mock_live_events, mock_event_records, mock_event_waits;
 extern int mock_grid_calls, mock_hartree_calls, mock_pbe_calls;
+extern size_t mock_nat_deriv_n, mock_nat_deriv_acc_n; // stage 4 natural XC kernels
+extern size_t mock_nat_grad2_n, mock_nat_div2_n, mock_tot_cmul_n; // stage 5
+extern size_t mock_rho_dz_n; // stage 6
 
 enum mock_operation_kind {
   MOCK_UPLOAD, MOCK_DOWNLOAD, MOCK_MEMSET, MOCK_FFT, MOCK_REAL_TO_COMPLEX,
@@ -41,6 +44,7 @@ void offloadFree(void *ptr);
 void offloadStreamCreate(offloadStream_t *stream);
 void offloadStreamDestroy(offloadStream_t stream);
 void offloadStreamSynchronize(offloadStream_t stream);
+void offloadDeviceSynchronize(void);
 void offloadEventCreate(offloadEvent_t *event);
 void offloadEventDestroy(offloadEvent_t event);
 void offloadEventRecord(offloadEvent_t event, offloadStream_t stream);

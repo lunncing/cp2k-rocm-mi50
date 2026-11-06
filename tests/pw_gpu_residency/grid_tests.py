@@ -75,7 +75,8 @@ static inline void offload_mempool_device_free(void *p) {
         "\n".join(routine(wrapper, n) for n in ("rs_pw_grid_prepare", "density_rs2pw", "potential_pw2rs")))
     wrapper = (ROOT / "src/offload/offload_api.F").read_text()
     (build / "grid_offload_bindings.inc").write_text(
-        "\n".join(routine(wrapper, n, True) for n in ("offload_grid_device", "offload_grid_bind")) +
+        "\n".join(routine(wrapper, n, True) for n in ("offload_grid_device", "offload_grid_bind",
+                                                     "offload_get_buffer_device_pointer")) +
         "\n".join(routine(wrapper, n) for n in ("offload_create_buffer", "offload_free_buffer",
                                                "offload_grid_prepare", "offload_grid_host")))
     fc = shlex.split(os.environ.get("FC", "gfortran"))

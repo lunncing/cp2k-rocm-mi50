@@ -18,7 +18,7 @@ static int density_device(double *const *host, void *const *device, double *rg, 
                              ng_[0], nmaps_, 1, map_[0], rg, rr, device);
 }
 
-static int potential_device(const double *v, double *const *host, void **device) {
+static int potential_device(const double *v, double *const *host, void *const *device) {
   void *mp[NLEV], *gp[NLEV], *hp[NLEV];
   int npts[3 * NLEV], ids[NLEV], nm[NLEV];
   const double scale[NLEV] = {1.0, 8.0, 0.5};
@@ -92,37 +92,71 @@ int main(void) {
   potential_reference(expected, ref, scales);
   assert(pw_gpu_res_vtot_prepare_c(vh, vxc, (size_t)nr_[0], 0.125));
   assert(pw_gpu_res_vtot_skip_host_c());
-  void *alias = NULL;
-  for (int i = 0; i < nr_[0]; i++) out[0][i] = -999;
+  // Stage 4: every level is written into the device memory of its own
+  // real-space grid (owned, not a borrowed PW alias); nothing is downloaded.
+  double *owned[NLEV];
+  void *dst[NLEV];
+  for (int l = 0; l < NLEV; l++) {
+    owned[l] = buffers[l]->device_buffer;
+    dst[l] = owned[l];
+    for (int i = 0; i < nr_[l]; i++) out[l][i] = -999;
+  }
   mock_reset_trace();
-  assert(potential_device(vxc, out, &alias));
-  assert(alias == res[RES_VXC].dev);
+  const unsigned long direct = res_stats.grid_direct;
+  assert(potential_device(vxc, out, dst));
+  assert(mock_download_bytes == 0 && mock_upload_bytes == 0);
+  assert(res_stats.grid_direct == direct + NLEV);
+  assert(res[RES_VXC].dev_authoritative); // the host Vtot is still deferred
+  for (int l = 0; l < NLEV; l++) {
+    for (int i = 0; i < nr_[l]; i++) assert(out[l][i] == -999);
+    assert(offload_grid_bind(buffers[l], owned[l], sizeof(double) * (size_t)nr_[l]));
+    assert(buffers[l]->device_buffer == owned[l]);
+    assert(offload_grid_device(buffers[l], sizeof(double) * (size_t)nr_[l]) == owned[l]);
+    // CPU/validation fallback materializes the device grid.
+    offload_grid_host(buffers[l]);
+    assert(!offload_grid_device(buffers[l], buffers[l]->size));
+  }
+  same(host[0], expected, (size_t)nr_[0], "device potential aux");
+  same(host[1], ref[1], (size_t)nr_[1], "device potential 1");
+  same(host[2], ref[2], (size_t)nr_[2], "device potential 2");
+  assert(!offload_grid_bind(buffers[0], owned[0], buffers[0]->size + 1));
+  // Mixed: only the auxiliary level on the device, the coarse levels on the host.
+  void *aux_only[NLEV] = {owned[0], NULL, NULL};
+  for (int i = 0; i < nr_[0]; i++) host[0][i] = -5;
+  offloadMemcpyAsyncHtoD(owned[0], host[0], buffers[0]->size, stream);
+  offloadStreamSynchronize(stream);
+  mock_reset_trace();
+  assert(potential_device(vxc, out, aux_only));
   assert(mock_download_bytes == sizeof(double) * (size_t)(nr_[1] + nr_[2]));
   for (int i = 0; i < nr_[0]; i++) assert(out[0][i] == -999);
   same(out[1], ref[1], (size_t)nr_[1], "coarse potential 1");
   same(out[2], ref[2], (size_t)nr_[2], "coarse potential 2");
-  double *owned = buffers[0]->device_buffer;
-  assert(offload_grid_bind(buffers[0], alias, (size_t)nr_[0] * sizeof(double)));
-  assert(buffers[0]->device_buffer == owned);
-  assert(offload_grid_device(buffers[0], buffers[0]->size) == alias);
-  assert(!offload_grid_bind(buffers[0], alias, buffers[0]->size + 1));
-  // CPU/validation fallback materializes the alias, never the stale owned grid.
+  assert(offload_grid_bind(buffers[0], owned[0], buffers[0]->size));
   offload_grid_host(buffers[0]);
-  same(host[0], expected, (size_t)nr_[0], "borrowed potential fallback");
-  assert(!offload_grid_device(buffers[0], buffers[0]->size));
-  // Consuming/freeing a borrowed descriptor must not free PW's allocation.
-  assert(offload_grid_bind(buffers[0], alias, buffers[0]->size));
-  mock_reset_trace();
-  offload_grid_prepare(buffers[0], 0);
-  assert(mock_download_bytes == 0 && buffers[0]->device_buffer == owned);
-  assert(offload_grid_bind(buffers[0], alias, buffers[0]->size));
-  offload_free_buffer(buffers[0]); buffers[0] = NULL;
+  same(host[0], expected, (size_t)nr_[0], "device potential aux (mixed)");
   pw_gpu_res_ensure_host_c(RES_VXC, vxc);
   same(vxc, expected, (size_t)nr_[0], "PW still owns potential");
-  // Rejected device output leaves no alias and preserves the fallback input.
+  // A non-resident potential is uploaded and still written on the device.
+  res_invalidate(RES_VXC);
+  for (int i = 0; i < nr_[0]; i++) host[0][i] = -5;
+  offloadMemcpyAsyncHtoD(owned[0], host[0], buffers[0]->size, stream);
+  offloadStreamSynchronize(stream);
+  assert(potential_device(vxc, out, dst));
+  for (int l = 0; l < NLEV; l++) {
+    assert(offload_grid_bind(buffers[l], owned[l], buffers[l]->size));
+    offload_grid_host(buffers[l]);
+  }
+  same(host[0], expected, (size_t)nr_[0], "uploaded potential aux");
+  same(host[1], ref[1], (size_t)nr_[1], "uploaded potential 1");
+  // A rejected call writes nothing.
   opt_res_pot = false;
-  alias = owned;
-  assert(!potential_device(vxc, out, &alias) && alias == NULL);
+  for (int i = 0; i < nr_[1]; i++) host[1][i] = -7;
+  offloadMemcpyAsyncHtoD(owned[1], host[1], buffers[1]->size, stream);
+  offloadStreamSynchronize(stream);
+  assert(!potential_device(vxc, out, dst));
+  assert(offload_grid_bind(buffers[1], owned[1], buffers[1]->size));
+  offload_grid_host(buffers[1]);
+  for (int i = 0; i < nr_[1]; i++) assert(host[1][i] == -7);
   for (int l = 0; l < NLEV; l++) {
     offload_free_buffer(buffers[l]);
     free(out[l]); free(ref[l]); free(map_[l]); free(gidx_[l]);
@@ -130,6 +164,6 @@ int main(void) {
   free(g_fine); free(gsq_fine);
   pw_gpu_finalize();
   assert(mock_allocated == 0 && mock_live_streams == 0 && mock_live_events == 0);
-  puts("PASS Grid device bridge, mixed inputs, borrowed potential and fallback/ownership");
+  puts("PASS Grid device bridge, mixed inputs, device potential and fallback/ownership");
   return 0;
 }

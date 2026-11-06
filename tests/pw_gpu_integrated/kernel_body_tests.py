@@ -18,7 +18,7 @@ ROOT = HERE.parents[1]
 def run_kernel_body_tests(build, flags, include, env):
     source = (ROOT / "src/pw/gpu/pw_gpu_kernels.cu").read_text()
     source, count = re.subn(r"(\w+)<<<(.*?)>>>\(", r"emulate(\1, \2, ", source, flags=re.S)
-    assert count == 20, count  # 17 + 3 residency kernels
+    assert count == 34, count  # 17 + 3 residency + 3 natural Hartree + 5 natural XC + 5 stage 5 + 1 stage 6
     prelude = '''#include "mock_offload.h"
 #define __global__
 #define __device__

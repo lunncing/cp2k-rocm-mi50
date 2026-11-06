@@ -200,7 +200,7 @@ void offload_grid_host(offload_buffer *buffer) {
 
 void offload_device_synchronize(void) {
   offload_activate_chosen_device();
-  offloadDeviceSynchronize();
+  offloadStreamSynchronize(0);
 }
 
 // EOF

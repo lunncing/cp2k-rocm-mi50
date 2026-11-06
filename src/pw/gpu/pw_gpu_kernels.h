@@ -117,6 +117,42 @@ void pw_gpu_launch_res_natural_cdot_terms(const double *rho, const double *v_h,
     double *terms, size_t n, offloadStream_t stream);
 void pw_gpu_launch_res_natural_extract_prefix(const double *src,
     double *prefix_out, const int *coords, size_t nprefix, offloadStream_t stream);
+// Natural FFT order of XC (stage 4), FFT positions p < n, zero-based maps:
+//   nat_deriv     : c(p)   = scale * (0,1) * g(idir,p) * z(p)
+//   nat_deriv_acc : acc(p) = acc(p) + (0,1) * g(idir,p) * scale * c(p)
+//   gtab_build    : axis tables of g (mode 1), gtab_check flags mismatches
+//   gtab_full     : gt(:, map(i)) = g(:, i) (mode 2)
+void pw_gpu_launch_nat_deriv(double *c, const double *z, const double *gt,
+    int mode, size_t n0, size_t n1, int idir, double scale, size_t n,
+    offloadStream_t stream);
+void pw_gpu_launch_nat_deriv_acc(double *acc, const double *c, const double *gt,
+    int mode, size_t n0, size_t n1, int idir, double scale, size_t n,
+    offloadStream_t stream);
+void pw_gpu_launch_gtab_build(double *gt, const double *g, const int *map,
+    size_t n0, size_t n1, size_t n, offloadStream_t stream);
+void pw_gpu_launch_gtab_check(double *flags, const double *g, const int *map,
+    const double *gt, size_t n0, size_t n1, size_t n, offloadStream_t stream);
+void pw_gpu_launch_gtab_full(double *gt, const double *g, const int *map,
+    size_t n, offloadStream_t stream);
+// Stage 5 (see pw_gpu_res_ops.h): two real fields per FFT in the natural XC,
+//   nat_grad2 : z = Fa^h + i Fb^h, F_d = i g_d rho (Hermitian parts)
+//   nat_div2  : acc (=|+=) i scale (g_a H_a + g_b H_b) from w = FFT[h_a + i h_b]
+//   pack2/unpack2: c = x + i y and back
+// and the fused Hartree begin: rho_tot = core + rg, out = rho_tot * w.
+void pw_gpu_launch_nat_grad2(double *z, const double *rho, const double *gt, int mode,
+    size_t n0, size_t n1, size_t n2, int a, int b, size_t n, offloadStream_t stream);
+void pw_gpu_launch_nat_div2(double *acc, const double *w, const double *gt, int mode,
+    size_t n0, size_t n1, size_t n2, int a, int b, double scale, int accumulate,
+    size_t n, offloadStream_t stream);
+void pw_gpu_launch_pack2(const double *x, const double *y, double *c, size_t n,
+    offloadStream_t stream);
+void pw_gpu_launch_unpack2(const double *c, double *x, double *y, size_t n,
+    offloadStream_t stream);
+void pw_gpu_launch_res_tot_cmul(double *rho_tot, double *out, const double *core,
+    const double *rg, const double *w, int width, size_t n, offloadStream_t stream);
+// Stage 6: z = rho^h + i (i g_z rho)^h, whose inverse FFT is rho_r + i d rho/dz.
+void pw_gpu_launch_nat_rho_dz(double *z, const double *rho, const double *gt, int mode,
+    size_t n0, size_t n1, size_t n2, size_t n, offloadStream_t stream);
 
 // Full VRAM pipeline. exc_out is the unscaled sum of energy density; the
 // Fortran wrapper multiplies it by dvol. Outputs are untouched on failure.
@@ -163,12 +199,13 @@ int pw_gpu_res_density_c(int nlevels, void *const *r_host, const int *npts,
     void *const *gidx, const double *scale, const int *t_npts, int t_ngpts,
     int t_nmaps, int t_grid_id, const int *t_map, double *rho_g_host,
     double *rho_r_host, void *const *r_dev);
-// Optional aux_dev receives a borrowed resident potential instead of writing
-// r_host[aux]. Consume it synchronously in Grid before any further PW operation.
+// Optional r_dev (NULL or one entry per level, NULL entries allowed): device
+// memory owned by the caller's real-space multigrid. Level l is written there
+// instead of r_host[l] (stage 4); the call is synchronous.
 int pw_gpu_res_potential_c(const double *v_host, int nlevels, void *const *r_host,
     const int *npts, const int *ngpts, const int *nmaps, const int *grid_id,
     void *const *maps, void *const *gidx, const double *rscale, int aux,
-    double fwd_scale, void **aux_dev);
+    double fwd_scale, void *const *r_dev);
 int pw_gpu_res_vtot_prepare_c(const double *vh_host, const double *vxc_host,
     size_t n, double dvol);
 int pw_gpu_res_vtot_commit_c(const double *vtot_host, size_t n);

@@ -152,6 +152,10 @@ void offloadStreamSynchronize(offloadStream_t stream) {
   assert(stream >= 1 && stream <= 2 && streams[stream].live);
   merge_clock(completed, streams[stream].clock);
 }
+void offloadDeviceSynchronize(void) {
+  for (int i = 1; i <= 2; i++)
+    if (streams[i].live) merge_clock(completed, streams[i].clock);
+}
 void offloadEventCreate(offloadEvent_t *event) {
   for (int i = 1; i <= 4; i++) {
     if (!events[i].live) {
@@ -524,6 +528,146 @@ void pw_gpu_launch_res_sample(const double *x, double *out, size_t n, int width,
   for (size_t k = 0; k < count; k++) {
     const size_t e = pw_res_sample_index(k, n);
     for (int c = 0; c < width; c++) out[(size_t)width * k + c] = x[(size_t)width * e + c];
+  }
+  mock_res_calls++;
+}
+// Stage 4: natural FFT order of XC.
+static size_t mock_gt_doubles(int mode, size_t n0, size_t n1, size_t n) {
+  return mode == 2 ? 3 * n : n0 + n1 + n / (n0 * n1);
+}
+size_t mock_nat_deriv_n, mock_nat_deriv_acc_n;
+void pw_gpu_launch_nat_deriv(double *c, const double *z, const double *gt,
+    int mode, size_t n0, size_t n1, int idir, double scale, size_t n,
+    offloadStream_t s) {
+  if (!n) return;
+  assert(mode == 1 || mode == 2);
+  begin_operation(MOCK_GRID_COPY, s, c, idir);
+  touch(c, 2 * n * sizeof(double)); touch(z, 2 * n * sizeof(double));
+  touch(gt, mock_gt_doubles(mode, n0, n1, n) * sizeof(double));
+  for (size_t p = 0; p < n; p++)
+    pw_nat_deriv_elem(c, z, pw_nat_gd(gt, mode, n0, n1, p, idir), scale, p);
+  mock_nat_deriv_n += n;
+  mock_res_calls++;
+}
+void pw_gpu_launch_nat_deriv_acc(double *acc, const double *c, const double *gt,
+    int mode, size_t n0, size_t n1, int idir, double scale, size_t n,
+    offloadStream_t s) {
+  if (!n) return;
+  assert(mode == 1 || mode == 2);
+  begin_operation(MOCK_GRID_AXPY, s, acc, idir);
+  touch(acc, 2 * n * sizeof(double)); touch(c, 2 * n * sizeof(double));
+  touch(gt, mock_gt_doubles(mode, n0, n1, n) * sizeof(double));
+  for (size_t p = 0; p < n; p++)
+    pw_nat_deriv_acc_elem(acc, c, pw_nat_gd(gt, mode, n0, n1, p, idir), scale, p);
+  mock_nat_deriv_acc_n += n;
+  mock_res_calls++;
+}
+void pw_gpu_launch_gtab_build(double *gt, const double *g, const int *map,
+    size_t n0, size_t n1, size_t n, offloadStream_t s) {
+  if (!n) return;
+  begin_operation(MOCK_GRID_COPY, s, gt, 0);
+  touch(g, 3 * n * sizeof(double)); touch(map, n * sizeof(int));
+  touch(gt, mock_gt_doubles(1, n0, n1, n) * sizeof(double));
+  for (size_t i = 0; i < n; i++) {
+    const size_t p = (size_t)map[i], r = p / n0;
+    assert(p < n);
+    gt[p % n0] = g[3 * i];
+    gt[n0 + r % n1] = g[3 * i + 1];
+    gt[n0 + n1 + r / n1] = g[3 * i + 2];
+  }
+  mock_res_calls++;
+}
+void pw_gpu_launch_gtab_check(double *flags, const double *g, const int *map,
+    const double *gt, size_t n0, size_t n1, size_t n, offloadStream_t s) {
+  if (!n) return;
+  begin_operation(MOCK_GRID_COPY, s, flags, 0);
+  touch(flags, n * sizeof(double)); touch(g, 3 * n * sizeof(double));
+  touch(map, n * sizeof(int)); touch(gt, mock_gt_doubles(1, n0, n1, n) * sizeof(double));
+  for (size_t i = 0; i < n; i++) {
+    const size_t p = (size_t)map[i];
+    int bad = 0;
+    for (int d = 0; d < 3; d++)
+      bad |= pw_res_bits_differ(g[3 * i + d], pw_nat_gd(gt, 1, n0, n1, p, d));
+    flags[i] = bad ? 1.0 : 0.0;
+  }
+  mock_res_calls++;
+}
+// Stage 5: paired natural XC kernels and the fused Hartree begin.
+size_t mock_nat_grad2_n, mock_nat_div2_n, mock_tot_cmul_n;
+void pw_gpu_launch_nat_grad2(double *z, const double *rho, const double *gt, int mode,
+    size_t n0, size_t n1, size_t n2, int a, int b, size_t n, offloadStream_t s) {
+  if (!n) return;
+  assert(mode == 1 || mode == 2);
+  assert(n == n0 * n1 * n2 && z != rho);
+  begin_operation(MOCK_GRID_COPY, s, z, a);
+  touch(z, 2 * n * sizeof(double)); touch(rho, 2 * n * sizeof(double));
+  touch(gt, mock_gt_doubles(mode, n0, n1, n) * sizeof(double));
+  for (size_t p = 0; p < n; p++) pw_nat_grad2_elem(z, rho, gt, mode, n0, n1, n2, a, b, p);
+  mock_nat_grad2_n += n;
+  mock_res_calls++;
+}
+size_t mock_rho_dz_n;
+void pw_gpu_launch_nat_rho_dz(double *z, const double *rho, const double *gt, int mode,
+    size_t n0, size_t n1, size_t n2, size_t n, offloadStream_t s) {
+  if (!n) return;
+  assert(mode == 1 || mode == 2);
+  assert(n == n0 * n1 * n2 && z != rho);
+  begin_operation(MOCK_GRID_COPY, s, z, 0);
+  touch(z, 2 * n * sizeof(double)); touch(rho, 2 * n * sizeof(double));
+  touch(gt, mock_gt_doubles(mode, n0, n1, n) * sizeof(double));
+  for (size_t p = 0; p < n; p++) pw_nat_rho_dz_elem(z, rho, gt, mode, n0, n1, n2, p);
+  mock_rho_dz_n += n;
+  mock_res_calls++;
+}
+void pw_gpu_launch_nat_div2(double *acc, const double *w, const double *gt, int mode,
+    size_t n0, size_t n1, size_t n2, int a, int b, double scale, int accumulate,
+    size_t n, offloadStream_t s) {
+  if (!n) return;
+  assert(mode == 1 || mode == 2);
+  assert(n == n0 * n1 * n2 && acc != w);
+  begin_operation(MOCK_GRID_AXPY, s, acc, a);
+  touch(acc, 2 * n * sizeof(double)); touch(w, 2 * n * sizeof(double));
+  touch(gt, mock_gt_doubles(mode, n0, n1, n) * sizeof(double));
+  for (size_t p = 0; p < n; p++)
+    pw_nat_div2_elem(acc, w, gt, mode, n0, n1, n2, a, b, scale, accumulate, p);
+  mock_nat_div2_n += n;
+  mock_res_calls++;
+}
+void pw_gpu_launch_pack2(const double *x, const double *y, double *c, size_t n,
+    offloadStream_t s) {
+  if (!n) return;
+  begin_operation(MOCK_REAL_TO_COMPLEX, s, c, 0);
+  touch(x, n * sizeof(double)); touch(y, n * sizeof(double)); touch(c, 2 * n * sizeof(double));
+  for (size_t p = 0; p < n; p++) { c[2 * p] = x[p]; c[2 * p + 1] = y[p]; }
+}
+void pw_gpu_launch_unpack2(const double *c, double *x, double *y, size_t n,
+    offloadStream_t s) {
+  if (!n) return;
+  begin_operation(MOCK_COMPLEX_TO_REAL, s, x, 0);
+  touch(x, n * sizeof(double)); touch(y, n * sizeof(double)); touch(c, 2 * n * sizeof(double));
+  for (size_t p = 0; p < n; p++) { x[p] = c[2 * p]; y[p] = c[2 * p + 1]; }
+}
+void pw_gpu_launch_res_tot_cmul(double *rho_tot, double *out, const double *core,
+    const double *rg, const double *w, int width, size_t n, offloadStream_t s) {
+  if (!n) return;
+  begin_operation(MOCK_GRID_COPY, s, out, 0);
+  touch(rho_tot, 2 * n * sizeof(double)); touch(out, 2 * n * sizeof(double));
+  touch(core, 2 * n * sizeof(double)); touch(rg, 2 * n * sizeof(double));
+  touch(w, (size_t)width * n * sizeof(double));
+  for (size_t i = 0; i < n; i++) pw_res_tot_cmul_elem(rho_tot, out, core, rg, w, width, i);
+  mock_tot_cmul_n += n;
+  mock_res_calls++;
+}
+void pw_gpu_launch_gtab_full(double *gt, const double *g, const int *map,
+    size_t n, offloadStream_t s) {
+  if (!n) return;
+  begin_operation(MOCK_GRID_COPY, s, gt, 0);
+  touch(g, 3 * n * sizeof(double)); touch(map, n * sizeof(int));
+  touch(gt, 3 * n * sizeof(double));
+  for (size_t i = 0; i < n; i++) {
+    const size_t p = (size_t)map[i];
+    assert(p < n);
+    for (int d = 0; d < 3; d++) gt[3 * p + (size_t)d] = g[3 * i + (size_t)d];
   }
   mock_res_calls++;
 }

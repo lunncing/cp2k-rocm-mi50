@@ -95,6 +95,23 @@ NATURAL_CASES = r'''
 #include "test_res.c"
 #undef main
 
+// Stage 5 pairs two real fields per FFT in the natural XC: the XC outputs then
+// agree with the sorted order to rounding instead of bitwise.
+static void xc_same(const double *a, const double *b, const size_t n, const char *what) {
+  if (!opt_res_xc_pairs) {
+    same(a, b, n, what);
+    return;
+  }
+  double big = 0.0;
+  for (size_t i = 0; i < n; i++) big = fmax(big, fabs(b[i]));
+  for (size_t i = 0; i < n; i++) {
+    if (!(fabs(a[i] - b[i]) <= 1e-12 * (1.0 + big))) {
+      fprintf(stderr, "%s: mismatch at %zu: %.17g != %.17g\n", what, i, a[i], b[i]);
+      abort();
+    }
+  }
+}
+
 static void full_grid(void) {
   grids(1);
   const int n = nr_[0];
@@ -141,7 +158,7 @@ static void natural_chain(void) {
     const unsigned long hits = res[RES_RHO_CORE].hits;
     for (size_t i = 0; i < 2 * n; i++) tot[i] = -987.0;
     mock_reset_trace();
-    mock_natural_mul_n = mock_natural_dot_n = mock_natural_prefix_n = 0;
+    mock_natural_mul_n = mock_natural_dot_n = mock_natural_prefix_n = mock_tot_cmul_n = 0;
     assert(pw_gpu_res_hartree_begin_c(h.core, rg, h.infl, tot, n, nprefix, dims[0]));
     assert(res_hartree.natural_g == natural);
     same(tot, ref_tot, 2 * nprefix, "natural DDAPC prefix");
@@ -149,7 +166,7 @@ static void natural_chain(void) {
     assert(mock_download_bytes == 2 * nprefix * sizeof(double) +
            (opt_res_verify ? (pass == 1 ? 5 : 2) * n * sizeof(double) : 0));
     if (natural) {
-      assert(mock_natural_mul_n == n && mock_natural_prefix_n == nprefix);
+      assert(mock_tot_cmul_n == n && mock_natural_prefix_n == nprefix); // fused begin (stage 5)
       assert(res[RES_RHO_CORE].owned_bytes == 2 * n * sizeof(double));
       assert(res[RES_INFL].width == (pass == 2 ? 2 : 1));
     }
@@ -187,8 +204,8 @@ static void natural_chain(void) {
   assert(res_stats.syncs == syncs);
   assert(!res[RES_RHO_G].dev_authoritative && !res[RES_RHO_R].dev_authoritative);
   pw_gpu_res_ensure_host_c(RES_VXC, vxc);
-  same(vxc, ref_vxc, n, "natural XC handoff");
-  same(&exc, &ref_exc, 1, "natural XC energy");
+  xc_same(vxc, ref_vxc, n, "natural XC handoff");
+  xc_same(&exc, &ref_exc, 1, "natural XC energy");
   assert(res[RES_RHO_G].hits == hits + 1);
   // Switching the coarse index cache back to sorted G must not reuse natural indices.
   double *pot[NLEV], *ref_pot[NLEV];
@@ -332,6 +349,268 @@ static void natural_chunked_sync(void) {
   free(map); free(host); free(box); free(ref);
 }
 
+// Stage 4: XC and potential_pw2rs in the natural order on a full grid, bitwise
+// equal to the sorted order, with separable g (axis tables) and with g of a
+// cell that couples the axes (full copy). The sorted g array is released.
+static void full_grid_g(const int separable) {
+  full_grid();
+  const int n = nr_[0], n0 = dims[0][0], n1 = dims[0][1], n2 = dims[0][2];
+  for (int i = 0; i < n; i++) {
+    const int p = map_[0][i], x = p % n0, y = (p / n0) % n1, z = p / (n0 * n1);
+    const double gx = 0.31 * (2 * x <= n0 ? x : x - n0);
+    const double gy = -0.27 * (2 * y <= n1 ? y : y - n1); // -0.0 at y = 0
+    const double gz = 0.23 * (2 * z <= n2 ? z : z - n2);
+    g_fine[3 * i] = separable ? gx : gx + 0.05 * gy;
+    g_fine[3 * i + 1] = gy;
+    g_fine[3 * i + 2] = gz;
+  }
+}
+
+static void natural_xc(void) {
+  for (int sep = 1; sep >= 0; sep--) {
+    full_grid_g(sep);
+    start(0);
+    const bool nat = opt_res_natural_xc;
+    const size_t n = (size_t)ng_[0];
+    double *r[NLEV], *pot[NLEV], *ref_pot[NLEV];
+    const double rscale[NLEV] = {1.0, 8.0, 0.5};
+    for (int l = 0; l < NLEV; l++) {
+      r[l] = rarray((size_t)nr_[l]);
+      for (int i = 0; i < nr_[l]; i++) r[l][i] = 0.5 + 0.2 * r[l][i];
+      pot[l] = rarray((size_t)nr_[l]);
+      ref_pot[l] = rarray((size_t)nr_[l]);
+    }
+    double rg[128] = {0}, rr[64] = {0}, ref_g[128], ref_r[64];
+    double vxc[64], ref_vxc[64], exc, ref_exc;
+    density_reference(r, ref_g, ref_r);
+    opt_res_natural_xc = false;
+    assert(xc_call(ref_g, ref_r, ref_vxc, &ref_exc));
+    pw_gpu_res_ensure_host_c(RES_VXC, ref_vxc);
+    res_invalidate(RES_VXC);
+    potential_reference(ref_vxc, ref_pot, rscale);
+    double grad[3][64], grad_ref[3][64];
+    pw_gpu_sfffc_grad3(ref_g, grad_ref[0], grad_ref[1], grad_ref[2], map_[0], g_fine,
+                       dims[0], ng_[0], 1, 1);
+    opt_res_natural_xc = nat;
+    for (int pass = 0; pass < 3; pass++) {
+      assert(density_fused(r, rg, rr));
+      const unsigned long before = res_stats.nat_xc, dz_before = res_stats.dz_used;
+      mock_nat_deriv_n = mock_nat_deriv_acc_n = mock_nat_grad2_n = mock_nat_div2_n = 0;
+      // pass 2: the density is not resident; its sorted host copy is scattered.
+      if (pass == 2) pw_gpu_res_invalidate_c();
+      mock_reset_trace();
+      if (pass == 2) {
+        assert(xc_call(ref_g, ref_r, vxc, &exc));
+      } else {
+        assert(xc_call(rg, rr, vxc, &exc));
+      }
+      pw_gpu_res_ensure_host_c(RES_VXC, vxc);
+      xc_same(vxc, ref_vxc, n, "natural XC vxc");
+      xc_same(&exc, &ref_exc, 1, "natural XC energy");
+      grid_cache_entry *e = NULL;
+      for (int i = 0; i < PW_GPU_GRID_CACHE_SIZE; i++)
+        if (grid_cache[i].grid_id == 1) e = &grid_cache[i];
+      assert(e != NULL);
+      if (nat) {
+        assert(res_stats.nat_xc == before + 1 && res_stats.nat_gt_mode == (sep ? 1 : 2));
+        // Stage 6: pass 1 reads d rho/dz from its density (pass 0 built the g tables).
+        const bool dz = opt_res_xc_dz && pass == 1;
+        assert(res_stats.dz_used == dz_before + (dz ? 1u : 0u));
+        const size_t singles = opt_res_xc_pairs ? 1 : 3;
+        assert(mock_nat_deriv_n == (dz ? 0 : singles) * n && mock_nat_deriv_acc_n == singles * n);
+        assert(mock_nat_grad2_n == (opt_res_xc_pairs ? n : 0) &&
+               mock_nat_div2_n == (opt_res_xc_pairs ? n : 0));
+        for (size_t i = 0; i < mock_operation_count; i++)
+          assert(mock_operations[i].kind != MOCK_SCATTER_DERIV &&
+                 mock_operations[i].kind != MOCK_GATHER_DERIV);
+        assert(e->g_dev == NULL && e->gt_mode == (sep ? 1 : 2));
+        assert(e->gt_bytes == sizeof(double) *
+               (sep ? (size_t)(dims[0][0] + dims[0][1] + dims[0][2]) : 3 * n));
+        if (pass > 0) assert(mock_upload_bytes == (pass == 2 ? 3 * n * sizeof(double) : 0));
+      } else {
+        assert(res_stats.nat_xc == before && e->gt_mode == 0);
+      }
+      // potential_pw2rs: the coarse levels are read from the auxiliary FFT box.
+      const unsigned long pots = res_stats.nat_potential;
+      for (int l = 0; l < NLEV; l++) memset(pot[l], 0, sizeof(double) * (size_t)nr_[l]);
+      res_invalidate(RES_VXC);
+      assert(potential_fused(ref_vxc, pot, rscale));
+      for (int l = 0; l < NLEV; l++) same(pot[l], ref_pot[l], (size_t)nr_[l], "natural potential");
+      assert(res_stats.nat_potential == pots + (nat && opt_res_natural_g ? 1u : 0u));
+    }
+    // A sorted consumer (legacy gradient) re-creates the sorted g array on demand.
+    pw_gpu_sfffc_grad3(ref_g, grad[0], grad[1], grad[2], map_[0], g_fine, dims[0],
+                       ng_[0], 1, 1);
+    for (int d = 0; d < 3; d++) same(grad[d], grad_ref[d], n, "sorted gradient after natural XC");
+    // The natural XC keeps working next to the re-created sorted copy.
+    assert(density_fused(r, rg, rr));
+    assert(xc_call(rg, rr, vxc, &exc));
+    pw_gpu_res_ensure_host_c(RES_VXC, vxc);
+    xc_same(vxc, ref_vxc, n, "natural XC next to sorted g");
+    // A rho_g without Hermitian symmetry (and the Nyquist plane of the even x
+    // axis): the paired transforms still return exactly the real parts that
+    // the sorted path takes of each gradient.
+    double skew_g[128], skew_vxc[64], skew_exc;
+    for (size_t i = 0; i < 2 * n; i++) skew_g[i] = ref_g[i] * (1.0 + 0.3 * rnd()) + 0.01 * rnd();
+    opt_res_natural_xc = false;
+    assert(xc_call(skew_g, ref_r, skew_vxc, &skew_exc));
+    pw_gpu_res_ensure_host_c(RES_VXC, skew_vxc);
+    opt_res_natural_xc = nat;
+    assert(xc_call(skew_g, ref_r, vxc, &exc));
+    pw_gpu_res_ensure_host_c(RES_VXC, vxc);
+    xc_same(vxc, skew_vxc, n, "natural XC, non-Hermitian rho_g");
+    xc_same(&exc, &skew_exc, 1, "natural XC energy, non-Hermitian rho_g");
+    pw_gpu_res_set_lazy_c(0);
+    finish();
+    for (int l = 0; l < NLEV; l++) { free(r[l]); free(pot[l]); free(ref_pot[l]); }
+  }
+}
+
+// Stage 6: d rho/dz from the density's inverse FFT, and every condition under
+// which the XC computes its own z gradient instead.
+static int xc_call_g(const double *rho_g, const double *rho_r, double *vxc, double *exc,
+                     const double *g) {
+  return pw_gpu_xc_full_pipeline_configured_c(rho_g, rho_r, vxc, exc, map_[0], g,
+      dims[0], ng_[0], nmaps_, 1.0 / nr_[0], 1, 1e-10, .804, .066725,
+      .2195149727645171, 1.0, 1.0, 1e-10, 0.0, 0);
+}
+
+static void near(const double *a, const double *b, const size_t n, const char *what) {
+  double big = 0.0;
+  for (size_t i = 0; i < n; i++) big = fmax(big, fabs(b[i]));
+  for (size_t i = 0; i < n; i++) {
+    if (!(fabs(a[i] - b[i]) <= 1e-13 * (1.0 + big))) {
+      fprintf(stderr, "%s: mismatch at %zu: %.17g != %.17g\n", what, i, a[i], b[i]);
+      abort();
+    }
+  }
+}
+
+static void natural_dz(void) {
+  full_grid_g(1);
+  start(0);
+  assert(opt_res_natural_xc);
+  const bool on = opt_res_xc_dz;
+  const size_t n = (size_t)ng_[0];
+  double *r[NLEV];
+  for (int l = 0; l < NLEV; l++) {
+    r[l] = rarray((size_t)nr_[l]);
+    for (int i = 0; i < nr_[l]; i++) r[l][i] = 0.5 + 0.2 * r[l][i];
+  }
+  double rg[128] = {0}, rr[64] = {0}, ref_g[128], ref_r[64];
+  double vxc[64], ref_vxc[64], exc, ref_exc, grad[3][64], dz[64];
+  density_reference(r, ref_g, ref_r);
+  opt_res_natural_xc = false;
+  assert(xc_call(ref_g, ref_r, ref_vxc, &ref_exc));
+  pw_gpu_res_ensure_host_c(RES_VXC, ref_vxc);
+  res_invalidate(RES_VXC);
+  opt_res_natural_xc = true;
+  pw_gpu_sfffc_grad3(ref_g, grad[0], grad[1], grad[2], map_[0], g_fine, dims[0], ng_[0], 1, 1);
+#define XC_OK(rho_g, rho_r, what) do { \
+    assert(xc_call(rho_g, rho_r, vxc, &exc)); \
+    pw_gpu_res_ensure_host_c(RES_VXC, vxc); \
+    xc_same(vxc, ref_vxc, n, what); \
+    xc_same(&exc, &ref_exc, 1, what); \
+    res_invalidate(RES_VXC); \
+  } while (0)
+  // No g tables before the first natural XC: plain density, bitwise rho_r.
+  assert(density_fused(r, rg, rr));
+  assert(res_stats.dz_made == 0 && mock_rho_dz_n == 0);
+  pw_gpu_res_ensure_host_c(RES_RHO_R, rr);
+  same(rr, ref_r, n, "density without g tables");
+  XC_OK(rg, rr, "first XC");
+  assert(res_stats.dz_used == 0);
+  // Steady state: one transform less in the XC, no allocation, no upload.
+  for (int step = 0; step < 2; step++) {
+    const size_t allocations = mock_allocations;
+    const int ffts = mock_fft_calls;
+    assert(density_fused(r, rg, rr));
+    const int density_ffts = mock_fft_calls - ffts;
+    assert(res_stats.dz_made == (on ? step + 1u : 0u) && mock_rho_dz_n == (on ? (step + 1) * n : 0));
+    if (on) {
+      offloadMemcpyAsyncDtoH(dz, xc_dev_hi + n, n * sizeof(double), stream);
+      offloadStreamSynchronize(stream);
+      near(dz, grad[2], n, "d rho/dz of the density");
+    }
+    mock_nat_deriv_n = 0;
+    const int xc_ffts = mock_fft_calls;
+    const size_t up = mock_upload_bytes;
+    XC_OK(rg, rr, "XC with d rho/dz");
+    assert(mock_upload_bytes == up);
+    assert(res_stats.dz_used == (on ? step + 1u : 0u));
+    const bool skip = on && !opt_res_verify;
+    assert(mock_nat_deriv_n == (skip ? 0 : opt_res_xc_pairs ? 1 : 3) * n);
+    assert(mock_fft_calls - xc_ffts == (skip ? 4 : opt_res_xc_pairs ? 5 : 7));
+    assert(mock_allocations == allocations && density_ffts > 0);
+  }
+  pw_gpu_res_ensure_host_c(RES_RHO_R, rr);
+  if (on) near(rr, ref_r, n, "rho_r with d rho/dz");
+  else same(rr, ref_r, n, "rho_r without d rho/dz");
+  unsigned long used = res_stats.dz_used;
+  // RHO_R or RHO_G not resident: the XC reads host inputs, its own z gradient.
+  for (int id = RES_RHO_G; id <= RES_RHO_R; id++) {
+    assert(density_fused(r, rg, rr));
+    pw_gpu_res_ensure_host_c(id, id == RES_RHO_G ? (void *)rg : (void *)rr);
+    res_invalidate(id);
+    XC_OK(rg, rr, "XC with one input uploaded");
+    assert(res_stats.dz_used == used);
+  }
+  // Rebuilt g tables (other g array): new generation, d rho/dz is not used.
+  double *g_copy = malloc(3 * n * sizeof(double));
+  memcpy(g_copy, g_fine, 3 * n * sizeof(double));
+  assert(density_fused(r, rg, rr));
+  assert(xc_call_g(rg, rr, vxc, &exc, g_copy));
+  pw_gpu_res_ensure_host_c(RES_VXC, vxc);
+  xc_same(vxc, ref_vxc, n, "XC with rebuilt g tables");
+  res_invalidate(RES_VXC);
+  assert(res_stats.dz_used == used);
+  // The rebuilt tables serve the next density.
+  assert(density_fused(r, rg, rr));
+  assert(xc_call_g(rg, rr, vxc, &exc, g_copy));
+  pw_gpu_res_ensure_host_c(RES_VXC, vxc);
+  xc_same(vxc, ref_vxc, n, "XC with the new tables");
+  res_invalidate(RES_VXC);
+  assert(res_stats.dz_used == used + (on ? 1u : 0u));
+  used = res_stats.dz_used;
+  free(g_copy);
+  // Consumed once: a second XC of the same (host-valid) arrays recomputes.
+  if (!opt_res_lazy_density) {
+    assert(density_fused(r, rg, rr));
+    XC_OK(rg, rr, "first XC of a density");     // rebuilds the tables for g_fine
+    assert(res_stats.dz_used == used);
+    assert(density_fused(r, rg, rr));
+    XC_OK(rg, rr, "XC with d rho/dz again");
+    assert(res_stats.dz_used == used + (on ? 1u : 0u));
+    used = res_stats.dz_used;
+    XC_OK(rg, rr, "second XC of the same density");
+    assert(res_stats.dz_used == used);
+  }
+  // Grid invalidation between density and XC.
+  XC_OK(ref_g, ref_r, "tables for g_fine");
+  assert(density_fused(r, rg, rr));
+  pw_gpu_grid_invalidate(1);
+  XC_OK(rg, rr, "XC after grid invalidation");
+  assert(res_stats.dz_used == used);
+  // CP2K_PW_GPU_RES_VERIFY: a corrupted d rho/dz is detected and replaced.
+  if (opt_res_verify && on) {
+    assert(density_fused(r, rg, rr));
+    XC_OK(rg, rr, "tables after invalidation");
+    assert(density_fused(r, rg, rr));
+    assert(res_dz.epoch == xc_epoch);
+    double bad = 1.0;
+    offloadMemcpyAsyncHtoD(xc_dev_hi + n + 3, &bad, sizeof(double), stream);
+    const unsigned long bads = res_stats.dz_bad;
+    XC_OK(rg, rr, "XC with a corrupted d rho/dz");
+    assert(res_stats.dz_bad == bads + 1 && res_stats.dz_used == used + 1);
+  }
+  assert(res_stats.dz_bad == 0 || opt_res_verify);
+  if (!on) assert(res_stats.dz_made == 0 && res_stats.dz_used == 0 && mock_rho_dz_n == 0);
+#undef XC_OK
+  pw_gpu_res_set_lazy_c(0);
+  finish();
+  for (int l = 0; l < NLEV; l++) free(r[l]);
+}
+
 // One SCF step after warm-up uploads only the real-space density inputs and
 // the small fingerprint/DDAPC data: the target map, its g-vectors and the
 // coarse indices (sorted and natural) stay cached.
@@ -386,8 +665,8 @@ static void natural_traffic(void) {
     pw_gpu_res_ensure_host_c(RES_V_H_R, vh);
     pw_gpu_res_ensure_host_c(RES_VXC, vxc);
     same(vh, ref_vh, (size_t)nr, "traffic v_h");
-    same(&exc, &ref_exc, 1, "traffic exc");
-    for (int l = 0; l < NLEV; l++) same(pot[l], ref_pot[l], (size_t)nr_[l], "traffic potential");
+    xc_same(&exc, &ref_exc, 1, "traffic exc");
+    for (int l = 0; l < NLEV; l++) xc_same(pot[l], ref_pot[l], (size_t)nr_[l], "traffic potential");
     if (step > 0) {
       size_t inputs = 0;
       for (int l = 0; l < NLEV; l++) inputs += sizeof(double) * (size_t)nr_[l];
@@ -414,6 +693,8 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[1], "memory")) natural_memory();
   else if (!strcmp(argv[1], "chunked_sync")) natural_chunked_sync();
   else if (!strcmp(argv[1], "traffic")) natural_traffic();
+  else if (!strcmp(argv[1], "xc")) natural_xc();
+  else if (!strcmp(argv[1], "dz")) natural_dz();
   else assert(!"unknown natural test");
   for (int l = 0; l < NLEV; l++) { free(map_[l]); free(gidx_[l]); }
   free(g_fine); free(gsq_fine);
@@ -461,7 +742,7 @@ def main():
                    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
         source = (ROOT / "src/pw/gpu/pw_gpu_kernels.cu").read_text()
         source, count = re.subn(r"(\w+)<<<(.*?)>>>\(", r"emulate(\1, \2, ", source, flags=re.S)
-        assert count == 23, count
+        assert count == 34, count  # + 5 natural XC kernels (stage 4) + 5 paired/fused (stage 5) + 1 (stage 6)
         prelude = (HERMES / "kernel_body_tests.py").read_text().split("prelude = '''", 1)[1].split("'''", 1)[0]
         body = (HERMES / "test_kernel_bodies.cpp").read_text()
         body = body.replace("int main() {", "static void hermes_main() {", 1)
@@ -514,6 +795,20 @@ def main():
             ("traffic", {}),
             ("traffic", {"CP2K_PW_GPU_RES_LAZY_DENSITY": "0", "CP2K_PW_GPU_RES_LAZY_POT": "0"}),
             ("traffic", {"CP2K_PW_GPU_RES_NATURAL_G": "0"}),
+            ("xc", {}),
+            ("xc", {"CP2K_PW_GPU_RES_LAZY_DENSITY": "0", "CP2K_PW_GPU_RES_LAZY_POT": "0"}),
+            ("xc", {"CP2K_PW_GPU_RES_NATURAL_XC": "0"}),
+            ("xc", {"CP2K_PW_GPU_RES_NATURAL_G": "0"}),
+            ("xc", {"CP2K_PW_GPU_RES_XC_PAIRS": "0"}),
+            ("traffic", {"CP2K_PW_GPU_RES_XC_PAIRS": "0"}),
+            ("chain", {"CP2K_PW_GPU_RES_XC_PAIRS": "0"}),
+            ("dz", {}),
+            ("dz", {"CP2K_PW_GPU_RES_LAZY_DENSITY": "0", "CP2K_PW_GPU_RES_LAZY_POT": "0"}),
+            ("dz", {"CP2K_PW_GPU_RES_VERIFY": "1"}),
+            ("dz", {"CP2K_PW_GPU_RES_XC_DZ": "0"}),
+            ("dz", {"CP2K_PW_GPU_RES_XC_PAIRS": "0"}),
+            ("xc", {"CP2K_PW_GPU_RES_XC_DZ": "0"}),
+            ("traffic", {"CP2K_PW_GPU_RES_XC_DZ": "0"}),
         ]
         for name, overrides in natural_cases:
             for threads in ("1", "3"):

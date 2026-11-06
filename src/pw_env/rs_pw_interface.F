@@ -21,7 +21,8 @@ MODULE rs_pw_interface
    USE gaussian_gridlevels,             ONLY: gridlevel_info_type
    USE input_section_types,             ONLY: section_vals_val_get
    USE kinds,                           ONLY: dp
-   USE offload_api,                     ONLY: offload_grid_bind,&
+   USE offload_api,                     ONLY: offload_get_buffer_device_pointer,&
+                                              offload_grid_bind,&
                                               offload_grid_device,&
                                               offload_grid_host,&
                                               offload_grid_prepare
@@ -235,7 +236,8 @@ CONTAINS
 !> \param rs_v OUTPUT: the potential on the realspace multigrids
 !> \param v_rspace INPUT : the potential on a planewave grid in Rspace
 !> \param pw_env ...
-!> \param device_grid The caller immediately integrates these grids before any further PW operation.
+!> \param device_grid The caller integrates these grids on the device: levels whose layout matches
+!>        their PW grid receive the potential in their own device memory (no host copy).
 !> \par History
 !>      09.2006 created [Joost VandeVondele]
 !> \note
@@ -256,8 +258,8 @@ CONTAINS
       INTEGER                                            :: auxbas_grid, handle, igrid_level, &
                                                             interp_kind
       REAL(KIND=dp)                                      :: scale
-      LOGICAL                                            :: done, bind_grid
-      TYPE(C_PTR)                                        :: aux_dev
+      LOGICAL                                            :: any_device, bind_grid, done
+      TYPE(C_PTR), DIMENSION(SIZE(rs_v))                 :: rs_dev
       TYPE(gridlevel_info_type), POINTER                 :: gridlevel_info
       TYPE(pw_c1d_gs_type), ALLOCATABLE, DIMENSION(:)    :: mgrid_gspace
       TYPE(pw_pool_p_type), DIMENSION(:), POINTER        :: pw_pools
@@ -273,23 +275,33 @@ CONTAINS
 
       ! use either realspace or fft techniques to get the potential on the rs multigrids
       CALL section_vals_val_get(pw_env%interp_section, "KIND", i_val=interp_kind)
-      aux_dev = C_NULL_PTR
+      rs_dev = C_NULL_PTR
+      any_device = .FALSE.
       bind_grid = .FALSE.
       IF (PRESENT(device_grid)) bind_grid = device_grid
-      bind_grid = bind_grid .AND. grid_layout_ok(rs_v(auxbas_grid), v_rspace%pw_grid)
+      bind_grid = bind_grid .AND. interp_kind == pw_interp
       DO igrid_level = 1, gridlevel_info%ngrid_levels
          CALL offload_grid_prepare(rs_v(igrid_level)%buffer, .FALSE.)
+         ! Levels with the FFT layout of their PW grid are written in their own device memory.
+         IF (bind_grid) THEN
+            IF (grid_layout_ok(rs_v(igrid_level), mgrid_rspace(igrid_level)%pw_grid)) THEN
+               rs_dev(igrid_level) = offload_get_buffer_device_pointer(rs_v(igrid_level)%buffer)
+               IF (C_ASSOCIATED(rs_dev(igrid_level))) any_device = .TRUE.
+            END IF
+         END IF
       END DO
       SELECT CASE (interp_kind)
       CASE (pw_interp)
          ! The same sequence on the GPU; the G-space multigrids never leave the device.
          done = .FALSE.
-         IF (bind_grid) THEN
-            done = pw_gpu_res_potential(v_rspace, mgrid_rspace(1:gridlevel_info%ngrid_levels), auxbas_grid, aux_dev)
+         IF (any_device) THEN
+            done = pw_gpu_res_potential(v_rspace, mgrid_rspace(1:gridlevel_info%ngrid_levels), auxbas_grid, &
+                                        rs_dev(1:gridlevel_info%ngrid_levels))
          ELSE
             done = pw_gpu_res_potential(v_rspace, mgrid_rspace(1:gridlevel_info%ngrid_levels), auxbas_grid)
          END IF
          IF (.NOT. done) THEN
+            rs_dev = C_NULL_PTR
             CALL pw_gpu_res_ensure_host(v_rspace)
             CALL pw_pools_create_pws(pw_pools, mgrid_gspace)
             CALL pw_transfer(v_rspace, mgrid_gspace(auxbas_grid))
@@ -332,8 +344,8 @@ CONTAINS
       END SELECT
 
       DO igrid_level = 1, gridlevel_info%ngrid_levels
-         IF (igrid_level == auxbas_grid .AND. C_ASSOCIATED(aux_dev)) THEN
-            done = offload_grid_bind(rs_v(igrid_level)%buffer, aux_dev, rs_v(igrid_level)%ngpts_local)
+         IF (C_ASSOCIATED(rs_dev(igrid_level))) THEN
+            done = offload_grid_bind(rs_v(igrid_level)%buffer, rs_dev(igrid_level), rs_v(igrid_level)%ngpts_local)
             CPASSERT(done)
             CYCLE
          END IF
