@@ -1,0 +1,57 @@
+--- a/source/tests/elpa_gpu/test_elpa.F
++++ b/source/tests/elpa_gpu/test_elpa.F
+@@ -31,6 +31,7 @@
+    requested_kernel = ELPA_2STAGE_REAL_GENERIC
+    CALL set_elpa_kernel(requested_kernel)
+    CALL solve(.TRUE.)
++   CALL verify(ALL(last_flags == 0), "Explicit CPU kernel enabled a GPU")
+    DO i = 1, 10
+       CALL solve(.FALSE.)
+    END DO
+@@ -53,7 +54,7 @@
+    CALL omp_set_num_threads(2)
+    CALL solve(.TRUE.)
+ 
+-   ! Explicit AMD selection works without HIP; HIP also enables GPU flags for a CPU kernel.
++   ! Explicit AMD selection works without HIP; an explicit CPU kernel stays on the CPU.
+    requested_kernel = ELPA_2STAGE_REAL_AMD_GPU
+    CALL set_elpa_kernel(requested_kernel)
+    CALL solve(.TRUE.)
+@@ -97,6 +98,27 @@
+    CALL new_environment(2)
+    CALL solve(.TRUE.)
+    CALL verify(comm_refs(1) == 0, "Evicted communicator leaked")
++
++   ! AUTO resolves by build backend; the mock CPU reports MACHINE_CPU_GENERIC.
++   CALL set_elpa_kernel(ELPA_2STAGE_REAL_INVALID)
++   requested_kernel = ELPA_2STAGE_REAL_DEFAULT
++#if !defined(__NO_OFFLOAD_ELPA)
++#if defined(__OFFLOAD_CUDA)
++   requested_kernel = ELPA_2STAGE_REAL_NVIDIA_GPU
++#endif
++#if defined(__OFFLOAD_HIP)
++   requested_kernel = ELPA_2STAGE_REAL_AMD_GPU
++#endif
++#if defined(__OFFLOAD_OPENCL)
++   requested_kernel = ELPA_2STAGE_REAL_INTEL_GPU_SYCL
++#endif
++#endif
++   CALL solve(.TRUE.)
++   CALL solve(.FALSE.)
++   requested_kernel = ELPA_2STAGE_REAL_GENERIC
++   CALL set_elpa_kernel(requested_kernel)
++   CALL solve(.TRUE.)
++   CALL verify(ALL(last_flags == 0), "CPU selection after AUTO retained GPU flags")
+ 
+    ! Other GPU backends must retain their existing enablement.
+    requested_kernel = ELPA_2STAGE_REAL_NVIDIA_GPU
+@@ -161,9 +183,6 @@
+       CALL verify(last_solver == MERGE(ELPA_SOLVER_1STAGE, ELPA_SOLVER_2STAGE, elpa_one_stage), "Stale solver")
+       CALL verify(last_threads == MERGE(omp_get_max_threads(), 0, support_omp), "Stale OpenMP thread count")
+       amd_requested = requested_kernel == ELPA_2STAGE_REAL_AMD_GPU
+-#if defined(__OFFLOAD_HIP)
+-      amd_requested = .TRUE.
+-#endif
+       expected_flags = [MERGE(1, 0, amd_requested .AND. support_gpu), &
+                         MERGE(1, 0, amd_requested .AND. support_amd), &
+                         MERGE(1, 0, requested_kernel == ELPA_2STAGE_REAL_NVIDIA_GPU), &

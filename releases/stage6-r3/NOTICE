@@ -1,0 +1,39 @@
+CP2K 2026.2 MI50 Stage 6 source snapshot, packaged 2026-11-06 (r3).
+
+The complete source payload comes from the original installed-target source tar:
+SHA256 d45fe70edbf96c571c3100c13fc65f6f581056efa9224fa8fbe40119e5dd2fd0
+Source regular files before packaging filters: 9041.
+All production source bytes and all permission modes are preserved from that tar,
+not reconstructed from a Windows extraction. One allowlisted test file,
+tests/elpa_gpu/test_elpa.F, corrects stale HIP expectations for explicit CPU kernels
+and checks AUTO resolution. Its original/replacement hashes and reason are in
+manifest.json; patches/elpa-test-expectation.patch contains the exact public diff.
+No production ELPA wrapper or other physics source is changed by packaging.
+Public upstream tests, data and benchmarks are retained.
+Generated Python caches and temporary build trees are excluded if present.
+
+The source's REVISION label is git:c92cc08. The source tar has no Git metadata;
+that label does not identify or certify an unmodified upstream tree. This is an
+installed-baseline snapshot with cumulative local changes. No cumulative patch
+is included, and no clean-upstream patch applicability is claimed.
+
+CP2K and its contributors retain their copyright and license notices. The root
+LICENSE is copied verbatim from source/LICENSE (GNU GPL version 2). Consult the
+source file headers and component LICENSE files for applicable terms. The new
+packaging helpers are provided under GPL-2.0-or-later as marked in their headers.
+External Docker images, ROCm and installed build dependencies are not distributed
+by this archive and retain their own licenses.
+
+Compile evidence, CPU mocks, real MI50 acceptance and independent review are
+distinct. A bounded independent review diagnosed the stale ELPA test expectation;
+the corrected mock suite passed in author-local checks. At packaging time,
+cumulative independent physics review and same-target validation of this exact
+archive were not complete. Follow-up target results are recorded separately in a
+release VALIDATION record keyed by the archive SHA-256; consult that record for
+the current status. This experimental handoff contains no warranty of general scientific
+correctness or performance beyond the documented validation scope.
+
+The separate legacy pw_gpu_integrated --sanitize suite has a known mock-link
+failure. The helper's --mock all selects only PW residency and ELPA; it does not
+claim that all CP2K tests pass. The device-free --check does not invoke CP2K,
+because even CP2K --version initializes GPU offload in this snapshot.
