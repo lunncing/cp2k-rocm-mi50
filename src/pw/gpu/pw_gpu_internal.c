@@ -324,6 +324,73 @@ static void read_memory_environment(void) {
   }
 }
 
+// Free and total memory of the active device as the driver reports them: all
+// allocations on the device count (other libraries, other processes).
+static bool device_mem_info(size_t *free_bytes, size_t *total_bytes) {
+#if defined(PW_GPU_TEST_FREE_MEMORY)
+  *free_bytes = PW_GPU_TEST_FREE_MEMORY();
+#if defined(PW_GPU_TEST_TOTAL_MEMORY)
+  *total_bytes = PW_GPU_TEST_TOTAL_MEMORY();
+#else
+  *total_bytes = 0;
+#endif
+  return true;
+#elif defined(__OFFLOAD_HIP)
+  return hipMemGetInfo(free_bytes, total_bytes) == hipSuccess;
+#elif defined(__OFFLOAD_CUDA)
+  return cudaMemGetInfo(free_bytes, total_bytes) == cudaSuccess;
+#else
+  (void)free_bytes;
+  (void)total_bytes;
+  return false;
+#endif
+}
+
+// Device memory in use, sampled at every PW allocation and at the entry of the
+// large per-step routines (density, XC, Hartree, V_TOT, potential): the least
+// free memory seen, with the PW share at that moment. A peak of another library
+// between two samples is not seen (sample the device externally for that).
+static bool opt_mem_sample = true;
+static struct {
+  size_t total, min_free, pw_at_min;
+  unsigned long samples;
+  double seconds;
+} mem_obs = {0, SIZE_MAX, 0, 0, 0.0};
+
+static void mem_sample(void) {
+  if (!opt_mem_sample) return;
+  const double t0 = omp_get_wtime();
+  size_t free_bytes, total_bytes;
+  if (device_mem_info(&free_bytes, &total_bytes) && total_bytes != 0) {
+    mem_obs.total = total_bytes;
+    mem_obs.samples++;
+    if (free_bytes < mem_obs.min_free) {
+      mem_obs.min_free = free_bytes;
+      mem_obs.pw_at_min = current_gpu_allocated_bytes;
+    }
+  }
+  mem_obs.seconds += omp_get_wtime() - t0;
+}
+
+// At the entry of a large per-step routine (other libraries' memory is live).
+static void mem_sample_entry(void) {
+  if (is_initialized && omp_get_num_threads() == 1) mem_sample();
+}
+
+static void mem_print(void) {
+  if (peak_gpu_allocated_bytes == 0 && mem_obs.samples == 0) return;
+  const double mb = (double)PW_GPU_MIB;
+  fprintf(stderr, "[PW_GPU] device memory (MiB): PW peak %.0f", peak_gpu_allocated_bytes / mb);
+  if (mem_obs.samples != 0 && mem_obs.min_free <= mem_obs.total) {
+    fprintf(stderr,
+            ", device in use at most %.0f of %.0f at %lu samples (PW %.0f of it), "
+            "sampling %.1f ms",
+            (mem_obs.total - mem_obs.min_free) / mb, mem_obs.total / mb, mem_obs.samples,
+            mem_obs.pw_at_min / mb, 1e3 * mem_obs.seconds);
+  }
+  fprintf(stderr, "\n");
+}
+
 static void device_malloc(void **ptr, const size_t bytes) {
   assert(bytes <= SIZE_MAX - current_gpu_allocated_bytes);
   offloadMalloc(ptr, bytes);
@@ -331,6 +398,7 @@ static void device_malloc(void **ptr, const size_t bytes) {
   if (current_gpu_allocated_bytes > peak_gpu_allocated_bytes) {
     peak_gpu_allocated_bytes = current_gpu_allocated_bytes;
   }
+  mem_sample();
 }
 
 static void device_free(void *ptr, const size_t bytes) {
@@ -534,6 +602,11 @@ void pw_gpu_init(void) {
   opt_res_xc_dz = opt_res_xc_pairs && env_flag("CP2K_PW_GPU_RES_XC_DZ", true);
   opt_res_lazy_pot = opt_res && env_flag("CP2K_PW_GPU_RES_LAZY_POT", true);
   opt_res_stats = opt_res && env_flag("CP2K_PW_GPU_RES_STATS", true);
+  opt_mem_sample = env_flag("CP2K_PW_GPU_MEM_SAMPLE", true);
+  mem_obs.total = mem_obs.pw_at_min = 0;
+  mem_obs.min_free = SIZE_MAX;
+  mem_obs.samples = 0;
+  mem_obs.seconds = 0.0;
   {
     size_t mb;
     if (parse_unsigned(getenv("CP2K_PW_GPU_RES_RESERVE_MB"), SIZE_MAX / PW_GPU_MIB, &mb)) {
@@ -648,6 +721,7 @@ void pw_gpu_finalize(void) {
   res_lazy_grant = res_density_token = false;
   release_work_buffers();
   res_print_stats();
+  mem_print();
   for (int i = 0; i < RES_NSLOTS; i++) {
     free(res[i].samples);
     res[i].samples = NULL;
@@ -924,19 +998,8 @@ static void res_evict_all(void) {
 
 // Free device memory as reported by the runtime (false: unknown).
 static bool res_device_free_memory(size_t *free_bytes) {
-#if defined(PW_GPU_TEST_FREE_MEMORY)
-  *free_bytes = PW_GPU_TEST_FREE_MEMORY();
-  return true;
-#elif defined(__OFFLOAD_HIP)
   size_t total;
-  return hipMemGetInfo(free_bytes, &total) == hipSuccess;
-#elif defined(__OFFLOAD_CUDA)
-  size_t total;
-  return cudaMemGetInfo(free_bytes, &total) == cudaSuccess;
-#else
-  (void)free_bytes;
-  return false;
-#endif
+  return device_mem_info(free_bytes, &total);
 }
 
 // Reclaim idle caches/optional work buffers for persistent Hartree inputs, but
@@ -1850,6 +1913,7 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
     double scale, int grid_id, double epsilon_rho, double kappa, double beta,
     double mu, double scale_ec, double scale_ex, double gradient_cutoff,
     double smooth_range, int spherical) {
+  mem_sample_entry();
   if (!is_initialized || !opt_fused_xc || omp_get_num_threads() != 1) return 0;
   if (npts == NULL || exc_out == NULL || ngpts < 0 ||
       (nmaps != 1 && nmaps != 2) || grid_id <= 0 ||
@@ -2472,6 +2536,7 @@ int pw_gpu_res_density_c(const int nlevels, void *const *r_host, const int *npts
                          const int *t_npts, const int t_ngpts, const int t_nmaps,
                          const int t_grid_id, const int *t_map, double *rho_g_host,
                          double *rho_r_host, void *const *r_dev) {
+  mem_sample_entry();
   // The token is consumed by every attempt, including rejected ones.
   const bool lazy_allowed = res_density_token;
   res_density_token = false;
@@ -2642,6 +2707,7 @@ int pw_gpu_res_potential_c(const double *v_host, const int nlevels,
                            const int *nmaps, const int *grid_id, void *const *maps,
                            void *const *gidx, const double *rscale, const int aux,
                            const double fwd_scale, void *const *r_dev) {
+  mem_sample_entry();
   const int done = res_potential(v_host, nlevels, r_host, npts, ngpts, nmaps,
                                  grid_id, maps, gidx, rscale, aux, fwd_scale, r_dev);
   protected_xc_buffer = false;
@@ -2658,6 +2724,7 @@ int pw_gpu_res_potential_c(const double *v_host, const int nlevels,
  ******************************************************************************/
 int pw_gpu_res_vtot_prepare_c(const double *vh_host, const double *vxc_host,
                               const size_t n, const double dvol) {
+  mem_sample_entry();
   if (!is_initialized || !opt_res_pot || omp_get_num_threads() != 1 || n == 0 ||
       vh_host == NULL || n > (size_t)INT_MAX) {
     return 0;
@@ -2767,6 +2834,7 @@ int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host
                                const double *infl_host, double *rho_tot_host,
                                const size_t ngpts, const size_t nprefix,
                                const int *npts) {
+  mem_sample_entry();
   res_hartree.pending = false;
   if (!is_initialized || !opt_res_hartree || !opt_map_cache ||
       omp_get_num_threads() != 1) {

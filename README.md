@@ -1,35 +1,71 @@
-# CP2K 2026.2 · MI50 Stage 6
+# CP2K 2026.2 · Stage 7 Final (MI50 & RX 9070 XT Dual-GPU)
 
-本仓库记录 AMD MI50（gfx906）上的 CP2K 2026.2 Stage 6 GPU 流水线改动。**仓库根目录中的 `src/`、`tests/` 是历史增量文件；GitHub 自动生成的 “Source code” 下载不是完整可构建源码。** 完整交付请下载下面的专用 Release 资产。
+本仓库记录 AMD Instinct MI50（gfx906）与 Radeon RX 9070 XT（gfx1201）上的 CP2K 2026.2 Stage 7 最终优化版。
 
-[完整源码与构建包：Stage 6 r3](https://github.com/lunncing/cp2k-rocm-mi50/releases/tag/v2026.2-mi50-stage6-r3)
+**Stage 7 已经定版并停止进一步优化，支持每张卡唯一一套正式构建。**
+仓库根目录中的 、 为核心改动源码与运行适配层。完整可直接构建的源码包请下载下方的 Release 专用资产。
 
-专用资产 `cp2k-2026.2-mi50-stage6-source-20261106-r3.tar.gz` 包含 CP2K 根 CMake、完整 `src/data/tests/tools`、上游公开算例、许可证、构建/运行入口和逐文件校验清单。该包源自目标机实际使用的完整源码，物理代码保持原始字节与权限；仅修正一处 ELPA mock 的过期预期，并附原始/替换摘要和补丁。
+## 最新正式发布
 
-这是面向既有 Ubuntu / ROCm 环境的源码交付。Docker 镜像、ROCm、Spack 和已安装依赖不在归档内；需要保留包内 README 列出的精确依赖。它不是包含所有依赖的离线安装器。
+👉 **[CP2K 2026.2 Stage 7 Final 完整发布资产与操作手册](https://github.com/lunncing/cp2k-rocm-mi50/releases/tag/v2026.2-stage7-final)**
 
-```bash
-archive=cp2k-2026.2-mi50-stage6-source-20261106-r3.tar.gz
-sha256sum -c "$archive.sha256"
-tar -xzf "$archive"
-package="$PWD/${archive%.tar.gz}"
-bash "$package/scripts/verify.sh" --archive "$PWD/$archive" --launcher-tests
-bash "$package/scripts/build.sh" --prefix "$HOME/cp2k-mi50-stage6-release-r3" --jobs 16
-bash "$package/scripts/run.sh" --prefix "$HOME/cp2k-mi50-stage6-release-r3" --check
-```
+Release 中包含以下专用资产：
+- （9053 项完整源码，包含根 CMakeLists.txt、src、data、tests、tools、许可证及构建脚本）
+- （相对 CP2K 2026.2 原版的完整累积补丁）
+- （完整 Git 历史归档）
+-  /  / （完整操作说明书，涵盖单卡运行、独立双卡 A/B 并发、全部 20 个诊断变量、显存预算与故障排查）
+- （校验清单）
 
-使用新的空安装目录。编译完成后，在具体算例目录运行：
+---
 
-```bash
-"$HOME/cp2k-mi50-stage6-release-r3/bin/cp2k.psmp" -i input.inp -o run.out
-```
+## 核心特性与 Stage 7 收益
 
-运行入口固定绑定 MI50 UUID，采用单 MPI rank；默认 OpenMP 16 线程、OpenBLAS 1 线程，缓存跨进程保留。MI50 不设置默认 8 GiB 限制。此入口不跟随 `use_9070xt` 切卡，也不代表多卡已验收；源码的其它运行能力和旧安装仍保留。
+1. **流水线全显存常驻（VRAM Residency）**：
+   - 彻底消除 SCF 迭代中实空间网格与 G 空间密度的主机 PCIe 往返；
+   - 延迟回传窗口（Lazy Retention）将中间势（{	ext{tot}}$, {	ext{xc}}$, {	ext{H}}$）永久留在显存；
+   - 自然序 FFT 盒子流式处理，完全旁路 scatter/gather。
+2. **算子融合与实数配对 FFT**：
+   - 密度的逆向 FFT 顺带计算 $ 方向梯度（$\partialho/\partial z$），XC 每步少做一次三维 FFT；
+   - 自然序 XC 实数配对 FFT（7 次 3D FFT 缩减为 5 次）；
+   - 原生 PBE 泛函导数融合核。
+3. **Stage 7 网格建立并行化**：
+   - 启动时的网格建立（赋值、计数、映射、gidx、壳层与 gather）实现完整多线程并行，大幅缩短几何优化/多次单点计算的初始化冷启动时间。
+4. **两张卡各一套构建并存**：
+   - **MI50**（PCI , gfx906）：位于 ，运行于固定容器环境；
+   - **RX 9070 XT**（PCI , gfx1201）：位于 ，主机原生运行；
+   - 既有主要科学计算库（ELPA、DFT-D4、SIRIUS、COSMA、DLA-Future、DBCSR）功能完整保留。
 
-具体构建、算例和测试结果按归档摘要记录在同一 Release 的 `VALIDATION.md`。PW residency 与 ELPA mock、真实 MI50 运行、独立打包审查分别报告。独立的旧 `pw_gpu_integrated` 测试入口仍缺两个自然序内核的 mock，链接失败；不能宣称全部 CP2K 测试通过。真实 ELPA 对角化、多 rank、GEO_OPT/MD、UKS 与非正交输入尚未全面验收，累积 Stage 6 物理源码也尚无完整独立审查。
+---
 
-旧 `deliver_stage6_full_20261106.tar.gz` 是增量覆盖包，保留用于追溯，已被上述完整源码包替代。原版 CP2K 及各组件版权和许可证继续适用，详见包内 `LICENSE`、`NOTICE` 与源码文件头。
+## 基准实测数据（84 原子电解液团簇，16 线程）
 
-## ELPA 调用封装优化
+| GPU / Cutoff | SCF 内循环步数 | 能量绝对偏差 / Ha | 最大力偏差 / Ha·bohr⁻¹ | CP2K 最终总耗时 | 平均单步 SCF 耗时 |
+|---|:---:|:---:|:---:|:---:|:---:|
+| **MI50** / 500 Ry | 9 步 | 1.70e-13 | 2.39e-12 | **12.58 s** | **0.48 s / 步** |
+| **MI50** / 320 Ry | 12 步 | 2.27e-13 | 2.60e-13 | **8.87 s** | **0.30 s / 步** |
+| **RX 9070 XT** / 500 Ry | 9 步 | 1.14e-13 | 7.18e-13 | **16.30 s** | **0.83 s / 步** |
+| **RX 9070 XT** / 320 Ry | 12 步 | 2.85e-13 | 2.76e-12 | **13.14 s** | **0.60 s / 步** |
 
-Stage 6 r3 已包含 ELPA 对象/setup 复用、GPU/CPU kernel 选择及 QR 状态处理；本次将根目录 mock 测试与 r3 已接受版本对齐，生产代码未变。参见[优化与启用说明](docs/ELPA-OPTIMIZATION.md)和[测试说明](tests/elpa_gpu/README.md)。现有套件通过 32 个 mock 配置及无 ELPA 编译检查；真实 GPU 对角化、多 MPI rank、ELPA 数值准确性与性能仍待验收。
+> 注：四组回归全部退出码为 0，数值严格通过 $|\Delta E| \le 10^{-10}$ Ha、全部 84 原子 252 个力分量最大差 $\le 10^{-9}$ Ha/bohr 门槛，底层 [PW_GPU] 路径 fallback 均为 0。
+
+---
+
+## 快速使用
+
+加载环境并选择目标 GPU：
+
+
+
+运行计算：
+
+
+
+支持两张卡同时计算互不干扰的两个独立体系（例如 MI50 算体系 A，RX 算体系 B），具体命令与排错说明详见 [操作说明](docs/STAGE7-MANUAL.md)。
+
+---
+
+## 历史发布
+
+- [v2026.2-elpa-wrapper-r1](https://github.com/lunncing/cp2k-rocm-mi50/releases/tag/v2026.2-elpa-wrapper-r1)（ELPA 调用封装源码补充版）
+- [v2026.2-mi50-stage6-r3](https://github.com/lunncing/cp2k-rocm-mi50/releases/tag/v2026.2-mi50-stage6-r3)（Stage 6 完整发布版）
+- [v2026.2-mi50-stage6](https://github.com/lunncing/cp2k-rocm-mi50/releases/tag/v2026.2-mi50-stage6)（Stage 6 初版补丁）

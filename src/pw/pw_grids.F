@@ -440,7 +440,8 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER :: routineN = 'pw_grid_create_ghatmap'
 
-      INTEGER                                            :: gpt, handle, l, m, mn, n
+      INTEGER                                            :: gpt, handle, j, l, m, mn, n, ngpts_l, &
+                                                            nmap, nrow, span
 
       CALL timeset(routineN, handle)
 
@@ -449,6 +450,38 @@ CONTAINS
 
       ! mapping of map_x( g_hat(i,j)) to g_hatmap
       ! the second index is for switching from gather(1) to scatter(2)
+      IF (pw_grid%para%mode /= PW_MODE_DISTRIBUTED) THEN
+         ! As below, in parallel: every row is initialized to minus one and then the entries
+         ! of the G-vectors are set.
+         ngpts_l = SIZE(pw_grid%gsq)
+         nrow = SIZE(pw_grid%g_hatmap, 1)
+         nmap = SIZE(pw_grid%g_hatmap, 2)
+         span = pw_grid%grid_span
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(ngpts_l, nmap, nrow, pw_grid, span) PRIVATE(gpt, j, l, m, n)
+         DO gpt = 1, nrow
+            DO j = 1, nmap
+               pw_grid%g_hatmap(gpt, j) = -1
+            END DO
+            IF (gpt <= ngpts_l) THEN
+               l = pw_grid%mapl%pos(pw_grid%g_hat(1, gpt))
+               m = pw_grid%mapm%pos(pw_grid%g_hat(2, gpt))
+               n = pw_grid%mapn%pos(pw_grid%g_hat(3, gpt))
+               !ATTENTION: C-mapping [start-index=0] !!!!
+               !ATTENTION: potential integer overflow !!!!
+               pw_grid%g_hatmap(gpt, 1) = l + pw_grid%npts(1)*(m + pw_grid%npts(2)*n)
+               IF (span == HALFSPACE) THEN
+                  l = pw_grid%mapl%neg(pw_grid%g_hat(1, gpt))
+                  m = pw_grid%mapm%neg(pw_grid%g_hat(2, gpt))
+                  n = pw_grid%mapn%neg(pw_grid%g_hat(3, gpt))
+                  pw_grid%g_hatmap(gpt, 2) = l + pw_grid%npts(1)*(m + pw_grid%npts(2)*n)
+               END IF
+            END IF
+         END DO
+!$OMP END PARALLEL DO
+         CALL timestop(handle)
+         RETURN
+      END IF
+
       ASSOCIATE (g_hat => pw_grid%g_hat, g_hatmap => pw_grid%g_hatmap, pmapl => pw_grid%mapl%pos, &
                  pmapm => pw_grid%mapm%pos, pmapn => pw_grid%mapn%pos, nmapl => pw_grid%mapl%neg, &
                  nmapm => pw_grid%mapm%neg, nmapn => pw_grid%mapn%neg, ngpts => SIZE(pw_grid%gsq), &
@@ -1378,54 +1411,61 @@ CONTAINS
       REAL(KIND=dp), INTENT(IN)                          :: cutoff
       INTEGER, DIMENSION(:, :), INTENT(OUT)              :: yz_mask
 
-      INTEGER                                            :: l, m, mm, n, n_upperlimit, nlim(2), nn
+      INTEGER                                            :: l, m, mm, n, n_upperlimit, nlim(2), nn, &
+                                                            span
       INTEGER(KIND=int_8)                                :: gpt
+      INTEGER, DIMENSION(2, 3)                           :: bounds
       REAL(KIND=dp)                                      :: length, length_x, length_y, length_z
 
-      ASSOCIATE (bounds => pw_grid%bounds)
+      bounds = pw_grid%bounds
+      span = pw_grid%grid_span
 
-         IF (pw_grid%grid_span == HALFSPACE) THEN
-            n_upperlimit = 0
-         ELSE IF (pw_grid%grid_span == FULLSPACE) THEN
-            n_upperlimit = bounds(2, 3)
-         ELSE
-            CPABORT("No type set for the grid")
-         END IF
+      IF (span == HALFSPACE) THEN
+         n_upperlimit = 0
+      ELSE IF (span == FULLSPACE) THEN
+         n_upperlimit = bounds(2, 3)
+      ELSE
+         CPABORT("No type set for the grid")
+      END IF
 
-         ! finds valid g-points within grid
-         gpt = 0
-         IF (pw_grid%para%mode == PW_MODE_LOCAL) THEN
-            nlim(1) = bounds(1, 3)
-            nlim(2) = n_upperlimit
-         ELSE IF (pw_grid%para%mode == PW_MODE_DISTRIBUTED) THEN
-            n = n_upperlimit - bounds(1, 3) + 1
-            nlim = get_limit(n, mp_comm%num_pe, mp_comm%mepos)
-            nlim = nlim + bounds(1, 3) - 1
-         ELSE
-            CPABORT("para % mode not specified")
-         END IF
+      ! finds valid g-points within grid
+      gpt = 0
+      IF (pw_grid%para%mode == PW_MODE_LOCAL) THEN
+         nlim(1) = bounds(1, 3)
+         nlim(2) = n_upperlimit
+      ELSE IF (pw_grid%para%mode == PW_MODE_DISTRIBUTED) THEN
+         n = n_upperlimit - bounds(1, 3) + 1
+         nlim = get_limit(n, mp_comm%num_pe, mp_comm%mepos)
+         nlim = nlim + bounds(1, 3) - 1
+      ELSE
+         CPABORT("para % mode not specified")
+      END IF
 
-         yz_mask = 0
-         DO n = nlim(1), nlim(2)
-            nn = n - bounds(1, 3) + 1
-            DO m = bounds(1, 2), bounds(2, 2)
-               mm = m - bounds(1, 2) + 1
-               DO l = bounds(1, 1), bounds(2, 1)
-                  IF (pw_grid%grid_span == HALFSPACE .AND. n == 0) THEN
-                     IF ((m == 0 .AND. l > 0) .OR. (m > 0)) CYCLE
-                  END IF
+      ! every plane n updates only its own column of yz_mask
+      yz_mask = 0
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(bounds, cutoff, h_inv, nlim, span, yz_mask) &
+!$OMP             PRIVATE(l, length, length_x, length_y, length_z, m, mm, n, nn) &
+!$OMP             REDUCTION(+:gpt) SCHEDULE(DYNAMIC, 1)
+      DO n = nlim(1), nlim(2)
+         nn = n - bounds(1, 3) + 1
+         DO m = bounds(1, 2), bounds(2, 2)
+            mm = m - bounds(1, 2) + 1
+            DO l = bounds(1, 1), bounds(2, 1)
+               IF (span == HALFSPACE .AND. n == 0) THEN
+                  IF ((m == 0 .AND. l > 0) .OR. (m > 0)) CYCLE
+               END IF
 
-                  CALL pw_vec_length(h_inv, length_x, length_y, length_z, length, l, m, n)
+               CALL pw_vec_length(h_inv, length_x, length_y, length_z, length, l, m, n)
 
-                  IF (0.5_dp*length <= cutoff) THEN
-                     gpt = gpt + 1
-                     yz_mask(mm, nn) = yz_mask(mm, nn) + 1
-                  END IF
+               IF (0.5_dp*length <= cutoff) THEN
+                  gpt = gpt + 1
+                  yz_mask(mm, nn) = yz_mask(mm, nn) + 1
+               END IF
 
-               END DO
             END DO
          END DO
-      END ASSOCIATE
+      END DO
+!$OMP END PARALLEL DO
 
       ! number of g-vectors for grid
       IF (pw_grid%para%mode == PW_MODE_DISTRIBUTED) THEN
@@ -1454,10 +1494,12 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'pw_grid_assign'
 
-      INTEGER                                            :: gpt, handle, i, ip, l, lby, lbz, ll, m, &
-                                                            mm, n, n_upperlimit, nn
+      INTEGER                                            :: cnt, gpt, handle, i, ip, l, lby, lbz, ll, &
+                                                            m, mm, n, n_upperlimit, nlo, nn, span
       INTEGER(KIND=int_8)                                :: gpt_global
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: plane_start
       INTEGER, DIMENSION(2, 3)                           :: bol, bounds
+      LOGICAL                                            :: found_g0
       REAL(KIND=dp)                                      :: length, length_x, length_y, length_z
 
       CALL timeset(routineN, handle)
@@ -1476,11 +1518,42 @@ CONTAINS
 
       ! finds valid g-points within grid
       IF (pw_grid%para%mode == PW_MODE_LOCAL) THEN
-         gpt = 0
-         DO n = bounds(1, 3), n_upperlimit
+         ! The points of plane n follow those of the planes before it, in the order of the
+         ! sequential loop: count every plane, then fill the planes in parallel.
+         span = pw_grid%grid_span
+         nlo = bounds(1, 3)
+         ALLOCATE (plane_start(nlo:MAX(nlo, n_upperlimit) + 1))
+         plane_start(:) = 0
+!$OMP PARALLEL DEFAULT(NONE) SHARED(bounds, cutoff, h_inv, n_upperlimit, nlo, plane_start, pw_grid, span) &
+!$OMP          PRIVATE(cnt, gpt, l, length, length_x, length_y, length_z, m, n)
+!$OMP DO SCHEDULE(DYNAMIC, 1)
+         DO n = nlo, n_upperlimit
+            cnt = 0
             DO m = bounds(1, 2), bounds(2, 2)
                DO l = bounds(1, 1), bounds(2, 1)
-                  IF (pw_grid%grid_span == HALFSPACE .AND. n == 0) THEN
+                  IF (span == HALFSPACE .AND. n == 0) THEN
+                     IF ((m == 0 .AND. l > 0) .OR. (m > 0)) CYCLE
+                  END IF
+
+                  CALL pw_vec_length(h_inv, length_x, length_y, length_z, length, l, m, n)
+
+                  IF (0.5_dp*length <= cutoff) cnt = cnt + 1
+               END DO
+            END DO
+            plane_start(n + 1) = cnt
+         END DO
+!$OMP END DO
+!$OMP SINGLE
+         DO n = nlo, n_upperlimit
+            plane_start(n + 1) = plane_start(n + 1) + plane_start(n)
+         END DO
+!$OMP END SINGLE
+!$OMP DO SCHEDULE(DYNAMIC, 1)
+         DO n = nlo, n_upperlimit
+            gpt = plane_start(n)
+            DO m = bounds(1, 2), bounds(2, 2)
+               DO l = bounds(1, 1), bounds(2, 1)
+                  IF (span == HALFSPACE .AND. n == 0) THEN
                      IF ((m == 0 .AND. l > 0) .OR. (m > 0)) CYCLE
                   END IF
 
@@ -1500,6 +1573,14 @@ CONTAINS
                END DO
             END DO
          END DO
+!$OMP END DO
+!$OMP END PARALLEL
+         IF (n_upperlimit >= nlo) THEN
+            gpt = plane_start(n_upperlimit + 1)
+         ELSE
+            gpt = 0
+         END IF
+         DEALLOCATE (plane_start)
 
       ELSE
 
@@ -1585,15 +1666,16 @@ CONTAINS
          CPASSERT(pw_grid%ngpts_cut == gpt_global)
       END IF
 
-      pw_grid%have_g0 = .FALSE.
-      pw_grid%first_gne0 = 1
+      found_g0 = .FALSE.
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(pw_grid) PRIVATE(gpt) REDUCTION(.OR.:found_g0)
       DO gpt = 1, pw_grid%ngpts_cut_local
-         IF (ALL(pw_grid%g_hat(:, gpt) == 0)) THEN
-            pw_grid%have_g0 = .TRUE.
-            pw_grid%first_gne0 = 2
-            EXIT
-         END IF
+         IF (pw_grid%g_hat(1, gpt) == 0 .AND. pw_grid%g_hat(2, gpt) == 0 .AND. &
+             pw_grid%g_hat(3, gpt) == 0) found_g0 = .TRUE.
       END DO
+!$OMP END PARALLEL DO
+      pw_grid%have_g0 = found_g0
+      pw_grid%first_gne0 = 1
+      IF (found_g0) pw_grid%first_gne0 = 2
 
       CALL pw_grid_set_maps(pw_grid%grid_span, pw_grid%g_hat, &
                             pw_grid%mapl, pw_grid%mapm, pw_grid%mapn, pw_grid%npts)
@@ -1624,55 +1706,74 @@ CONTAINS
       TYPE(map_pn), INTENT(INOUT)                        :: mapl, mapm, mapn
       INTEGER, DIMENSION(:), INTENT(IN)                  :: npts
 
-      INTEGER                                            :: gpt, l, m, n, ng
+      INTEGER                                            :: gpt, hi, lo, ng
+      INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: my_seen, seen
 
       ng = SIZE(g_hat, 2)
 
+      ! An entry of a map depends only on its own index; it is set for exactly the indices
+      ! that occur in g_hat. Find those in parallel, then set the entries.
+      lo = MIN(LBOUND(mapl%pos, 1), LBOUND(mapm%pos, 1), LBOUND(mapn%pos, 1))
+      hi = MAX(UBOUND(mapl%pos, 1), UBOUND(mapm%pos, 1), UBOUND(mapn%pos, 1))
+      ALLOCATE (seen(lo:hi, 3))
+      seen(:, :) = 0
+!$OMP PARALLEL DEFAULT(NONE) SHARED(g_hat, hi, lo, ng, seen) PRIVATE(gpt, my_seen)
+      ALLOCATE (my_seen(lo:hi, 3))
+      my_seen(:, :) = 0
+!$OMP DO
       DO gpt = 1, ng
-         l = g_hat(1, gpt)
-         m = g_hat(2, gpt)
-         n = g_hat(3, gpt)
-         IF (l < 0) THEN
-            mapl%pos(l) = l + npts(1)
-         ELSE
-            mapl%pos(l) = l
-         END IF
-         IF (m < 0) THEN
-            mapm%pos(m) = m + npts(2)
-         ELSE
-            mapm%pos(m) = m
-         END IF
-         IF (n < 0) THEN
-            mapn%pos(n) = n + npts(3)
-         ELSE
-            mapn%pos(n) = n
-         END IF
-
-         ! Generating the maps to the full 3-d space
-
-         IF (grid_span == HALFSPACE) THEN
-
-            IF (l <= 0) THEN
-               mapl%neg(l) = -l
-            ELSE
-               mapl%neg(l) = npts(1) - l
-            END IF
-            IF (m <= 0) THEN
-               mapm%neg(m) = -m
-            ELSE
-               mapm%neg(m) = npts(2) - m
-            END IF
-            IF (n <= 0) THEN
-               mapn%neg(n) = -n
-            ELSE
-               mapn%neg(n) = npts(3) - n
-            END IF
-
-         END IF
-
+         my_seen(g_hat(1, gpt), 1) = 1
+         my_seen(g_hat(2, gpt), 2) = 1
+         my_seen(g_hat(3, gpt), 3) = 1
       END DO
+!$OMP END DO NOWAIT
+!$OMP CRITICAL(pw_grid_set_maps_seen)
+      seen(:, :) = MAX(seen(:, :), my_seen(:, :))
+!$OMP END CRITICAL(pw_grid_set_maps_seen)
+      DEALLOCATE (my_seen)
+!$OMP END PARALLEL
+
+      CALL set_map_entries(mapl, seen(:, 1), lo, npts(1), grid_span)
+      CALL set_map_entries(mapm, seen(:, 2), lo, npts(2), grid_span)
+      CALL set_map_entries(mapn, seen(:, 3), lo, npts(3), grid_span)
+      DEALLOCATE (seen)
 
    END SUBROUTINE pw_grid_set_maps
+
+! **************************************************************************************************
+!> \brief The map entries of the indices i with seen(i) /= 0, as in the loop over g_hat that
+!>        pw_grid_set_maps replaces.
+!> \param map ...
+!> \param seen flags, seen(lo + k - 1) for index lo + k - 1
+!> \param lo lower bound of seen
+!> \param npts number of points along this direction
+!> \param grid_span ...
+! **************************************************************************************************
+   SUBROUTINE set_map_entries(map, seen, lo, npts, grid_span)
+      TYPE(map_pn), INTENT(INOUT)                        :: map
+      INTEGER, DIMENSION(:), INTENT(IN)                  :: seen
+      INTEGER, INTENT(IN)                                :: lo, npts, grid_span
+
+      INTEGER                                            :: i
+
+      DO i = LBOUND(map%pos, 1), UBOUND(map%pos, 1)
+         IF (seen(i - lo + 1) == 0) CYCLE
+         IF (i < 0) THEN
+            map%pos(i) = i + npts
+         ELSE
+            map%pos(i) = i
+         END IF
+         ! Generating the maps to the full 3-d space
+         IF (grid_span == HALFSPACE) THEN
+            IF (i <= 0) THEN
+               map%neg(i) = -i
+            ELSE
+               map%neg(i) = npts - i
+            END IF
+         END IF
+      END DO
+
+   END SUBROUTINE set_map_entries
 
 ! **************************************************************************************************
 !> \brief Allocate all (Pointer) Arrays in pw_grid
@@ -1766,12 +1867,13 @@ CONTAINS
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'pw_grid_sort'
 
-      INTEGER                                            :: handle, i, ig, ih, ip, is, it, ng, ngr
+      INTEGER                                            :: handle, i, ig, ih, ip, is, it, j, ng, ngr
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: idx
       INTEGER, ALLOCATABLE, DIMENSION(:, :)              :: int_tmp
       LOGICAL                                            :: g_found
       REAL(KIND=dp)                                      :: gig, gigr
-      REAL(KIND=dp), ALLOCATABLE, DIMENSION(:, :)        :: real_tmp
+      REAL(KIND=dp), CONTIGUOUS, DIMENSION(:, :), &
+         POINTER                                         :: real_tmp
 
       CALL timeset(routineN, handle)
 
@@ -1784,39 +1886,24 @@ CONTAINS
       ! within shells order wrt x,y,z
       CALL sort_shells(pw_grid%gsq, pw_grid%g_hat, idx)
 
-      ALLOCATE (real_tmp(3, ng))
-!$OMP PARALLEL DO DEFAULT(NONE) SHARED(idx, ng, pw_grid, real_tmp) PRIVATE(i)
+      ! Gather g and g_hat in the sorted order into new arrays that replace the old ones
+      ! (no copy back). g has the same shape (3, ng) as allocated in pw_grid_allocate.
+      ALLOCATE (real_tmp(3, ng), int_tmp(3, ng))
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(idx, int_tmp, ng, pw_grid, real_tmp) PRIVATE(i, j)
       DO i = 1, ng
-         real_tmp(1, i) = pw_grid%g(1, idx(i))
-         real_tmp(2, i) = pw_grid%g(2, idx(i))
-         real_tmp(3, i) = pw_grid%g(3, idx(i))
+         j = idx(i)
+         real_tmp(1, i) = pw_grid%g(1, j)
+         real_tmp(2, i) = pw_grid%g(2, j)
+         real_tmp(3, i) = pw_grid%g(3, j)
+         int_tmp(1, i) = pw_grid%g_hat(1, j)
+         int_tmp(2, i) = pw_grid%g_hat(2, j)
+         int_tmp(3, i) = pw_grid%g_hat(3, j)
       END DO
 !$OMP END PARALLEL DO
-!$OMP PARALLEL DO DEFAULT(NONE) SHARED(ng, pw_grid, real_tmp) PRIVATE(i)
-      DO i = 1, ng
-         pw_grid%g(1, i) = real_tmp(1, i)
-         pw_grid%g(2, i) = real_tmp(2, i)
-         pw_grid%g(3, i) = real_tmp(3, i)
-      END DO
-!$OMP END PARALLEL DO
-      DEALLOCATE (real_tmp)
-
-      ALLOCATE (int_tmp(3, ng))
-!$OMP PARALLEL DO DEFAULT(NONE) SHARED(idx, int_tmp, ng, pw_grid) PRIVATE(i)
-      DO i = 1, ng
-         int_tmp(1, i) = pw_grid%g_hat(1, idx(i))
-         int_tmp(2, i) = pw_grid%g_hat(2, idx(i))
-         int_tmp(3, i) = pw_grid%g_hat(3, idx(i))
-      END DO
-!$OMP END PARALLEL DO
-!$OMP PARALLEL DO DEFAULT(NONE) SHARED(int_tmp, ng, pw_grid) PRIVATE(i)
-      DO i = 1, ng
-         pw_grid%g_hat(1, i) = int_tmp(1, i)
-         pw_grid%g_hat(2, i) = int_tmp(2, i)
-         pw_grid%g_hat(3, i) = int_tmp(3, i)
-      END DO
-!$OMP END PARALLEL DO
-      DEALLOCATE (int_tmp)
+      DEALLOCATE (pw_grid%g)
+      pw_grid%g => real_tmp
+      NULLIFY (real_tmp)
+      CALL MOVE_ALLOC(int_tmp, pw_grid%g_hat)
 
       DEALLOCATE (idx)
 
@@ -1831,15 +1918,25 @@ CONTAINS
             END IF
          ELSE
             ALLOCATE (pw_grid%gidx(1:ngr))
-            pw_grid%gidx = 0
-            ! first try as many trivial associations as possible
-            it = 0
+            ! first try as many trivial associations as possible: the G-vectors before the
+            ! first one that differs from the reference grid (it = that position - 1)
+            it = ngr
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(ngr, pw_grid, ref_grid) PRIVATE(ig) REDUCTION(MIN:it)
             DO ig = 1, ngr
-               IF (.NOT. ALL(pw_grid%g_hat(1:3, ig) &
-                             == ref_grid%g_hat(1:3, ig))) EXIT
-               pw_grid%gidx(ig) = ig
-               it = ig
+               IF (pw_grid%g_hat(1, ig) /= ref_grid%g_hat(1, ig) .OR. &
+                   pw_grid%g_hat(2, ig) /= ref_grid%g_hat(2, ig) .OR. &
+                   pw_grid%g_hat(3, ig) /= ref_grid%g_hat(3, ig)) it = MIN(it, ig - 1)
             END DO
+!$OMP END PARALLEL DO
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(it, ngr, pw_grid) PRIVATE(ig)
+            DO ig = 1, ngr
+               IF (ig <= it) THEN
+                  pw_grid%gidx(ig) = ig
+               ELSE
+                  pw_grid%gidx(ig) = 0
+               END IF
+            END DO
+!$OMP END PARALLEL DO
             ! now for the ones that could not be done
             IF (ng == ngr .AND. use_gidx_table(pw_grid, ref_grid)) THEN
                ! for the case pw_grid <= ref_grid: direct lookup of the (unique) Miller indices
@@ -1957,8 +2054,10 @@ CONTAINS
       REAL(KIND=dp), DIMENSION(1:n), INTENT(INOUT)       :: arr
       INTEGER, DIMENSION(1:n), INTENT(INOUT)             :: idx
 
-      INTEGER                                            :: c, hi, i, lo, mid, nchunk, nthreads, &
-                                                            width
+      CHARACTER(len=*), PARAMETER                        :: routineN = 'sort_gsq'
+
+      INTEGER                                            :: c, handle, hi, i, lo, mid, nchunk, &
+                                                            nthreads, width
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: bounds, tmp_idx
       LOGICAL                                            :: in_tmp
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: tmp_arr
@@ -1970,6 +2069,7 @@ CONTAINS
          CALL sort(arr, n, idx)
          RETURN
       END IF
+      CALL timeset(routineN, handle)
 
       nchunk = 1
       DO WHILE (nchunk < nthreads .AND. nchunk < 256)
@@ -2022,6 +2122,7 @@ CONTAINS
 !$OMP END PARALLEL DO
       END IF
       DEALLOCATE (bounds, tmp_arr, tmp_idx)
+      CALL timestop(handle)
 
    END SUBROUTINE sort_gsq
 
@@ -2085,7 +2186,8 @@ CONTAINS
       TYPE(pw_grid_type), INTENT(IN)                     :: pw_grid, ref_grid
       LOGICAL                                            :: ok
 
-      INTEGER                                            :: d
+      INTEGER                                            :: d, hi1, hi2, hi3, ih, lo1, lo2, lo3, &
+                                                            nref
       INTEGER(KIND=int_8)                                :: npts
 
       ok = ALLOCATED(ref_grid%g_hat) .AND. ASSOCIATED(ref_grid%gsq) .AND. &
@@ -2103,10 +2205,28 @@ CONTAINS
       ok = SIZE(ref_grid%g_hat, 2) >= SIZE(ref_grid%gsq) .AND. SIZE(ref_grid%g_hat, 1) == 3 .AND. &
            SIZE(pw_grid%g_hat, 1) == 3
       IF (.NOT. ok) RETURN
-      DO d = 1, 3
-         ok = ok .AND. MINVAL(ref_grid%g_hat(d, 1:SIZE(ref_grid%gsq))) >= ref_grid%bounds(1, d) .AND. &
-              MAXVAL(ref_grid%g_hat(d, 1:SIZE(ref_grid%gsq))) <= ref_grid%bounds(2, d)
+      ! MINVAL/MAXVAL of g_hat(d, 1:nref) for d = 1, 2, 3 in one parallel pass
+      nref = SIZE(ref_grid%gsq)
+      lo1 = HUGE(0)
+      lo2 = HUGE(0)
+      lo3 = HUGE(0)
+      hi1 = -HUGE(0)
+      hi2 = -HUGE(0)
+      hi3 = -HUGE(0)
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(nref, ref_grid) PRIVATE(ih) &
+!$OMP             REDUCTION(MIN:lo1, lo2, lo3) REDUCTION(MAX:hi1, hi2, hi3)
+      DO ih = 1, nref
+         lo1 = MIN(lo1, ref_grid%g_hat(1, ih))
+         lo2 = MIN(lo2, ref_grid%g_hat(2, ih))
+         lo3 = MIN(lo3, ref_grid%g_hat(3, ih))
+         hi1 = MAX(hi1, ref_grid%g_hat(1, ih))
+         hi2 = MAX(hi2, ref_grid%g_hat(2, ih))
+         hi3 = MAX(hi3, ref_grid%g_hat(3, ih))
       END DO
+!$OMP END PARALLEL DO
+      ok = lo1 >= ref_grid%bounds(1, 1) .AND. hi1 <= ref_grid%bounds(2, 1) .AND. &
+           lo2 >= ref_grid%bounds(1, 2) .AND. hi2 <= ref_grid%bounds(2, 2) .AND. &
+           lo3 >= ref_grid%bounds(1, 3) .AND. hi3 <= ref_grid%bounds(2, 3)
 
    END FUNCTION use_gidx_table
 
@@ -2125,21 +2245,55 @@ CONTAINS
       TYPE(pw_grid_type), INTENT(IN)                     :: ref_grid
       INTEGER, INTENT(IN)                                :: it, ngr
 
-      INTEGER                                            :: bad, ig, ih, l, m, n
+      CHARACTER(len=*), PARAMETER                        :: routineN = 'gidx_from_table'
+
+      INTEGER                                            :: bad, handle, hi1, hi2, hi3, ig, ih, l, &
+                                                            lo1, lo2, lo3, m, n
       INTEGER, ALLOCATABLE, DIMENSION(:, :, :)           :: table
       INTEGER, DIMENSION(2, 3)                           :: rb
       REAL(KIND=dp)                                      :: gig, gigr
 
-      rb = ref_grid%bounds
+      IF (it >= ngr) RETURN
+      CALL timeset(routineN, handle)
+
+      ! Only the Miller indices of G-vectors it+1:ngr are looked up: the table covers the box
+      ! they span within the reference bounds, filled from the reference G-vectors in it.
+      lo1 = HUGE(0)
+      lo2 = HUGE(0)
+      lo3 = HUGE(0)
+      hi1 = -HUGE(0)
+      hi2 = -HUGE(0)
+      hi3 = -HUGE(0)
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(it, ngr, pw_grid) PRIVATE(ig) &
+!$OMP             REDUCTION(MIN:lo1, lo2, lo3) REDUCTION(MAX:hi1, hi2, hi3)
+      DO ig = it + 1, ngr
+         lo1 = MIN(lo1, pw_grid%g_hat(1, ig))
+         lo2 = MIN(lo2, pw_grid%g_hat(2, ig))
+         lo3 = MIN(lo3, pw_grid%g_hat(3, ig))
+         hi1 = MAX(hi1, pw_grid%g_hat(1, ig))
+         hi2 = MAX(hi2, pw_grid%g_hat(2, ig))
+         hi3 = MAX(hi3, pw_grid%g_hat(3, ig))
+      END DO
+!$OMP END PARALLEL DO
+      rb(1, 1) = MAX(lo1, ref_grid%bounds(1, 1))
+      rb(1, 2) = MAX(lo2, ref_grid%bounds(1, 2))
+      rb(1, 3) = MAX(lo3, ref_grid%bounds(1, 3))
+      rb(2, 1) = MIN(hi1, ref_grid%bounds(2, 1))
+      rb(2, 2) = MIN(hi2, ref_grid%bounds(2, 2))
+      rb(2, 3) = MIN(hi3, ref_grid%bounds(2, 3))
       ALLOCATE (table(rb(1, 1):rb(2, 1), rb(1, 2):rb(2, 2), rb(1, 3):rb(2, 3)))
 !$OMP PARALLEL DO DEFAULT(NONE) SHARED(rb, table) PRIVATE(n)
       DO n = rb(1, 3), rb(2, 3)
          table(:, :, n) = 0
       END DO
 !$OMP END PARALLEL DO
-!$OMP PARALLEL DO DEFAULT(NONE) SHARED(ref_grid, table) PRIVATE(ih)
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(rb, ref_grid, table) PRIVATE(ih, l, m, n)
       DO ih = 1, SIZE(ref_grid%gsq)
-         table(ref_grid%g_hat(1, ih), ref_grid%g_hat(2, ih), ref_grid%g_hat(3, ih)) = ih
+         l = ref_grid%g_hat(1, ih)
+         m = ref_grid%g_hat(2, ih)
+         n = ref_grid%g_hat(3, ih)
+         IF (l >= rb(1, 1) .AND. l <= rb(2, 1) .AND. m >= rb(1, 2) .AND. m <= rb(2, 2) .AND. &
+             n >= rb(1, 3) .AND. n <= rb(2, 3)) table(l, m, n) = ih
       END DO
 !$OMP END PARALLEL DO
 
@@ -2169,6 +2323,7 @@ CONTAINS
             " G-vector", bad, pw_grid%g_hat(1:3, bad), pw_grid%gsq(bad)
          CPABORT("G vector not found")
       END IF
+      CALL timestop(handle)
 
    END SUBROUTINE gidx_from_table
 
@@ -2188,8 +2343,8 @@ CONTAINS
       CHARACTER(len=*), PARAMETER                        :: routineN = 'sort_shells'
       REAL(KIND=dp), PARAMETER                           :: small = 5.e-16_dp
 
-      INTEGER                                            :: handle, ig, ish, ng, nshell
-      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: shell_start
+      INTEGER                                            :: b, handle, ig, ish, k, nblk, ng, nshell
+      INTEGER, ALLOCATABLE, DIMENSION(:)                 :: seg_first, seg_shells, shell_start
       REAL(KIND=dp)                                      :: s_begin
 
       CALL timeset(routineN, handle)
@@ -2198,27 +2353,67 @@ CONTAINS
 ! might need to call lapack for machine precision.
 
       ! A shell starts where gsq leaves the first value of the current shell by at least small.
-      ! The shells are found sequentially; each one is then reordered independently.
+      ! gsq is sorted, so a step gsq(ig) - gsq(ig-1) >= small certainly starts a shell, and the
+      ! sequential search restarts there in the same state. Segments that begin at such steps
+      ! are therefore searched independently; each shell is then reordered independently.
       ng = SIZE(gsq)
-      nshell = 0
-      s_begin = -1.0_dp
-      DO ig = 1, ng
-         IF (.NOT. (ABS(gsq(ig) - s_begin) < small)) THEN
-            nshell = nshell + 1
-            s_begin = gsq(ig)
+      nblk = 1
+!$    nblk = omp_get_max_threads()
+!$    IF (omp_in_parallel()) nblk = 1
+      IF (ng < 65536) nblk = 1
+      ALLOCATE (seg_first(0:nblk), seg_shells(0:nblk))
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(gsq, nblk, ng, seg_first) PRIVATE(b, ig)
+      DO b = 0, nblk - 1
+         ig = INT(INT(b, int_8)*INT(ng, int_8)/INT(nblk, int_8)) + 1
+         IF (b > 0) THEN
+            DO WHILE (ig <= ng)
+               IF (.NOT. (gsq(ig) - gsq(ig - 1) < small)) EXIT
+               ig = ig + 1
+            END DO
          END IF
+         seg_first(b) = ig
       END DO
+!$OMP END PARALLEL DO
+      seg_first(nblk) = ng + 1
+
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(gsq, nblk, seg_first, seg_shells) PRIVATE(b, ig, k, s_begin) &
+!$OMP             SCHEDULE(DYNAMIC, 1)
+      DO b = 0, nblk - 1
+         k = 0
+         s_begin = -1.0_dp
+         DO ig = seg_first(b), seg_first(b + 1) - 1
+            IF (.NOT. (ABS(gsq(ig) - s_begin) < small)) THEN
+               k = k + 1
+               s_begin = gsq(ig)
+            END IF
+         END DO
+         seg_shells(b) = k
+      END DO
+!$OMP END PARALLEL DO
+      nshell = 0
+      DO b = 0, nblk - 1
+         k = seg_shells(b)
+         seg_shells(b) = nshell
+         nshell = nshell + k
+      END DO
+
       ALLOCATE (shell_start(nshell + 1))
-      nshell = 0
-      s_begin = -1.0_dp
-      DO ig = 1, ng
-         IF (.NOT. (ABS(gsq(ig) - s_begin) < small)) THEN
-            nshell = nshell + 1
-            shell_start(nshell) = ig
-            s_begin = gsq(ig)
-         END IF
+!$OMP PARALLEL DO DEFAULT(NONE) SHARED(gsq, nblk, seg_first, seg_shells, shell_start) &
+!$OMP             PRIVATE(b, ig, k, s_begin) SCHEDULE(DYNAMIC, 1)
+      DO b = 0, nblk - 1
+         k = seg_shells(b)
+         s_begin = -1.0_dp
+         DO ig = seg_first(b), seg_first(b + 1) - 1
+            IF (.NOT. (ABS(gsq(ig) - s_begin) < small)) THEN
+               k = k + 1
+               shell_start(k) = ig
+               s_begin = gsq(ig)
+            END IF
+         END DO
       END DO
+!$OMP END PARALLEL DO
       shell_start(nshell + 1) = ng + 1
+      DEALLOCATE (seg_first, seg_shells)
 
 !$OMP PARALLEL DO DEFAULT(NONE) SHARED(g_hat, idx, nshell, shell_start) PRIVATE(ish) &
 !$OMP             SCHEDULE(DYNAMIC, 4096)
@@ -2247,12 +2442,44 @@ CONTAINS
       INTEGER, DIMENSION(:), INTENT(INOUT)               :: idx
       INTEGER, INTENT(IN)                                :: s1, s2
 
-      INTEGER                                            :: i, ii, n1, n2, n3, ns
+      INTEGER, PARAMETER                                 :: nsmall = 64
+
+      INTEGER                                            :: i, ii, j, n1, n2, n3, ns, v
       INTEGER, ALLOCATABLE, DIMENSION(:)                 :: indl
+      INTEGER, DIMENSION(nsmall)                         :: sval
+      REAL(KIND=dp)                                      :: k
       REAL(KIND=dp), ALLOCATABLE, DIMENSION(:)           :: slen
+      REAL(KIND=dp), DIMENSION(nsmall)                   :: skey
 
       IF (s2 <= s1) RETURN
       ns = s2 - s1 + 1
+      IF (ns <= nsmall) THEN
+         ! Same keys and the same (stable) order as util's sort below, without heap scratch
+         DO i = 1, ns
+            ii = idx(s1 + i - 1)
+            n1 = g_hat(1, ii)
+            n2 = g_hat(2, ii)
+            n3 = g_hat(3, ii)
+            skey(i) = 1000.0_dp*REAL(n1, dp) + &
+                      REAL(n2, dp) + 0.001_dp*REAL(n3, dp)
+            sval(i) = ii
+         END DO
+         DO i = 2, ns
+            k = skey(i)
+            v = sval(i)
+            j = i - 1
+            DO WHILE (j >= 1)
+               IF (.NOT. (k < skey(j))) EXIT
+               skey(j + 1) = skey(j)
+               sval(j + 1) = sval(j)
+               j = j - 1
+            END DO
+            skey(j + 1) = k
+            sval(j + 1) = v
+         END DO
+         idx(s1:s2) = sval(1:ns)
+         RETURN
+      END IF
       ALLOCATE (indl(ns))
       ALLOCATE (slen(ns))
 
