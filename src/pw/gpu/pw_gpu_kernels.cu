@@ -312,6 +312,45 @@ void pw_gpu_launch_pbe_lda(const double *rho, const double *norm, double *e0,
 
 #include "pw_gpu_xc_ops.h"
 
+__global__ void pw_pbe_lsd_pointwise(const double *ra, const double *rb,
+    const double *norm, const double *na, const double *nb, double *e0,
+    double *era, double *erb, double *en, double *ena, double *enb,
+    size_t n, int grad, double epsilon, double sx, double sc) {
+  for (size_t point = (size_t)blockIdx.x * blockDim.x + threadIdx.x; point < n;
+       point += (size_t)blockDim.x * gridDim.x)
+    pw_pbe_lsd_elem(ra[point], rb[point], norm[point], na[point], nb[point],
+        epsilon, sx, sc, grad, grad >= 0 ? e0 + point : NULL, grad ? era + point : NULL,
+        grad ? erb + point : NULL, grad ? en + point : NULL,
+        grad ? ena + point : NULL, grad ? enb + point : NULL);
+}
+
+void pw_gpu_launch_pbe_lsd(const double *ra, const double *rb,
+    const double *norm, const double *na, const double *nb, double *e0,
+    double *era, double *erb, double *en, double *ena, double *enb,
+    size_t n, int grad, double epsilon, double sx, double sc, offloadStream_t stream) {
+  if (n) pw_pbe_lsd_pointwise<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, stream>>>(
+      ra, rb, norm, na, nb, e0, era, erb, en, ena, enb, n, grad, epsilon, sx, sc);
+}
+
+__global__ void pw_xc_pbe_lsd_combine_kernel(const double *ra, const double *rb,
+    double *ga0, double *ga1, double *ga2, double *gb0, double *gb1, double *gb2,
+    double *va, double *vb, double *energy, size_t n,
+    double epsilon, double sx, double sc, double cutoff, double smooth) {
+  for (size_t point = (size_t)blockIdx.x * blockDim.x + threadIdx.x; point < n;
+       point += (size_t)blockDim.x * gridDim.x)
+    pw_xc_pbe_lsd_combine_elem(ra, rb, ga0, ga1, ga2, gb0, gb1, gb2, va,
+                              vb, energy, point, epsilon, sx, sc, cutoff, smooth);
+}
+
+void pw_gpu_launch_xc_pbe_lsd_combine(const double *ra, const double *rb,
+    double *ga0, double *ga1, double *ga2, double *gb0, double *gb1, double *gb2,
+    double *va, double *vb, double *energy, size_t n,
+    double epsilon, double sx, double sc, double cutoff, double smooth, offloadStream_t stream) {
+  if (n) pw_xc_pbe_lsd_combine_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, stream>>>(
+      ra, rb, ga0, ga1, ga2, gb0, gb1, gb2, va, vb, energy, n,
+      epsilon, sx, sc, cutoff, smooth);
+}
+
 __global__ void pw_gpu_norm3_kernel(const double *g0, const double *g1,
     const double *g2, double *norm, size_t n) {
   for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
@@ -341,6 +380,13 @@ __global__ void pw_gpu_xc_cutoff_kernel(double *values, const double *rho,
   for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
        i += (size_t)blockDim.x * gridDim.x)
     values[i] = pw_xc_cutoff(values[i], rho[i], cutoff, range);
+}
+
+__global__ void pw_gpu_xc_cutoff_lsd_kernel(double *target, const double *ra,
+    const double *rb, size_t count, double cutoff, double range) {
+  for (size_t point = (size_t)blockIdx.x * blockDim.x + threadIdx.x; point < count;
+       point += (size_t)blockDim.x * gridDim.x)
+    target[point] = pw_xc_cutoff_lsd(target[point], ra[point], rb[point], cutoff, range);
 }
 
 __global__ void pw_gpu_xc_reduce_kernel(const double *values, double *partial,
@@ -374,6 +420,13 @@ void pw_gpu_launch_xc_cutoff(double *values, const double *rho, size_t n,
   if (n && range > 0.0)
     pw_gpu_xc_cutoff_kernel<<<pw_grid_blocks(n), PW_GPU_MAP_THREADS, 0, s>>>(
         values, rho, n, cutoff, range);
+}
+
+void pw_gpu_launch_xc_cutoff_lsd(double *target, const double *ra, const double *rb,
+    size_t count, double cutoff, double range, offloadStream_t stream) {
+  if (count && range > 0.0)
+    pw_gpu_xc_cutoff_lsd_kernel<<<pw_grid_blocks(count), PW_GPU_MAP_THREADS, 0, stream>>>(
+        target, ra, rb, count, cutoff, range);
 }
 
 void pw_gpu_launch_xc_reduce(const double *values, double *partial, size_t n,

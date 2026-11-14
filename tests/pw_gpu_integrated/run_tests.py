@@ -17,6 +17,8 @@ from integral_tests import run_integral_tests
 from grid_ops_tests import run_grid_ops_tests
 from kernel_body_tests import run_kernel_body_tests
 from xc_pipeline_tests import run_xc_pipeline_tests
+from mixing_tests import run_mixing_tests
+from cholesky_tests import run_cholesky_tests
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
@@ -27,7 +29,9 @@ def source_checks() -> None:
     for name in ("src/input_cp2k_global.F", "src/pw/pw_gpu.F", "src/pw/pw_methods.F",
                  "src/qs_collocate_density.F", "src/qs_ks_utils.F", "src/pw_env/rs_pw_interface.F",
                  "tests/pw_gpu_residency/test_res_bindings.F",
-                 "src/cp_ddapc_util.F", "src/xc/xc_pbe.F", "src/xc/xc.F", "tests/pw_gpu_integrated/test_grid_ops.F",
+                 "src/cp_ddapc_util.F", "src/cp_ddapc.F", "src/qs_ks_methods.F", "src/qs_scf.F",
+                 "src/fm/cp_fm_elpa.F", "src/fm/cp_fm_cholesky.F", "src/qs_gspace_mixing.F",
+                 "src/xc/xc_pbe.F", "src/xc/xc.F", "tests/pw_gpu_integrated/test_grid_ops.F",
                  "tests/pw_gpu_integrated/test_pw_integral.F", "tests/pw_gpu_integrated/test_xc_pipeline.F"):
         lines = (ROOT / name).read_text().splitlines()
         long_lines = [(i, len(line)) for i, line in enumerate(lines, 1) if len(line) > 132]
@@ -53,6 +57,10 @@ def source_checks() -> None:
 
 
 def cases():
+    yield "UKS PBE-LSD and spin exchange symmetry", ["uks"], {}, 0, 0
+    yield "UKS disabled fallback", ["uks"], {"CP2K_PW_GPU_UKS": "0"}, 0, 0
+    yield "UKS full pipeline disabled", ["uks"], {"CP2K_PW_GPU_XC_FULL_PIPELINE": "0"}, 0, 0
+    yield "UKS memory budget fallback", ["uks_limits"], {}, 0, 1
     yield "XC full pipeline and VRAM transfer contract", ["xc_pipeline"], {}, 0, 0
     yield "XC full pipeline without map caching", ["xc_pipeline"], {"CP2K_PW_GPU_MAP_CACHE": "0"}, 0, 0
     yield "XC full pipeline exact budgets and reclamation", ["xc_limits"], {}, 0, 1
@@ -106,6 +114,7 @@ def cases():
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sanitize", action="store_true", help="enable ASan and UBSan")
+    parser.add_argument("--cholesky-only", action="store_true", help="run only the Cholesky C and Fortran tests")
     args = parser.parse_args()
     if os.name == "posix":
         import resource
@@ -142,6 +151,9 @@ def main() -> None:
         clean_env["OPENBLAS_NUM_THREADS"] = "1"
         clean_env["ASAN_OPTIONS"] = "detect_leaks=1:halt_on_error=1"
         clean_env["UBSAN_OPTIONS"] = "halt_on_error=1:print_stacktrace=1"
+        run_cholesky_tests(build, compiler, flags, include, blas, clean_env, args.sanitize)
+        if args.cholesky_only:
+            return
         run_kernel_body_tests(build, flags, include, clean_env)
         count = 0
         for name, arguments, overrides, status, notices in cases():
@@ -161,6 +173,7 @@ def main() -> None:
         run_integral_tests(build, compiler, flags, include, blas, clean_env, args.sanitize)
         run_xc_pipeline_tests(build, compiler, flags, include, blas, clean_env, args.sanitize)
         run_grid_ops_tests(build, compiler, flags, include, blas, clean_env, args.sanitize)
+        run_mixing_tests(build, clean_env, args.sanitize)
 
 
 if __name__ == "__main__":

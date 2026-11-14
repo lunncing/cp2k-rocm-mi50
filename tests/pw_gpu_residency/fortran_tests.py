@@ -16,12 +16,18 @@ def run_fortran_tests(build, cc, flags, include, blas, env):
 
     wrapper = (ROOT / "src/pw/pw_gpu.F").read_text()
     functions = ("pw_gpu_res_enabled", "pw_gpu_res_integrate_r", "res_grid_ok", "res_rs_ok",
-                 "pw_gpu_res_vtot_prepare", "pw_gpu_res_vtot_skip_host")
+                 "pw_gpu_res_vtot_prepare", "pw_gpu_res_vtot_skip_host", "pw_gpu_uks_enabled",
+                 "res_gs_ok", "pw_gpu_res_hartree_uks_begin", "pw_gpu_res_hartree_energy",
+                 "pw_gpu_res_hartree_finish", "pw_gpu_res_hartree_begin")
     subroutines = ("pw_gpu_res_ensure_host_ptr", "pw_gpu_res_ensure_host_r", "pw_gpu_res_ensure_host_g",
-                   "pw_gpu_res_set_lazy", "pw_gpu_res_defer_density", "pw_gpu_res_discard")
+                   "pw_gpu_res_set_lazy", "pw_gpu_res_defer_density", "pw_gpu_res_discard",
+                   "pw_gpu_res_allow_density", "pw_gpu_res_hartree_cancel")
     bindings = "\n".join(routine(wrapper, n, True) for n in functions)
     bindings += "\n".join(routine(wrapper, n) for n in subroutines)
     (build / "res_bindings.inc").write_text(bindings)
+    ddapc = (ROOT / "src/cp_ddapc.F").read_text()
+    (build / "res_dispatch.inc").write_text(routine(ddapc, "qs_ks_periodic_device") +
+                                          routine(ddapc, "qs_ks_ddapc_device_begin"))
     methods = (ROOT / "src/pw/pw_methods.F").read_text().replace("$ (", "$(")
     for name, template, function in (
         ("host_integrate", "pw_integrate_function_${kind}$_${space}$", True),

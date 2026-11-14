@@ -47,6 +47,7 @@ MODULE xc_pipeline_fixture
    TYPE section_vals_type
       TYPE(section_name_type) :: section
       TYPE(section_vals_type), POINTER :: children(:) => NULL()
+      TYPE(section_vals_type), POINTER :: adiabatic => NULL()
       INTEGER :: deriv = xc_deriv_pw, smooth = xc_rho_no_smooth, param = xc_pbe_orig
       LOGICAL :: active = .TRUE.
       REAL(KIND=dp) :: sc = 1, sx = 1, rho_cutoff = 1e-10_dp, drho_cutoff = .02_dp, smooth_range = 0
@@ -82,6 +83,7 @@ CONTAINS
 #include "xc_dispatch.inc"
 #include "xc_cutoff.inc"
 #include "xc_cpu_pbe.inc"
+#include "xc_lsd_pbe.inc"
    SUBROUTINE timeset(name, handle)
       CHARACTER(LEN=*), INTENT(IN) :: name
       INTEGER, INTENT(OUT) :: handle
@@ -156,9 +158,19 @@ CONTAINS
    FUNCTION section_vals_get_subs_vals(section, name) RESULT(child)
       TYPE(section_vals_type), POINTER :: section, child
       CHARACTER(LEN=*), INTENT(IN) :: name
-      IF (name /= 'XC_FUNCTIONAL') ERROR STOP 'unknown subsection'
-      child => section%children(1)
+      IF (name == 'XC_FUNCTIONAL') THEN
+         child => section%children(1)
+      ELSE IF (name == 'ADIABATIC_RESCALING') THEN
+         child => section%adiabatic
+      ELSE
+         ERROR STOP 'unknown subsection'
+      END IF
    END FUNCTION
+   SUBROUTINE section_vals_get(section, explicit)
+      TYPE(section_vals_type), POINTER :: section
+      LOGICAL, INTENT(OUT) :: explicit
+      explicit = section%active
+   END SUBROUTINE
    FUNCTION section_vals_get_subs_vals2(section, i_section) RESULT(child)
       TYPE(section_vals_type), POINTER :: section, child
       INTEGER, INTENT(IN) :: i_section
@@ -245,6 +257,246 @@ CONTAINS
                          section%rho_cutoff*section%smooth_range, section%smooth_range)
       result = e(:, 2)
    END SUBROUTINE
+
+   SUBROUTINE lsd_reference(ra, rb, za, zb, section, result, energy)
+      TYPE(pw_r3d_rs_type), INTENT(IN) :: ra, rb
+      TYPE(pw_c1d_gs_type), INTENT(IN) :: za, zb
+      TYPE(section_vals_type), POINTER :: section
+      REAL(dp), INTENT(OUT) :: result(27, 2), energy
+      REAL(dp) :: rhoa(27), rhob(27), rho_total(27), grads(27, 3, 2), total(27, 3)
+      REAL(dp) :: norm_a(27), norm_b(27), norm(27), deriv(27, 16), fa(27), fb(27), ftot(27)
+      REAL(dp), TARGET :: values(27), total_density(27)
+      REAL(dp), POINTER :: ep(:, :, :), rp(:, :, :), null_array(:, :, :)
+      COMPLEX(dp) :: full(27), spectrum(8), divg(8)
+      TYPE(pw_grid_type), POINTER :: grid
+      TYPE(section_vals_type), POINTER :: pbe
+      INTEGER :: dim, spin
+      grid => ra%pw_grid
+      pbe => section%children(1)%children(1)
+      rhoa = RESHAPE(ra%array, [27])
+      rhob = RESHAPE(rb%array, [27])
+      rho_total = rhoa + rhob
+      DO dim = 1, 3
+         spectrum = CMPLX(0.0_dp, 1.0_dp, dp)*grid%g(dim, :)*za%array
+         full = dft(scatter(spectrum, grid), 1)
+         grads(:, dim, 1) = REAL(full, dp)
+         spectrum = CMPLX(0.0_dp, 1.0_dp, dp)*grid%g(dim, :)*zb%array
+         full = dft(scatter(spectrum, grid), 1)
+         grads(:, dim, 2) = REAL(full, dp)
+      END DO
+      total = grads(:, :, 1) + grads(:, :, 2)
+      norm_a = SQRT(grads(:, 1, 1)**2 + grads(:, 2, 1)**2 + grads(:, 3, 1)**2)
+      norm_b = SQRT(grads(:, 1, 2)**2 + grads(:, 2, 2)**2 + grads(:, 3, 2)**2)
+      norm = SQRT(total(:, 1)**2 + total(:, 2)**2 + total(:, 3)**2)
+      deriv = 0
+!$OMP PARALLEL
+      CALL cpu_pbe_lsd_calc(rhoa, rhob, norm, norm_a, norm_b, deriv(:, 1), deriv(:, 2), deriv(:, 3), &
+                            deriv(:, 4), deriv(:, 5), deriv(:, 6), deriv(:, 7), deriv(:, 8), deriv(:, 9), &
+                            deriv(:, 10), deriv(:, 11), deriv(:, 12), deriv(:, 13), deriv(:, 14), &
+                            deriv(:, 15), deriv(:, 16), 1, 27, section%rho_cutoff, pbe%param, pbe%sc, pbe%sx)
+!$OMP END PARALLEL
+      fa = deriv(:, 10)/MAX(norm_a, section%drho_cutoff)
+      fb = deriv(:, 11)/MAX(norm_b, section%drho_cutoff)
+      ftot = deriv(:, 9)/MAX(norm, section%drho_cutoff)
+      DO dim = 1, 3
+         grads(:, dim, 1) = -(fa*grads(:, dim, 1) + total(:, dim)*ftot)
+         grads(:, dim, 2) = -(fb*grads(:, dim, 2) + total(:, dim)*ftot)
+      END DO
+      NULLIFY (null_array)
+      total_density = rho_total
+      rp(1:3, 1:3, 1:3) => total_density
+      ep(1:3, 1:3, 1:3) => values
+      values = deriv(:, 1)
+      CALL smooth_cutoff(ep, rp, null_array, null_array, section%rho_cutoff, section%smooth_range)
+      energy = SUM(values)*grid%dvol
+      DO spin = 1, 2
+         divg = 0
+         DO dim = 1, 3
+            full = dft(CMPLX(grads(:, dim, spin), 0.0_dp, dp), -1)
+            spectrum = full(grid%g_hatmap(:, 1) + 1)/27
+            divg = divg + CMPLX(0.0_dp, 1.0_dp, dp)*grid%g(dim, :)*spectrum
+         END DO
+         full = dft(scatter(divg, grid), 1)
+         values = REAL(full, dp) + deriv(:, spin + 1)
+         IF (grid%spherical) THEN
+            full = dft(CMPLX(values, 0.0_dp, dp), -1)
+            spectrum = full(grid%g_hatmap(:, 1) + 1)/27
+            full = dft(scatter(spectrum, grid), 1)
+            values = REAL(full, dp)
+         END IF
+         CALL smooth_cutoff(ep, rp, null_array, null_array, &
+                            section%rho_cutoff*section%smooth_range, section%smooth_range)
+         result(:, spin) = values
+      END DO
+   END SUBROUTINE lsd_reference
+
+   SUBROUTINE test_lsd_elements()
+      INTEGER, PARAMETER :: count = 19
+      REAL(dp), PARAMETER :: floor = EPSILON(0.0_dp)*1.e4_dp
+      REAL(dp) :: ra(count), rb(count), norm(count), na(count), nb(count)
+      REAL(dp) :: actual(count, 16), expected(count, 16), saved_ra(count)
+      INTEGER :: point, grad, param, before
+      DO point = 1, count
+         ra(point) = .3_dp + .01_dp*point
+         rb(point) = .7_dp - .02_dp*point
+         norm(point) = .03_dp*point
+         na(point) = .02_dp*point
+         nb(point) = .01_dp*point
+      END DO
+      ra(1:7) = [-.1_dp, 0.0_dp, floor, NEAREST(floor, -1.0_dp), NEAREST(floor, 1.0_dp), 0.0_dp, 1e-12_dp]
+      rb(6:11) = [0.0_dp, -1.0_dp, -.1_dp, 0.0_dp, floor, NEAREST(floor, 1.0_dp)]
+      rb(2) = 1.0_dp
+      ra(9) = 1.0_dp
+      norm(12) = 0
+      na(12) = 0
+      nb(12) = 0
+      DO param = 1, 3
+         DO grad = -2, 2
+            actual = .013_dp
+            expected = actual
+            before = test_kernel_calls(2_C_INT)
+!$OMP PARALLEL
+            CALL pbe_lsd_calc(ra, rb, norm, na, nb, actual(:, 1), actual(:, 2), actual(:, 3), actual(:, 4), &
+                              actual(:, 5), actual(:, 6), actual(:, 7), actual(:, 8), actual(:, 9), actual(:, 10), &
+                              actual(:, 11), actual(:, 12), actual(:, 13), actual(:, 14), actual(:, 15), actual(:, 16), &
+                              grad, count, 1e-12_dp, param, .7_dp, .9_dp)
+            CALL cpu_pbe_lsd_calc(ra, rb, norm, na, nb, expected(:, 1), expected(:, 2), expected(:, 3), &
+                                  expected(:, 4), expected(:, 5), expected(:, 6), expected(:, 7), expected(:, 8), &
+                                  expected(:, 9), expected(:, 10), expected(:, 11), expected(:, 12), expected(:, 13), &
+                                  expected(:, 14), expected(:, 15), expected(:, 16), grad, count, 1e-12_dp, param, .7_dp, .9_dp)
+!$OMP END PARALLEL
+            IF (.NOT. ALL(ieee_is_finite(actual))) ERROR STOP 'LSD nonfinite derivative'
+            IF (.NOT. ALL(ieee_is_finite(expected))) ERROR STOP 'LSD nonfinite reference'
+            IF (ANY(ABS(actual - expected) > 1e-12_dp*(1 + ABS(expected)))) ERROR STOP 'LSD Fortran mismatch'
+            IF (grad >= 1 .OR. grad == -1) THEN
+               IF (ANY(actual(1:4, 2) == .013_dp) .OR. ANY(actual(8:10, 3) == .013_dp)) &
+                  ERROR STOP 'LSD skipped clamped spin derivatives'
+            END IF
+            IF (grad < 0 .AND. ANY(actual(:, 1) /= .013_dp)) ERROR STOP 'LSD negative grad wrote energy'
+            IF (grad == 0 .AND. ANY(actual(:, 2:) /= .013_dp)) ERROR STOP 'LSD grad=0 wrote derivatives'
+            IF (ABS(grad) <= 1) THEN
+               IF (ANY(actual(:, 4:8) /= .013_dp) .OR. ANY(actual(:, 12:) /= .013_dp)) &
+                  ERROR STOP 'LSD wrote higher derivatives'
+            END IF
+            IF (gpu_enabled .AND. param == xc_pbe_orig .AND. ABS(grad) <= 1) THEN
+               IF (test_kernel_calls(2_C_INT) /= before + 1) ERROR STOP 'LSD launch count'
+            ELSE
+               IF (test_kernel_calls(2_C_INT) /= before) ERROR STOP 'unexpected LSD offload'
+            END IF
+            IF (grad /= -1 .AND. grad /= 0) CYCLE
+            actual = .013_dp
+            saved_ra = ra
+            before = test_kernel_calls(2_C_INT)
+!$OMP PARALLEL
+            IF (grad == -1) THEN
+               CALL pbe_lsd_calc(ra, rb, norm, na, nb, ra, actual(:, 2), actual(:, 3), actual(:, 4), &
+                                 actual(:, 5), actual(:, 6), actual(:, 7), actual(:, 8), actual(:, 9), actual(:, 10), &
+                                 actual(:, 11), actual(:, 12), actual(:, 13), actual(:, 14), actual(:, 15), actual(:, 16), &
+                                 grad, count, 1e-12_dp, param, .7_dp, .9_dp)
+            ELSE
+               CALL pbe_lsd_calc(ra, rb, norm, na, nb, actual(:, 1), ra, ra, ra, ra, ra, ra, ra, &
+                                 ra, ra, ra, ra, ra, ra, ra, ra, grad, count, 1e-12_dp, param, .7_dp, .9_dp)
+            END IF
+!$OMP END PARALLEL
+            IF (ANY(ra /= saved_ra)) ERROR STOP 'LSD overwrote aliased unused output'
+            IF (ANY(ABS(actual - expected) > 1e-12_dp*(1 + ABS(expected)))) ERROR STOP 'LSD aliased output mismatch'
+            IF (gpu_enabled .AND. param == xc_pbe_orig) THEN
+               IF (test_kernel_calls(2_C_INT) /= before + 1) ERROR STOP 'LSD aliased output fell back'
+            ELSE
+               IF (test_kernel_calls(2_C_INT) /= before) ERROR STOP 'unexpected aliased LSD offload'
+            END IF
+         END DO
+      END DO
+   END SUBROUTINE test_lsd_elements
+
+   SUBROUTINE test_lsd_pipeline(grid, pool, section)
+      TYPE(pw_grid_type), TARGET :: grid
+      TYPE(pw_pool_type), POINTER :: pool
+      TYPE(section_vals_type), POINTER :: section, pbe
+      TYPE(pw_r3d_rs_type), POINTER :: rho(:), tau(:), vxc(:), vtau(:), weights
+      TYPE(pw_c1d_gs_type), POINTER :: rho_g(:)
+      REAL(dp) :: expected(27, 2), energy, exc, virial(3, 3)
+      INTEGER :: point, spin, filter, variant, skip, calls
+      NULLIFY (tau, vxc, vtau, weights)
+      ALLOCATE (rho(2), rho_g(2))
+      DO spin = 1, 2
+         rho(spin)%pw_grid => grid
+         rho_g(spin)%pw_grid => grid
+         ALLOCATE (rho(spin)%array(-1:1, 2:4, 0:2), rho_g(spin)%array(8))
+         rho(spin)%array = RESHAPE([(.2_dp*spin + .1_dp*SIN(.2_dp*point*spin), point=1, 27)], [3, 3, 3])
+         rho_g(spin)%array = [(CMPLX(.03_dp*COS(REAL(point*spin, dp)), &
+                                    .02_dp*SIN(REAL(point*spin, dp)), dp), point=1, 8)]
+      END DO
+      pbe => section%children(1)%children(1)
+      section%deriv = xc_deriv_pw
+      section%smooth = xc_rho_no_smooth
+      pbe%active = .TRUE.
+      pbe%param = xc_pbe_orig
+      pbe%sc = .7_dp
+      pbe%sx = .9_dp
+      grid%para%mode = PW_MODE_LOCAL
+      section%children(1)%children(2)%active = .FALSE.
+      CALL test_gpu_begin(0_C_INT)
+      CALL test_lsd_elements()
+      DO filter = 0, 1
+         grid%spherical = filter == 1
+         DO variant = 0, 2
+            section%rho_cutoff = 1e-10_dp
+            section%smooth_range = 0
+            IF (variant == 1) THEN
+               section%rho_cutoff = .2_dp
+               section%smooth_range = 2
+            ELSE IF (variant == 2) THEN
+               rho(1)%array(-1, 2, 0) = -.3_dp
+               rho(2)%array(0, 2, 0) = 0
+               rho(1)%array(1, 2, 0) = 0
+               rho(2)%array(1, 2, 0) = 0
+            END IF
+            CALL lsd_reference(rho(1), rho(2), rho_g(1), rho_g(2), section, expected, energy)
+            calls = cpu_calls
+            CALL xc_vxc_pw_create(vxc, vtau, exc, rho, rho_g, tau, section, weights, pool, .FALSE., virial)
+            IF (gpu_enabled) THEN
+               IF (cpu_calls /= calls .OR. .NOT. ASSOCIATED(vxc)) ERROR STOP 'UKS dispatch'
+               IF (.NOT. ieee_is_finite(exc) .OR. ABS(exc - energy) > 1e-12_dp*(1 + ABS(energy))) &
+                  ERROR STOP 'UKS pipeline energy'
+               DO spin = 1, 2
+                  IF (.NOT. ALL(ieee_is_finite(vxc(spin)%array))) ERROR STOP 'UKS nonfinite potential'
+                  IF (ANY(ABS(RESHAPE(vxc(spin)%array, [27]) - expected(:, spin)) > &
+                          1e-12_dp*(1 + ABS(expected(:, spin))))) ERROR STOP 'UKS pipeline potential'
+                  CALL pool%give_back_pw(vxc(spin))
+               END DO
+               DEALLOCATE (vxc)
+            ELSE
+               IF (cpu_calls /= calls + 1 .OR. ASSOCIATED(vxc)) ERROR STOP 'UKS CPU dispatch'
+            END IF
+         END DO
+      END DO
+      ALLOCATE (section%adiabatic)
+      DO skip = 1, 8
+         pbe%param = xc_pbe_orig
+         section%adiabatic%active = .FALSE.
+         section%deriv = xc_deriv_pw
+         section%smooth = xc_rho_no_smooth
+         section%children(1)%children(2)%active = .FALSE.
+         IF (skip == 1) pbe%param = xc_pbe_rev
+         IF (skip == 2) pbe%param = xc_pbe_sol
+         IF (skip == 3) section%adiabatic%active = .TRUE.
+         IF (skip == 4) section%children(1)%children(2)%active = .TRUE.
+         IF (skip == 5) section%deriv = 2
+         IF (skip == 6) section%smooth = 2
+         calls = cpu_calls
+         CALL xc_vxc_pw_create(vxc, vtau, exc, rho, rho_g, tau, section, weights, pool, skip == 7, virial, &
+                                do_triplet=skip == 8)
+         IF (cpu_calls /= calls + 1 .OR. ASSOCIATED(vxc)) ERROR STOP 'UKS unsupported functional'
+      END DO
+      IF (pool%outstanding /= 0 .OR. timers /= 0) ERROR STOP 'UKS pool or timer leak'
+      CALL test_gpu_end()
+      DEALLOCATE (section%adiabatic)
+      DO spin = 1, 2
+         DEALLOCATE (rho(spin)%array, rho_g(spin)%array)
+      END DO
+      DEALLOCATE (rho, rho_g)
+   END SUBROUTINE test_lsd_pipeline
 END MODULE
 
 PROGRAM test_xc_pipeline
@@ -402,6 +654,7 @@ PROGRAM test_xc_pipeline
       rho_g(1)%pw_grid => grid
    END DO
    CALL test_gpu_end()
+   CALL test_lsd_pipeline(grid, pool, section)
    DEALLOCATE (grid%g_hatmap, grid%g, grid%gsq, rho(1)%array, rho_g(1)%array)
    DEALLOCATE (rho, rho_g, section%children(1)%children)
    DEALLOCATE (section%children)

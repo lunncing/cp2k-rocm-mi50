@@ -45,7 +45,8 @@ MODULE qs_ks_methods
                                               dbcsr_copy_columns_hack
    USE cp_ddapc,                        ONLY: qs_ks_ddapc,&
                                               qs_ks_ddapc_device_begin,&
-                                              qs_ks_ddapc_device_finish
+                                              qs_ks_ddapc_device_finish,&
+                                              qs_ks_periodic_device
    USE cp_fm_types,                     ONLY: cp_fm_type
    USE cp_log_handling,                 ONLY: cp_get_default_logger,&
                                               cp_logger_get_default_io_unit,&
@@ -81,7 +82,7 @@ MODULE qs_ks_methods
    USE mathlib,                         ONLY: abnormal_value
    USE message_passing,                 ONLY: mp_para_env_type
    USE particle_types,                  ONLY: particle_type
-   USE pw_gpu,                          ONLY: pw_gpu_res_invalidate
+   USE pw_gpu,                          ONLY: pw_gpu_res_invalidate, pw_gpu_uks_enabled
    USE pw_env_types,                    ONLY: pw_env_get,&
                                               pw_env_type
    USE pw_methods,                      ONLY: pw_axpy,&
@@ -406,13 +407,22 @@ CONTAINS
       hartree_device = .FALSE.
       IF (calculate_forces .OR. use_virial) CALL pw_gpu_res_invalidate()
       IF (do_ddapc .AND. .NOT. calculate_forces .AND. .NOT. just_energy .AND. .NOT. use_virial .AND. &
-          .NOT. gapw .AND. .NOT. gapw_xc .AND. nspins == 1 .AND. .NOT. dokp) THEN
+          .NOT. gapw .AND. .NOT. gapw_xc .AND. .NOT. dokp .AND. &
+          (nspins == 1 .OR. (nspins == 2 .AND. pw_gpu_uks_enabled()))) THEN
          IF (qs_env%cp_ddapc_ewald%do_decoupling .AND. .NOT. qs_env%cp_ddapc_ewald%do_qmmm_periodic_decpl .AND. &
              .NOT. qs_env%cp_ddapc_ewald%do_solvation .AND. .NOT. dft_control%qs_control%ddapc_restraint .AND. &
              .NOT. dft_control%do_pcc .AND. .NOT. dft_control%do_sccs .AND. .NOT. dft_control%do_paep .AND. &
              .NOT. qs_env%scf_control%gce%do_gce .AND. .NOT. qs_env%qmmm) THEN
             CALL qs_ks_ddapc_device_begin(qs_env, poisson_env, rho_tot_gspace, hartree_device)
          END IF
+      END IF
+
+      IF (.NOT. do_ddapc .AND. .NOT. calculate_forces .AND. .NOT. just_energy .AND. .NOT. use_virial .AND. &
+          .NOT. gapw .AND. .NOT. gapw_xc .AND. .NOT. dokp .AND. .NOT. qs_env%qmmm .AND. &
+          .NOT. dft_control%do_pcc .AND. .NOT. dft_control%do_sccs .AND. .NOT. dft_control%do_paep .AND. &
+          .NOT. qs_env%scf_control%gce%do_gce .AND. poisson_env%parameters%solver /= pw_poisson_implicit .AND. &
+          (nspins == 1 .OR. (nspins == 2 .AND. pw_gpu_uks_enabled()))) THEN
+         CALL qs_ks_periodic_device(qs_env, poisson_env, rho_tot_gspace, energy, hartree_device)
       END IF
 
       ! Get the total density in g-space [ions + electrons]
@@ -492,7 +502,7 @@ CONTAINS
       ELSE
          dft_control%qs_control%ddapc_explicit_potential = .FALSE.
          dft_control%qs_control%ddapc_restraint_is_spin = .FALSE.
-         IF (.NOT. just_energy) THEN
+         IF (.NOT. just_energy .AND. .NOT. hartree_device) THEN
             CALL pw_transfer(v_hartree_gspace, v_hartree_rspace)
             CALL pw_scale(v_hartree_rspace, v_hartree_rspace%pw_grid%dvol)
          END IF

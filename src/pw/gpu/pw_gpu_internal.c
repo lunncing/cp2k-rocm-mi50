@@ -4,7 +4,66 @@
 /*                                                                            */
 /*  SPDX-License-Identifier: GPL-2.0-or-later                                 */
 /*----------------------------------------------------------------------------*/
+#if (defined(__linux__) || defined(__unix__)) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include "../../offload/offload_runtime.h"
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#if defined(__linux__) || defined(__unix__)
+#include <dlfcn.h>
+#endif
+
+static bool env_flag(const char *name, const bool default_value) {
+  const char *value = getenv(name);
+  if (value == NULL || value[0] == '\0') return default_value;
+  if (value[0] == '0' || value[0] == 'n' || value[0] == 'N' ||
+      value[0] == 'f' || value[0] == 'F') return false;
+  if ((value[0] == 'o' || value[0] == 'O') &&
+      (value[1] == 'f' || value[1] == 'F')) return false;
+  return true;
+}
+
+static int optional_symbol(void *function, size_t size, const char *name) {
+#if defined(__linux__) || defined(__unix__)
+  void *symbol = dlsym(RTLD_DEFAULT, name);
+  if (symbol == NULL || size != sizeof(symbol)) return 0;
+  memcpy(function, &symbol, size);
+  return 1;
+#else
+  (void)function;
+  (void)size;
+  (void)name;
+  return 0;
+#endif
+}
+
+int pw_gpu_cholesky_fast_single_rank_c(void) {
+  return env_flag("CP2K_CHOLESKY_FAST_SINGLE_RANK", true);
+}
+
+int pw_gpu_openblas_threads_begin_c(int target_threads) {
+  int (*get_threads)(void) = NULL;
+  void (*set_threads)(int) = NULL;
+  if (target_threads <= 0 ||
+      !optional_symbol(&get_threads, sizeof(get_threads), "openblas_get_num_threads") ||
+      !optional_symbol(&set_threads, sizeof(set_threads), "openblas_set_num_threads")) return 0;
+  const int previous = get_threads();
+  if (previous <= 0) return 0;
+  set_threads(target_threads);
+  return previous;
+}
+
+void pw_gpu_openblas_threads_end_c(int prev_threads) {
+  void (*set_threads)(int) = NULL;
+  if (prev_threads > 0 &&
+      optional_symbol(&set_threads, sizeof(set_threads), "openblas_set_num_threads")) {
+    set_threads(prev_threads);
+  }
+}
 
 /*******************************************************************************
  * \brief Real part of the complex inner product, without temporary arrays.
@@ -66,6 +125,35 @@ static offloadStream_t stream_copy;
 static offloadEvent_t event_compute_done[2], event_copy_done[2];
 static bool is_initialized = false;
 
+#if defined(__OFFLOAD_HIP)
+typedef struct _rocblas_handle *pw_rocblas_handle;
+static pw_rocblas_handle cholesky_handle = NULL;
+static int (*cholesky_create)(pw_rocblas_handle *) = NULL;
+static int (*cholesky_destroy)(pw_rocblas_handle) = NULL;
+static int (*cholesky_set_stream)(pw_rocblas_handle, offloadStream_t) = NULL;
+static int (*cholesky_trsm)(pw_rocblas_handle, int, int, int, int, int, int,
+                          const double *, const double *, int, double *, int) = NULL;
+static int (*cholesky_trmm)(pw_rocblas_handle, int, int, int, int, int, int,
+                          const double *, const double *, int, const double *, int,
+                          double *, int) = NULL;
+
+static int cholesky_setup(void) {
+  if (cholesky_handle != NULL) return 1;
+  if (!optional_symbol(&cholesky_create, sizeof(cholesky_create), "rocblas_create_handle") ||
+      !optional_symbol(&cholesky_destroy, sizeof(cholesky_destroy), "rocblas_destroy_handle") ||
+      !optional_symbol(&cholesky_set_stream, sizeof(cholesky_set_stream), "rocblas_set_stream") ||
+      !optional_symbol(&cholesky_trsm, sizeof(cholesky_trsm), "rocblas_dtrsm") ||
+      !optional_symbol(&cholesky_trmm, sizeof(cholesky_trmm), "rocblas_dtrmm")) return 0;
+  if (cholesky_create(&cholesky_handle) != 0 || cholesky_handle == NULL ||
+      cholesky_set_stream(cholesky_handle, stream) != 0) {
+    if (cholesky_handle != NULL) cholesky_destroy(cholesky_handle);
+    cholesky_handle = NULL;
+    return 0;
+  }
+  return 1;
+}
+#endif
+
 /*******************************************************************************
  * \brief Device-resident per-grid data (g_hatmap, g-vectors).
  *
@@ -125,6 +213,9 @@ static size_t allocated_gbuf_size;
 static double *xc_dev, *xc_dev_hi;
 static size_t allocated_xc_size;
 static bool protected_xc_buffer = false;
+static double *uks_density_dev, *uks_xc_dev;
+static size_t allocated_uks_density_size, allocated_uks_xc_size;
+static bool protected_uks_buffer = false;
 
 /*******************************************************************************
  * \brief Device residency of PW arrays between calls (density -> Hartree ->
@@ -144,6 +235,9 @@ enum {
   RES_V_H_R,     // owned
   RES_RHO_CORE,  // owned
   RES_INFL,      // owned, compact real influence when its imaginary part is zero
+  RES_RHO_G_B,
+  RES_RHO_R_B,
+  RES_VXC_B,
   RES_NSLOTS
 };
 enum { RES_INVALID = 0, RES_VALID, RES_PENDING };
@@ -165,7 +259,10 @@ typedef struct {
 } res_slot;
 static res_slot res[RES_NSLOTS];
 static const char *const res_names[RES_NSLOTS] = {"RHO_G", "RHO_R", "VXC",
-                                                  "V_H_R", "RHO_CORE", "INFL"};
+    "V_H_R", "RHO_CORE", "INFL", "RHO_G_B", "RHO_R_B", "VXC_B"};
+static const int res_borrowed[] = {RES_RHO_G, RES_RHO_R, RES_VXC,
+                                  RES_RHO_G_B, RES_RHO_R_B, RES_VXC_B};
+static int res_vtot_active_slot = RES_VXC;
 static unsigned long xc_epoch = 1;      // borrowed slot generation
 static unsigned long scratch_epoch = 1; // changes with every shared scratch use
 static unsigned res_pinned = 0;         // owned slots in use (never evicted)
@@ -184,7 +281,8 @@ static bool opt_res_lazy_pot = true; // lazy Vxc and V_H (inside the granted win
 // the SCF driver grants for setups without host readers between a result and
 // its device consumer (pw_gpu_res_set_lazy_c). The density token marks the
 // one density computation of the SCF iteration that may stay on the device.
-static bool res_lazy_grant = false, res_density_token = false;
+static bool res_lazy_grant = false;
+static int res_density_token = 0, res_density_spin_count = 0;
 static size_t res_reserve_bytes = (size_t)1536 * 1024 * 1024;
 static struct {
   unsigned long density, density_fail, hartree, hartree_fail, potential,
@@ -223,7 +321,8 @@ static size_t res_natural_capacity = 0;
 static struct {
   unsigned long epoch, gt_gen; // epoch 0: none
   int grid_id, npts[3];
-} res_dz;
+  double *dev;
+} res_dz[2];
 #define PW_GPU_RES_NATURAL_CHUNK 65536
 static void res_natural_forget(void);
 static void res_evict_all(void);
@@ -231,11 +330,14 @@ static bool res_evict_one(void);
 static void res_invalidate_borrowed(void);
 static void res_invalidate(const int id);
 static void res_print_stats(void);
+static void release_uks_buffers(void);
+static int ensure_device_headroom(const size_t extra_bytes, const size_t reserve_floor);
 void pw_gpu_res_ensure_host_c(const int id, void *host_ptr);
 
 // Runtime switches, read once in pw_gpu_init().
 static bool opt_map_cache = true; // CP2K_PW_GPU_MAP_CACHE
 static bool opt_fused_xc = true;  // CP2K_PW_GPU_FUSED_XC
+static bool opt_uks = true, opt_full_pipeline = true;
 
 // Counts all explicit device allocations in this module. FFT-library internal
 // workspaces are opaque and are not included in this budget.
@@ -275,24 +377,6 @@ static bool parse_unsigned(const char *s, const size_t maximum, size_t *value) {
     return false;
   }
   *value = (size_t)parsed;
-  return true;
-}
-
-/*******************************************************************************
- * \brief Reads a boolean environment switch ("0", "no", "false", "off" = off).
- ******************************************************************************/
-static bool env_flag(const char *name, const bool default_value) {
-  const char *s = getenv(name);
-  if (s == NULL || s[0] == '\0') {
-    return default_value;
-  }
-  if (s[0] == '0' || s[0] == 'n' || s[0] == 'N' || s[0] == 'f' ||
-      s[0] == 'F') {
-    return false;
-  }
-  if ((s[0] == 'o' || s[0] == 'O') && (s[1] == 'f' || s[1] == 'F')) {
-    return false; // "off"
-  }
   return true;
 }
 
@@ -448,7 +532,8 @@ static size_t xc_lo_bytes(const size_t total) {
 static void release_xc_buffer(void) {
   if (xc_dev == NULL) return;
   // Reclamation may evict live results, unlike reuse after their last consumer.
-  for (int id = 0; id <= RES_VXC; id++) {
+  for (size_t slot = 0; slot < sizeof(res_borrowed) / sizeof(res_borrowed[0]); slot++) {
+    const int id = res_borrowed[slot];
     pw_gpu_res_ensure_host_c(id, (void *)res[id].host);
   }
   res_invalidate_borrowed();
@@ -473,6 +558,11 @@ static int check_and_reclaim_memory(const size_t required_bytes) {
       continue;
     }
     if (res_evict_one()) {
+      continue;
+    }
+    if ((uks_density_dev != NULL || uks_xc_dev != NULL) &&
+        !protected_uks_buffer && !protected_xc_buffer) {
+      release_uks_buffers();
       continue;
     }
     if (xc_dev != NULL && !protected_xc_buffer) {
@@ -518,6 +608,7 @@ static void release_work_buffers(void) {
   offloadStreamSynchronize(stream_copy);
   release_double_buffers();
   release_xc_buffer();
+  release_uks_buffers();
   res_evict_all();
   scratch_epoch++;
   res_hartree.pending = false;
@@ -589,6 +680,8 @@ void pw_gpu_init(void) {
   grid_cache_clock = 0;
   opt_map_cache = env_flag("CP2K_PW_GPU_MAP_CACHE", true);
   opt_fused_xc = env_flag("CP2K_PW_GPU_FUSED_XC", true);
+  opt_uks = env_flag("CP2K_PW_GPU_UKS", true);
+  opt_full_pipeline = env_flag("CP2K_PW_GPU_XC_FULL_PIPELINE", true);
   opt_res = env_flag("CP2K_PW_GPU_RES", true);
   opt_res_density = opt_res && env_flag("CP2K_PW_GPU_RES_DENSITY", true);
   opt_res_hartree = opt_res && env_flag("CP2K_PW_GPU_RES_HARTREE", true);
@@ -615,7 +708,10 @@ void pw_gpu_init(void) {
   }
   memset(res, 0, sizeof(res));
   memset(&res_stats, 0, sizeof(res_stats));
-  res_lazy_grant = res_density_token = false;
+  res_lazy_grant = false;
+  res_density_token = 0;
+  res_density_spin_count = 0;
+  res_vtot_active_slot = RES_VXC;
   memset(&res_hartree, 0, sizeof(res_hartree));
   memset(&res_natural, 0, sizeof(res_natural));
   memset(&res_dz, 0, sizeof(res_dz));
@@ -698,6 +794,12 @@ void pw_gpu_finalize(void) {
   offload_activate_chosen_device();
   offloadStreamSynchronize(stream);
   offloadStreamSynchronize(stream_copy);
+#if defined(__OFFLOAD_HIP)
+  if (cholesky_handle != NULL) {
+    cholesky_destroy(cholesky_handle);
+    cholesky_handle = NULL;
+  }
+#endif
   for (int i = 0; i < PW_GPU_CACHE_SIZE; i++) {
     if (cache[i].plan != NULL) {
       offload_fftDestroy(*cache[i].plan);
@@ -718,7 +820,8 @@ void pw_gpu_finalize(void) {
     fprintf(stderr, "[PW_GPU] residency: %d device-only result(s) dropped at finalization.\n",
             live);
   }
-  res_lazy_grant = res_density_token = false;
+  res_lazy_grant = false;
+  res_density_token = 0;
   release_work_buffers();
   res_print_stats();
   mem_print();
@@ -759,6 +862,11 @@ static int pw_gpu_ensure_buffer_c(const size_t requested_buffer_size,
       !check_and_reclaim_memory(2 * buffer_growth + map_growth)) {
     return memory_limit_exceeded();
   }
+  const size_t buffer_bytes = buffer_growth ? requested_buffer_size : 0;
+  const size_t map_bytes = map_growth ? requested_map_size : 0;
+  if (buffer_bytes > (SIZE_MAX - map_bytes) / 2) return memory_limit_exceeded();
+  if ((buffer_bytes || map_bytes) &&
+      !ensure_device_headroom(2 * buffer_bytes + map_bytes, 0)) return 0;
   if (buffer_growth != 0 || map_growth != 0) {
     offloadStreamSynchronize(stream);
   }
@@ -780,7 +888,8 @@ static int pw_gpu_ensure_buffer_c(const size_t requested_buffer_size,
     release_double_buffers();
     const size_t real_size = requested_buffer_size / 2;
     if (real_size != 0 && requested_buffer_size <= SIZE_MAX - real_size &&
-        check_and_reclaim_memory(requested_buffer_size + real_size)) {
+        check_and_reclaim_memory(requested_buffer_size + real_size) &&
+        ensure_device_headroom(requested_buffer_size + real_size, 0)) {
       device_malloc((void **)&buffer_dev_1_b, real_size);
       device_malloc((void **)&buffer_dev_2_b, requested_buffer_size);
       allocated_buffer_size_b = requested_buffer_size;
@@ -801,6 +910,7 @@ static int pw_gpu_ensure_gbuf_c(const size_t requested_size) {
     if (!check_and_reclaim_memory(requested_size - allocated_gbuf_size)) {
       return memory_limit_exceeded();
     }
+    if (!ensure_device_headroom(requested_size, 0)) return 0;
     offloadStreamSynchronize(stream);
     device_free(gbuf_dev, allocated_gbuf_size);
     device_malloc((void **)&gbuf_dev, requested_size);
@@ -812,10 +922,13 @@ static int pw_gpu_ensure_gbuf_c(const size_t requested_size) {
 static int pw_gpu_ensure_xc_c(const size_t requested_size) {
   const size_t growth = requested_size > allocated_xc_size
                             ? requested_size - allocated_xc_size : 0;
+  const bool was_protected = protected_xc_buffer;
   protected_xc_buffer = true;
   const int fits = check_and_reclaim_memory(growth);
-  protected_xc_buffer = false;
+  const int headroom = fits && (!growth || ensure_device_headroom(requested_size, 0));
+  protected_xc_buffer = was_protected;
   if (!fits) return memory_limit_exceeded();
+  if (!headroom) return 0;
   if (growth) {
     release_xc_buffer();
     const size_t lo = xc_lo_bytes(requested_size);
@@ -920,7 +1033,8 @@ static void res_natural_forget(void) {
 static void res_invalidate_borrowed(void) {
   // Before the XC grids are reused, a live result is copied to its host array
   // unless its consumer has just read it (see res_retire_borrowed).
-  for (int id = 0; id <= RES_VXC; id++) {
+  for (size_t slot = 0; slot < sizeof(res_borrowed) / sizeof(res_borrowed[0]); slot++) {
+    const int id = res_borrowed[slot];
     res_sync(id);
     res_invalidate(id);
   }
@@ -932,9 +1046,11 @@ static void res_invalidate_borrowed(void) {
 // (the next density overwrites them, the SCF exit is never reached with a
 // consumed density). Anything else that is still live is synchronized first.
 static void res_retire_borrowed(const unsigned consumed) {
-  for (int id = 0; id <= RES_VXC; id++) {
+  for (size_t slot = 0; slot < sizeof(res_borrowed) / sizeof(res_borrowed[0]); slot++) {
+    const int id = res_borrowed[slot];
     const bool dead = res_lazy_grant &&
-        (id == RES_RHO_G || id == RES_RHO_R) && (consumed & (1u << id));
+        (id == RES_RHO_G || id == RES_RHO_R || id == RES_RHO_G_B || id == RES_RHO_R_B) &&
+        (consumed & (1u << id));
     if (dead) {
       // Clear authority before invalidating the shared XC storage. These
       // densities have reached their last consumer in the granted window.
@@ -945,6 +1061,36 @@ static void res_retire_borrowed(const unsigned consumed) {
     res_invalidate(id);
   }
   xc_epoch++;
+}
+
+static void release_uks_buffers(void) {
+  if (uks_density_dev == NULL && uks_xc_dev == NULL) return;
+  res_invalidate_borrowed();
+  offloadStreamSynchronize(stream);
+  device_free(uks_density_dev, allocated_uks_density_size);
+  device_free(uks_xc_dev, allocated_uks_xc_size);
+  uks_density_dev = uks_xc_dev = NULL;
+  allocated_uks_density_size = allocated_uks_xc_size = 0;
+}
+
+static int ensure_uks_buffer(double **dev, size_t *allocated, const size_t bytes) {
+  if (*allocated >= bytes) return 1;
+  const bool uks_was_protected = protected_uks_buffer;
+  protected_uks_buffer = true;
+  const bool was_protected = protected_xc_buffer;
+  protected_xc_buffer = true;
+  const int fits = check_and_reclaim_memory(bytes - *allocated);
+  const int headroom = fits && ensure_device_headroom(bytes, 0);
+  protected_xc_buffer = was_protected;
+  protected_uks_buffer = uks_was_protected;
+  if (!fits) return memory_limit_exceeded();
+  if (!headroom) return 0;
+  if (*dev != NULL) res_invalidate_borrowed();
+  offloadStreamSynchronize(stream);
+  device_free(*dev, *allocated);
+  device_malloc((void **)dev, bytes);
+  *allocated = bytes;
+  return 1;
 }
 
 static void res_free_owned(const int id) {
@@ -985,7 +1131,7 @@ static bool res_evict_one(void) {
 }
 
 static void res_evict_all(void) {
-  for (int id = RES_V_H_R; id < RES_NSLOTS; id++) {
+  for (int id = RES_V_H_R; id <= RES_INFL; id++) {
     res_free_owned(id);
   }
   res_free_small();
@@ -999,8 +1145,120 @@ static void res_evict_all(void) {
 // Free device memory as reported by the runtime (false: unknown).
 static bool res_device_free_memory(size_t *free_bytes) {
   size_t total;
-  return device_mem_info(free_bytes, &total);
+  return device_mem_info(free_bytes, &total) && total != 0;
 }
+
+static int ensure_device_headroom(const size_t extra_bytes, const size_t reserve_floor) {
+  if (!host_fallback_enabled) return 1;
+  size_t free_bytes;
+  if (!res_device_free_memory(&free_bytes)) return 1;
+  const size_t configured = res_reserve_bytes ? res_reserve_bytes : 256 * PW_GPU_MIB;
+  const size_t reserve = configured > reserve_floor ? configured : reserve_floor;
+  if (extra_bytes > SIZE_MAX - reserve) return 0;
+  while (free_bytes < extra_bytes + reserve) {
+    if (allocated_buffer_size_b != 0) {
+      release_double_buffers();
+    } else if (res_evict_one()) {
+    } else if ((uks_density_dev != NULL || uks_xc_dev != NULL) &&
+               !protected_uks_buffer && !protected_xc_buffer) {
+      release_uks_buffers();
+    } else if (xc_dev != NULL && !protected_xc_buffer) {
+      release_xc_buffer();
+    } else {
+      grid_cache_entry *oldest = NULL;
+      for (int index = 0; index < PW_GPU_GRID_CACHE_SIZE; index++) {
+        grid_cache_entry *entry = &grid_cache[index];
+        if (entry->grid_id != 0 && entry != protected_grid_entry &&
+            (oldest == NULL || entry->last_use < oldest->last_use)) oldest = entry;
+      }
+      if (oldest == NULL) return 0;
+      grid_cache_clear_entry(oldest);
+    }
+    if (!res_device_free_memory(&free_bytes)) return 1;
+  }
+  return 1;
+}
+
+#if defined(__OFFLOAD_HIP)
+static int cholesky_transform(int op_solve, int side_right, int trans_t,
+                             int m, int n, const double *b, int ldb,
+                             const double *a, int lda, double *out, int ldout,
+                             int reduce) {
+  const int bdim = side_right ? n : m;
+  if (b == NULL || a == NULL || out == NULL || lda < m || ldb < bdim || ldout < m) return 0;
+  const size_t maximum = SIZE_MAX / sizeof(double);
+  if ((size_t)bdim > maximum / (size_t)bdim ||
+      (size_t)m > maximum / (size_t)n ||
+      (size_t)lda > maximum / (size_t)n ||
+      (size_t)ldb > maximum / (size_t)bdim ||
+      (size_t)ldout > maximum / (size_t)n) return 0;
+  const size_t bcount = (size_t)bdim * bdim, count = (size_t)m * n;
+  if (count > (maximum - bcount) / (op_solve ? 1 : 2)) return 0;
+  const size_t bytes = (bcount + count * (op_solve ? 1 : 2)) * sizeof(double);
+  offload_activate_chosen_device();
+  if (!check_and_reclaim_memory(bytes) || !ensure_device_headroom(bytes, 0) ||
+      !cholesky_setup()) return 0;
+  double *host = malloc(count * sizeof(double));
+  if (host == NULL) return 0;
+  double *device = NULL;
+  if (hipMalloc((void **)&device, bytes) != hipSuccess) {
+    free(host);
+    return 0;
+  }
+  current_gpu_allocated_bytes += bytes;
+  if (current_gpu_allocated_bytes > peak_gpu_allocated_bytes) {
+    peak_gpu_allocated_bytes = current_gpu_allocated_bytes;
+  }
+  mem_sample();
+  double *device_a = device + bcount;
+  double *device_out = op_solve ? device_a : device_a + count;
+  const double one = 1.0;
+  const double *input = a;
+  int input_ld = lda, success = 0;
+  if (reduce) {
+    for (int column = 0; column < n; column++) {
+      for (int row = 0; row < m; row++) {
+        host[row + (size_t)column * m] = row <= column
+            ? a[row + (size_t)column * lda] : a[column + (size_t)row * lda];
+      }
+    }
+    input = host;
+    input_ld = m;
+  }
+  if (hipMemcpy2DAsync(device, (size_t)bdim * sizeof(double), b,
+                       (size_t)ldb * sizeof(double), (size_t)bdim * sizeof(double),
+                       bdim, hipMemcpyHostToDevice, stream) != hipSuccess ||
+      hipMemcpy2DAsync(device_a, (size_t)m * sizeof(double), input,
+                       (size_t)input_ld * sizeof(double), (size_t)m * sizeof(double),
+                       n, hipMemcpyHostToDevice, stream) != hipSuccess) goto cleanup;
+  if (op_solve) {
+    if (cholesky_trsm(cholesky_handle, side_right ? 142 : 141, 121, trans_t ? 112 : 111,
+                      131, m, n, &one, device, bdim, device_a, m) != 0) goto cleanup;
+    if (reduce && cholesky_trsm(cholesky_handle, 142, 121, 111, 131, m, n,
+                                &one, device, bdim, device_a, m) != 0) goto cleanup;
+  } else {
+    if (cholesky_trmm(cholesky_handle, side_right ? 142 : 141, 121, trans_t ? 112 : 111,
+                      131, m, n, &one, device, bdim, device_a, m, device_out, m) != 0) goto cleanup;
+  }
+  if (hipStreamSynchronize(stream) != hipSuccess ||
+      hipMemcpy2DAsync(host, (size_t)m * sizeof(double), device_out,
+                       (size_t)m * sizeof(double), (size_t)m * sizeof(double),
+                       n, hipMemcpyDeviceToHost, stream) != hipSuccess ||
+      hipStreamSynchronize(stream) != hipSuccess) goto cleanup;
+  success = 1;
+cleanup:
+  if (hipStreamSynchronize(stream) != hipSuccess) success = 0;
+  if (hipFree(device) != hipSuccess) success = 0;
+  current_gpu_allocated_bytes -= bytes;
+  if (success) {
+    for (int column = 0; column < n; column++) {
+      memcpy(out + (size_t)column * ldout, host + (size_t)column * m, (size_t)m * sizeof(double));
+    }
+  }
+  free(host);
+  return success;
+}
+#endif
 
 // Reclaim idle caches/optional work buffers for persistent Hartree inputs, but
 // never evict live density, another owned slot, or the active FFT scratch.
@@ -1058,6 +1316,7 @@ static double *res_small(const size_t doubles) {
     memory_limit_exceeded();
     return NULL;
   }
+  if (!ensure_device_headroom(rounded, 0)) return NULL;
   device_malloc((void **)&res_small_dev, rounded);
   res_small_bytes = rounded;
   return res_small_dev;
@@ -1217,17 +1476,21 @@ static double *res_lookup_g(const int id, const void *host, const size_t n,
   return res_lookup(id, host, n, false);
 }
 
+static int res_find_host(const void *host, const int first, const int second) {
+  return res[second].host == host && res[second].state != RES_INVALID ? second : first;
+}
+
 // Check the Fortran object's identity before reducing the single resident slot.
 int pw_gpu_res_matches_c(const int id, const void *host, const size_t n) {
   if (!is_initialized || id < 0 || id >= RES_NSLOTS || omp_get_num_threads() != 1) return 0;
   return res_lookup(id, host, n, false) != NULL;
 }
 
-int pw_gpu_res_integrate_r_c(double *total_rho_out, const double dvol) {
+static int res_integrate_r(const int id, double *total_rho_out, const double dvol) {
   if (!is_initialized || !opt_res_density || total_rho_out == NULL ||
       !isfinite(dvol) || omp_get_num_threads() != 1) return 0;
-  res_slot *s = &res[RES_RHO_R];
-  if (s->n == 0 || res_lookup(RES_RHO_R, s->host, s->n, false) == NULL) return 0;
+  res_slot *s = &res[id];
+  if (s->n == 0 || res_lookup(id, s->host, s->n, false) == NULL) return 0;
   offload_activate_chosen_device();
   const size_t first = pw_gpu_xc_reduce_size(s->n);
   const size_t second = pw_gpu_xc_reduce_size(first);
@@ -1249,6 +1512,18 @@ int pw_gpu_res_integrate_r_c(double *total_rho_out, const double dvol) {
   offloadStreamSynchronize(stream);
   *total_rho_out = sum * dvol;
   return 1;
+}
+
+int pw_gpu_res_integrate_r_c(double *total_rho_out, const double dvol) {
+  return res_integrate_r(RES_RHO_R, total_rho_out, dvol);
+}
+
+int pw_gpu_res_integrate_r_host_c(const double *rho_host, const size_t n,
+                                 double *total_rho_out, const double dvol) {
+  if (!is_initialized || rho_host == NULL) return 0;
+  const int id = res_find_host(rho_host, RES_RHO_R, RES_RHO_R_B);
+  if (res[id].host != rho_host || res[id].n != n) return 0;
+  return res_integrate_r(id, total_rho_out, dvol);
 }
 
 static void res_print_stats(void) {
@@ -1326,6 +1601,7 @@ void pw_gpu_res_invalidate_c(void) {
     res_invalidate(id);
   }
   res_hartree.pending = false;
+  res_density_token = res_density_spin_count = 0;
 }
 
 /*******************************************************************************
@@ -1337,6 +1613,7 @@ void pw_gpu_res_invalidate_c(void) {
 void pw_gpu_res_set_lazy_c(const int on) {
   if (!is_initialized) return;
   res_density_token = false;
+  res_density_spin_count = 0;
   if (on) {
     res_lazy_grant = opt_res && (opt_res_lazy_density || opt_res_lazy_pot) && !opt_res_verify;
     return;
@@ -1350,7 +1627,12 @@ void pw_gpu_res_set_lazy_c(const int on) {
 
 // The next density computation (and only that one) may stay on the device.
 void pw_gpu_res_defer_density_c(const int on) {
-  res_density_token = is_initialized && res_lazy_grant && on != 0;
+  res_density_token = is_initialized && on != 0 ? 2 : 0;
+  res_density_spin_count = 0;
+}
+
+void pw_gpu_res_allow_density_c(void) {
+  pw_gpu_res_defer_density_c(1);
 }
 
 // The host array is about to be released without being read again: forget a
@@ -1523,6 +1805,47 @@ int modify_hartree_pot_gpu_c(double *v, const double *g, const double *gsq,
   return 1;
 }
 
+int pw_gpu_uks_enabled_c(void) {
+  return is_initialized && opt_uks;
+}
+
+static bool host_arrays_overlap(const void *left, const void *right, const size_t bytes) {
+  const uintptr_t first = (uintptr_t)left, second = (uintptr_t)right;
+  return first <= second ? second - first < bytes : first - second < bytes;
+}
+
+int pw_gpu_pbe_lsd_eval_c(const double *ra, const double *rb,
+    const double *norm, const double *na, const double *nb, double *e0,
+    double *era, double *erb, double *en, double *ena, double *enb,
+    size_t n, int grad, double epsilon, double sx, double sc) {
+  if (!pw_gpu_uks_enabled_c() || grad < -1 || grad > 1) return 0;
+  if (n == 0) return 1;
+  if (n > SIZE_MAX / sizeof(double)) return memory_limit_exceeded();
+  const size_t derivative_n = grad ? n : 0;
+  const size_t counts[] = {n, n, n, n, n, grad >= 0 ? n : 0, derivative_n, derivative_n,
+                           derivative_n, derivative_n, derivative_n};
+  size_t widths[11], bytes[11];
+  void *parts[11];
+  const void *host[] = {ra, rb, norm, na, nb, e0, era, erb, en, ena, enb};
+  for (int part = 0; part < 11; part++) {
+    if (counts[part] && host[part] == NULL) return 0;
+    widths[part] = sizeof(double);
+  }
+  for (int output = 5; output < 11; output++)
+    for (int previous = 0; previous < output; previous++)
+      if (counts[output] && counts[previous] &&
+          host_arrays_overlap(host[output], host[previous], n * sizeof(double))) return 0;
+  if (!pw_ops_reserve(counts, widths, 11, parts, bytes)) return 0;
+  for (int part = 0; part < 11; part++)
+    if (bytes[part]) offloadMemcpyAsyncHtoD(parts[part], host[part], bytes[part], stream);
+  pw_gpu_launch_pbe_lsd(parts[0], parts[1], parts[2], parts[3], parts[4], parts[5],
+      parts[6], parts[7], parts[8], parts[9], parts[10], n, grad, epsilon, sx, sc, stream);
+  for (int part = 5; part < 11; part++)
+    if (bytes[part]) offloadMemcpyAsyncDtoH((void *)host[part], parts[part], bytes[part], stream);
+  offloadStreamSynchronize(stream);
+  return 1;
+}
+
 int pbe_lda_eval_gpu_c(const double *rho, const double *norm, double *e0,
     double *erho, double *enorm, size_t n, int grad, double epsilon,
     double kappa, double beta, double mu, double sc, double sx) {
@@ -1589,6 +1912,7 @@ static grid_cache_entry *grid_cache_lookup_or_upload(
       memory_limit_exceeded();
       return NULL;
     }
+    if (!ensure_device_headroom(map_size, 0)) return NULL;
     device_malloc((void **)&hit->map_dev, map_size);
     offloadMemcpyAsyncHtoD(hit->map_dev, map_host, map_size, stream);
     hit->grid_id = grid_id;
@@ -1617,13 +1941,16 @@ static const double *grid_cache_get_g(grid_cache_entry *e,
     e->g_dev = NULL;
   }
   const size_t g_size = 3 * sizeof(double) * (size_t)e->ngpts;
+  grid_cache_entry *previous = protected_grid_entry;
   protected_grid_entry = e;
   const int fits = check_and_reclaim_memory(g_size);
-  protected_grid_entry = NULL;
+  const int headroom = fits && ensure_device_headroom(g_size, 0);
+  protected_grid_entry = previous;
   if (!fits) {
     memory_limit_exceeded();
     return NULL;
   }
+  if (!headroom) return NULL;
   device_malloc((void **)&e->g_dev, g_size);
   offloadMemcpyAsyncHtoD(e->g_dev, g_host, g_size, stream);
   e->g_host = g_host;
@@ -1659,8 +1986,9 @@ static int grid_natural_g(grid_cache_entry *e, const double *g_host,
   int mode = 0;
   double *gt_dev = NULL;
   size_t bytes = sizeof(double) * tab;
+  grid_cache_entry *previous = protected_grid_entry;
   protected_grid_entry = e;
-  if (check_and_reclaim_memory(bytes)) {
+  if (check_and_reclaim_memory(bytes) && ensure_device_headroom(bytes, 0)) {
     device_malloc((void **)&gt_dev, bytes);
     pw_gpu_launch_gtab_build(gt_dev, g_dev, e->map_dev, n0, n1, nr, stream);
     pw_gpu_launch_gtab_check(scratch, g_dev, e->map_dev, gt_dev, n0, n1, nr, stream);
@@ -1687,16 +2015,13 @@ static int grid_natural_g(grid_cache_entry *e, const double *g_host,
     // A cell that couples the axes needs the full copy. Its transient second
     // g array must leave the reserve free, or XC stays in the sorted order.
     bytes = 3 * sizeof(double) * nr;
-    size_t free_bytes;
-    const bool room = !res_device_free_memory(&free_bytes) ||
-        (free_bytes >= res_reserve_bytes && bytes <= free_bytes - res_reserve_bytes);
-    if (room && check_and_reclaim_memory(bytes)) {
+    if (check_and_reclaim_memory(bytes) && ensure_device_headroom(bytes, 0)) {
       device_malloc((void **)&gt_dev, bytes);
       pw_gpu_launch_gtab_full(gt_dev, g_dev, e->map_dev, nr, stream);
       mode = 2;
     }
   }
-  protected_grid_entry = NULL;
+  protected_grid_entry = previous;
   if (mode == 0) return 0;
   offloadStreamSynchronize(stream);
   device_free(e->g_dev, 3 * sizeof(double) * nr);
@@ -1755,12 +2080,18 @@ static const int *grid_cache_get_gidx(grid_cache_entry *e, const int *gidx_host,
     for (int i = 0; i < e->ngpts; i++)
       translated[i] = natural_map[gidx_host[i] - 1] + 1;
   }
+  grid_cache_entry *previous = protected_grid_entry;
   protected_grid_entry = e;
   const int fits = check_and_reclaim_memory(size);
-  protected_grid_entry = NULL;
+  const int headroom = fits && ensure_device_headroom(size, 0);
+  protected_grid_entry = previous;
   if (!fits) {
     free(translated);
     memory_limit_exceeded();
+    return NULL;
+  }
+  if (!headroom) {
+    free(translated);
     return NULL;
   }
   device_malloc((void **)dev, size);
@@ -2017,11 +2348,11 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
   // moves to the then unused first half of buffer_dev_1. Decided before the
   // borrowed slots are retired (which changes xc_epoch).
   const bool use_dz = pairs && res_g != NULL && res[RES_RHO_G].natural_g && res_r == xc_dev_hi &&
-                      res_dz.epoch == xc_epoch && res_dz.grid_id == grid_id &&
-                      !memcmp(res_dz.npts, npts, sizeof(res_dz.npts)) &&
-                      entry->gt_gen == res_dz.gt_gen;
+                      res_dz[0].epoch == xc_epoch && res_dz[0].grid_id == grid_id &&
+                      !memcmp(res_dz[0].npts, npts, sizeof(res_dz[0].npts)) &&
+                      entry->gt_gen == res_dz[0].gt_gen;
   const bool dz_check = use_dz && opt_res_verify; // the z gradient is also recomputed
-  res_dz.epoch = 0;
+  res_dz[0].epoch = 0;
   if (use_dz) {
     rho_dev = xc_dev_hi;
     grad_dev[2] = xc_dev_hi + nr;
@@ -2193,6 +2524,277 @@ int pw_gpu_xc_full_pipeline_c(const double *zin_rho_g, const double *din_rho_r,
       kappa, beta, mu, scale_ec, scale_ex, epsilon_rho, 0.0, 0);
 }
 
+static int xc_full_pipeline_lsd(const double *rho_g_a, const double *rho_g_b,
+    const double *rho_r_a, const double *rho_r_b, double *out_a, double *out_b,
+    double *out_exc, const int *map, const double *g, const int *npts,
+    int ngpts, int nmaps, int grid_id, double epsilon, double sx, double sc,
+    double cutoff, double smooth, double dvol, int spherical) {
+  if (!pw_gpu_uks_enabled_c() || !opt_fused_xc || !opt_full_pipeline ||
+      omp_get_num_threads() != 1) return 0;
+  if (npts == NULL || out_exc == NULL || ngpts < 0 || grid_id <= 0 ||
+      (nmaps != 1 && nmaps != 2) || !isfinite(cutoff) || cutoff < 0.0) return 0;
+  size_t nr = 1;
+  for (int dim = 0; dim < 3; dim++) {
+    if (npts[dim] < 0) return 0;
+    if (npts[dim] && nr > (size_t)(INT_MAX / 2) / (size_t)npts[dim])
+      return memory_limit_exceeded();
+    nr *= (size_t)npts[dim];
+  }
+  if ((size_t)ngpts > nr) return 0;
+  if (nr == 0) {
+    *out_exc = 0.0;
+    return 1;
+  }
+  if (rho_r_a == NULL || rho_r_b == NULL || out_a == NULL || out_b == NULL ||
+      out_a == out_b || (ngpts && (rho_g_a == NULL || rho_g_b == NULL ||
+                                  map == NULL || g == NULL))) return 0;
+  if (nr > SIZE_MAX / (4 * sizeof(double))) return memory_limit_exceeded();
+  const size_t bytes = nr * sizeof(double), gbytes = 2 * (size_t)ngpts * sizeof(double);
+  if (host_arrays_overlap(out_a, out_b, bytes)) return 0;
+  const size_t n0 = (size_t)npts[0], n1 = (size_t)npts[1], n2 = (size_t)npts[2];
+  const double scale = 1.0 / (double)nr;
+  offload_activate_chosen_device();
+  protected_uks_buffer = true;
+  protected_xc_buffer = true;
+  if (!pw_gpu_ensure_buffer_c(2 * bytes, 0, false) ||
+      !pw_gpu_ensure_gbuf_c(2 * bytes) ||
+      !pw_gpu_ensure_xc_c(4 * bytes) ||
+      !ensure_uks_buffer(&uks_density_dev, &allocated_uks_density_size, 4 * bytes) ||
+      !ensure_uks_buffer(&uks_xc_dev, &allocated_uks_xc_size, 2 * bytes)) return 0;
+  grid_cache_entry *entry = NULL;
+  const double *g_dev = NULL, *gt_dev = NULL;
+  bool natural = ngpts && opt_res_natural_xc && opt_map_cache && !spherical &&
+      nmaps == 1 && (size_t)ngpts == nr && res_natural.grid_id == grid_id &&
+      res_natural.n == nr && !memcmp(res_natural.npts, npts, sizeof(res_natural.npts));
+  int gt_mode = 0;
+  if (ngpts) {
+    if (!opt_map_cache) pw_gpu_grid_invalidate(grid_id);
+    entry = grid_cache_lookup_or_upload(grid_id, map, ngpts, nmaps);
+    if (entry == NULL) return 0;
+    protected_grid_entry = entry;
+    if (natural) {
+      gt_mode = grid_natural_g(entry, g, npts, buffer_dev_1, &gt_dev);
+      natural = gt_mode != 0;
+    }
+    if (!natural && (g_dev = grid_cache_get_g(entry, g)) == NULL) return 0;
+  }
+  const int *map_dev = entry == NULL ? NULL : entry->map_dev;
+  const bool pairs = natural && opt_res_xc_pairs;
+  const int rslot[2] = {RES_RHO_R, RES_RHO_R_B};
+  const int gslot[2] = {RES_RHO_G, RES_RHO_G_B};
+  const int vslot[2] = {RES_VXC, RES_VXC_B};
+  const double *rh[2] = {rho_r_a, rho_r_b}, *gh[2] = {rho_g_a, rho_g_b};
+  double *vh[2] = {out_a, out_b};
+  double *grad[2][3] = {{uks_density_dev, uks_density_dev + nr, uks_xc_dev},
+                        {xc_dev, xc_dev + nr, uks_xc_dev + nr}};
+  double *rho[2] = {uks_density_dev + 2 * nr, uks_density_dev + 3 * nr};
+  double *vrho[2] = {xc_dev_hi, xc_dev_hi + nr};
+  double *energy = buffer_dev_1, *spectrum = gbuf_dev;
+  double *vdev[2] = {uks_density_dev, xc_dev};
+  bool lazy = res_lazy_grant && opt_res_lazy_pot && opt_res_pot;
+  double *samples = lazy ? res_small(pw_res_sample_count(nr)) : NULL;
+  lazy = lazy && samples != NULL &&
+      res_sample_buffer(&res[RES_VXC], pw_res_sample_count(nr)) &&
+      res_sample_buffer(&res[RES_VXC_B], pw_res_sample_count(nr));
+  unsigned consumed = 0;
+  for (int spin = 0; spin < 2; spin++) {
+    res_sync(vslot[spin]);
+    res_invalidate(vslot[spin]);
+  }
+  for (int spin = 0; spin < 2; spin++) {
+    const double *resident = opt_res_xcin ? res_lookup(rslot[spin], rh[spin], nr, false) : NULL;
+    if (resident != NULL) {
+      if (resident != rho[spin])
+        pw_gpu_launch_copy(resident, rho[spin], nr, nr, 1, 1, 1.0, stream);
+      consumed |= 1u << rslot[spin];
+    } else {
+      res_sync(rslot[spin]);
+      res_invalidate(rslot[spin]);
+      pw_gpu_res_ensure_host_c(-1, (void *)rh[spin]);
+      offloadMemcpyAsyncHtoD(rho[spin], rh[spin], bytes, stream);
+    }
+  }
+  for (int spin = 0; spin < 2; spin++) {
+    const double *resident = ngpts && opt_res_xcin ?
+        res_lookup(gslot[spin], gh[spin], (size_t)ngpts, false) : NULL;
+    const bool resident_natural = resident != NULL && res[gslot[spin]].natural_g;
+    const bool use_dz = pairs && resident_natural && (consumed & (1u << rslot[spin])) &&
+        res_dz[spin].epoch == xc_epoch && res_dz[spin].grid_id == grid_id &&
+        entry->gt_gen == res_dz[spin].gt_gen &&
+        !memcmp(res_dz[spin].npts, npts, sizeof(res_dz[spin].npts));
+    if (resident != NULL) {
+      if (natural == resident_natural) {
+        pw_gpu_launch_copy(resident, spectrum, (size_t)ngpts, (size_t)ngpts, 2, 2, 1.0, stream);
+      } else if (natural) {
+        pw_gpu_launch_scatter(spectrum, resident, 1.0, ngpts, 1, map_dev, stream);
+      } else {
+        pw_gpu_launch_gather(spectrum, resident, 1.0, ngpts, map_dev, stream);
+      }
+      consumed |= 1u << gslot[spin];
+    } else {
+      res_sync(gslot[spin]);
+      res_invalidate(gslot[spin]);
+      if (ngpts) {
+        pw_gpu_res_ensure_host_c(-1, (void *)gh[spin]);
+        offloadMemcpyAsyncHtoD(natural ? buffer_dev_2 : spectrum, gh[spin], gbytes, stream);
+        if (natural)
+          pw_gpu_launch_scatter(spectrum, buffer_dev_2, 1.0, ngpts, 1, map_dev, stream);
+      }
+    }
+    if (pairs) {
+      pw_gpu_launch_nat_grad2(buffer_dev_2, spectrum, gt_dev, gt_mode,
+                              n0, n1, n2, 0, 1, nr, stream);
+      fft_3d(OFFLOAD_FFT_INVERSE, npts[2], npts[1], npts[0], buffer_dev_2);
+      pw_gpu_launch_unpack2(buffer_dev_2, grad[spin][0], grad[spin][1], nr, stream);
+      res_stats.xc_pairs++;
+    }
+    for (int dim = pairs ? 2 : 0; dim < 3; dim++) {
+      if (dim == 2 && use_dz && !opt_res_verify) {
+        pw_gpu_launch_copy(res_dz[spin].dev, grad[spin][2], nr, nr, 1, 1, 1.0, stream);
+        continue;
+      }
+      if (natural) {
+        pw_gpu_launch_nat_deriv(buffer_dev_2, spectrum, gt_dev, gt_mode,
+                                n0, n1, dim, 1.0, nr, stream);
+      } else {
+        offloadMemsetAsync(buffer_dev_2, 0, 2 * bytes, stream);
+        if (ngpts) pw_gpu_launch_scatter_deriv(buffer_dev_2, spectrum, g_dev, dim,
+                                               1.0, ngpts, nmaps, map_dev, stream);
+      }
+      fft_3d(OFFLOAD_FFT_INVERSE, npts[2], npts[1], npts[0], buffer_dev_2);
+      pw_gpu_launch_complex_to_real(buffer_dev_2, grad[spin][dim], (int)nr, stream);
+    }
+    if (use_dz) {
+      if (opt_res_verify) xc_check_dz(res_dz[spin].dev, grad[spin][2], nr);
+      res_stats.dz_used++;
+    }
+    if (natural) res_stats.nat_xc++;
+    res_dz[spin].epoch = 0;
+  }
+  if (consumed) res_stats.xc_in++;
+  res_retire_borrowed(consumed);
+  pw_gpu_launch_xc_pbe_lsd_combine(rho[0], rho[1], grad[0][0], grad[0][1], grad[0][2],
+      grad[1][0], grad[1][1], grad[1][2], vrho[0], vrho[1], energy, nr,
+      epsilon, sx, sc, cutoff, smooth, stream);
+  size_t remaining = nr;
+  double *sum_in = energy, *sum_out = buffer_dev_2;
+  do {
+    pw_gpu_launch_xc_reduce(sum_in, sum_out, remaining, stream);
+    remaining = pw_gpu_xc_reduce_size(remaining);
+    double *swap = sum_in;
+    sum_in = sum_out;
+    sum_out = swap;
+  } while (remaining > 1);
+  double energy_sum;
+  offloadMemcpyAsyncDtoH(&energy_sum, sum_in, sizeof(double), stream);
+  for (int spin = 0; spin < 2; spin++) {
+    if (pairs) {
+      pw_gpu_launch_pack2(grad[spin][0], grad[spin][1], buffer_dev_2, nr, stream);
+      fft_3d(OFFLOAD_FFT_FORWARD, npts[2], npts[1], npts[0], buffer_dev_2);
+      pw_gpu_launch_nat_div2(gbuf_dev, buffer_dev_2, gt_dev, gt_mode,
+                             n0, n1, n2, 0, 1, scale, 0, nr, stream);
+    } else {
+      offloadMemsetAsync(gbuf_dev, 0, 2 * bytes, stream);
+    }
+    for (int dim = pairs ? 2 : 0; dim < 3; dim++) {
+      pw_gpu_launch_real_to_complex(grad[spin][dim], buffer_dev_2, (int)nr, stream);
+      fft_3d(OFFLOAD_FFT_FORWARD, npts[2], npts[1], npts[0], buffer_dev_2);
+      if (natural) {
+        pw_gpu_launch_nat_deriv_acc(gbuf_dev, buffer_dev_2, gt_dev, gt_mode,
+                                    n0, n1, dim, scale, nr, stream);
+      } else if (ngpts) {
+        pw_gpu_launch_gather_deriv_acc(gbuf_dev, buffer_dev_2, g_dev, dim,
+                                       scale, ngpts, map_dev, stream);
+      }
+    }
+    double *box = natural ? gbuf_dev : buffer_dev_2;
+    if (!natural) {
+      offloadMemsetAsync(box, 0, 2 * bytes, stream);
+      if (ngpts) pw_gpu_launch_scatter(box, gbuf_dev, 1.0, ngpts, nmaps, map_dev, stream);
+    }
+    fft_3d(OFFLOAD_FFT_INVERSE, npts[2], npts[1], npts[0], box);
+    pw_gpu_launch_complex_to_real(box, vdev[spin], (int)nr, stream);
+    pw_gpu_launch_add_vrho(vdev[spin], vrho[spin], nr, stream);
+    if (spherical && ngpts) {
+      pw_gpu_launch_real_to_complex(vdev[spin], buffer_dev_2, (int)nr, stream);
+      fft_3d(OFFLOAD_FFT_FORWARD, npts[2], npts[1], npts[0], buffer_dev_2);
+      pw_gpu_launch_gather(gbuf_dev, buffer_dev_2, scale, ngpts, map_dev, stream);
+      offloadMemsetAsync(buffer_dev_2, 0, 2 * bytes, stream);
+      pw_gpu_launch_scatter(buffer_dev_2, gbuf_dev, 1.0, ngpts, nmaps, map_dev, stream);
+      fft_3d(OFFLOAD_FFT_INVERSE, npts[2], npts[1], npts[0], buffer_dev_2);
+      pw_gpu_launch_complex_to_real(buffer_dev_2, vdev[spin], (int)nr, stream);
+    } else if (spherical) {
+      offloadMemsetAsync(vdev[spin], 0, bytes, stream);
+    }
+    pw_gpu_launch_xc_cutoff_lsd(vdev[spin], rho[0], rho[1], nr, epsilon * smooth, smooth, stream);
+    if (lazy) {
+      res_register_lazy(vslot[spin], vh[spin], nr, 1, vdev[spin], samples);
+      res_stats.lazy_vxc++;
+      res_stats.download_saved += bytes;
+    } else {
+      offloadMemcpyAsyncDtoH(vh[spin], vdev[spin], bytes, stream);
+    }
+  }
+  offloadStreamSynchronize(stream);
+  *out_exc = energy_sum * dvol;
+  if (!lazy && opt_res_pot)
+    for (int spin = 0; spin < 2; spin++) res_register(vslot[spin], vh[spin], nr, 1, 1, vdev[spin]);
+  return 1;
+}
+
+int pw_gpu_xc_full_pipeline_lsd_configured_c(const double *rho_g_a, const double *rho_g_b,
+    const double *rho_r_a, const double *rho_r_b, double *out_a, double *out_b,
+    double *out_exc, const int *map, const double *g, const int *npts,
+    int ngpts, int nmaps, int grid_id, double epsilon, double sx, double sc,
+    double cutoff, double smooth, double dvol, int spherical) {
+  mem_sample_entry();
+  const int done = xc_full_pipeline_lsd(rho_g_a, rho_g_b, rho_r_a, rho_r_b,
+      out_a, out_b, out_exc, map, g, npts, ngpts, nmaps, grid_id,
+      epsilon, sx, sc, cutoff, smooth, dvol, spherical);
+  protected_grid_entry = NULL;
+  protected_xc_buffer = protected_uks_buffer = false;
+  if (is_initialized) offloadStreamSynchronize(stream);
+  if (!opt_map_cache && is_initialized && grid_id > 0) pw_gpu_grid_invalidate(grid_id);
+  return done;
+}
+
+int pw_gpu_xc_full_pipeline_lsd_c(const double *rho_r_a, const double *rho_r_b,
+    const double *rho_g_a, const double *rho_g_b, int npts_local, const int *npts,
+    const int *nloc, const int *bounds_local, int ngpts_local, const int *g_hat,
+    const int *g_hatmap, int has_spherical, const double *g1, const double *g2,
+    const double *g3, double epsilon, double sx, double sc, double cutoff,
+    double smooth, double dvol, double *out_a, double *out_b, double *out_exc) {
+  (void)g_hat;
+  if (!pw_gpu_uks_enabled_c() || npts == NULL || nloc == NULL || bounds_local == NULL ||
+      npts_local < 0 || ngpts_local < 0 || ngpts_local > npts_local) return 0;
+  size_t nr = 1;
+  for (int dim = 0; dim < 3; dim++) {
+    if (npts[dim] < 0 || nloc[dim] != npts[dim] ||
+        (int64_t)bounds_local[2 * dim + 1] - bounds_local[2 * dim] + 1 != nloc[dim]) return 0;
+    if (npts[dim] && nr > (size_t)(INT_MAX / 2) / (size_t)npts[dim]) return 0;
+    nr *= (size_t)npts[dim];
+  }
+  if (nr != (size_t)npts_local || (ngpts_local && (!g1 || !g2 || !g3))) return 0;
+  double *g = malloc(3 * sizeof(double) * (size_t)ngpts_local);
+  if (ngpts_local && g == NULL) return 0;
+  for (int point = 0; point < ngpts_local; point++) {
+    g[3 * (size_t)point] = g1[point];
+    g[3 * (size_t)point + 1] = g2[point];
+    g[3 * (size_t)point + 2] = g3[point];
+  }
+  int grid_id = INT_MAX;
+  for (int index = 0; index < PW_GPU_GRID_CACHE_SIZE; index++)
+    if (grid_cache[index].map_host == g_hatmap && grid_cache[index].grid_id > 0)
+      grid_id = grid_cache[index].grid_id;
+  if (res_natural.map == g_hatmap && res_natural.grid_id > 0) grid_id = res_natural.grid_id;
+  const int done = pw_gpu_xc_full_pipeline_lsd_configured_c(rho_g_a, rho_g_b, rho_r_a, rho_r_b,
+      out_a, out_b, out_exc, g_hatmap, g, npts, ngpts_local, 1, grid_id,
+      epsilon, sx, sc, cutoff, smooth, dvol, has_spherical);
+  pw_gpu_grid_invalidate(grid_id);
+  free(g);
+  return done;
+}
+
 /*******************************************************************************
  * \brief Number of points of an FFT grid; false if it is empty or too large
  *        for the int-indexed conversion kernels.
@@ -2267,7 +2869,8 @@ static bool res_natural_prepare(const int grid_id, const int *map,
   const size_t count = n < PW_GPU_RES_NATURAL_CHUNK ? n : PW_GPU_RES_NATURAL_CHUNK;
   if (count > res_natural_capacity) {
     const size_t unit = 2 * sizeof(double) + sizeof(int);
-    if (!check_and_reclaim_memory((count - res_natural_capacity) * unit)) return false;
+    if (!check_and_reclaim_memory((count - res_natural_capacity) * unit) ||
+        !ensure_device_headroom(count * unit, 0)) return false;
     offloadStreamSynchronize(stream);
     device_free(res_natural_dev, res_natural_capacity * unit);
     device_malloc((void **)&res_natural_dev, count * unit);
@@ -2292,9 +2895,9 @@ static bool res_natural_upload(double *dev, const double *host, const int width)
   return true;
 }
 
-static void res_register_natural_lazy(double *host, const size_t n, double *dev) {
-  res_bind(RES_RHO_G, host, n, 2, 2, dev);
-  res_slot *s = &res[RES_RHO_G];
+static void res_register_natural_lazy(const int id, double *host, const size_t n, double *dev) {
+  res_bind(id, host, n, 2, 2, dev);
+  res_slot *s = &res[id];
   s->natural_g = true;
   const size_t count = pw_res_sample_count(n);
   int coords[PW_GPU_RES_PREFIX_SAMPLES + PW_GPU_RES_STRIDED_SAMPLES];
@@ -2334,11 +2937,13 @@ static const grid_cache_entry *res_dz_tables(const int grid_id, const int *npts)
   return NULL;
 }
 
-static void res_dz_record(const grid_cache_entry *e, const int grid_id, const int *npts) {
-  res_dz.epoch = xc_epoch; // that of the RHO_G/RHO_R registration just made
-  res_dz.gt_gen = e->gt_gen;
-  res_dz.grid_id = grid_id;
-  memcpy(res_dz.npts, npts, sizeof(res_dz.npts));
+static void res_dz_record(const grid_cache_entry *e, const int grid_id, const int *npts,
+                           const int spin, double *dev) {
+  res_dz[spin].epoch = xc_epoch;
+  res_dz[spin].gt_gen = e->gt_gen;
+  res_dz[spin].grid_id = grid_id;
+  res_dz[spin].dev = dev;
+  memcpy(res_dz[spin].npts, npts, sizeof(res_dz[spin].npts));
   res_stats.dz_made++;
 }
 
@@ -2399,9 +3004,32 @@ static int res_density(const bool lazy_allowed, const int nlevels,
     res_stats.density_fail++;
     return 0;
   }
-  double *rho_g_dev = xc_dev, *rho_r_dev = xc_dev_hi;
-  res_invalidate_borrowed(); // the XC grids are overwritten below
-  res_dz.epoch = 0;
+  const int spin = opt_uks && lazy_allowed && res_density_spin_count == 1 &&
+      res[RES_RHO_G].state == RES_VALID && res[RES_RHO_R].state == RES_VALID &&
+      res[RES_RHO_G].host != rho_g_host && res[RES_RHO_R].host != rho_r_host &&
+      res[RES_RHO_G].n == (size_t)t_ngpts && res[RES_RHO_R].n == t_nr ? 1 : 0;
+  const int slot_g = spin ? RES_RHO_G_B : RES_RHO_G;
+  const int slot_r = spin ? RES_RHO_R_B : RES_RHO_R;
+  double *rho_g_dev = xc_dev, *rho_r_dev = xc_dev_hi, *dz_dev = xc_dev_hi + t_nr;
+  if (spin) {
+    if (!ensure_uks_buffer(&uks_density_dev, &allocated_uks_density_size,
+                            4 * sizeof(double) * t_nr)) return 0;
+    if (res[RES_RHO_G].state != RES_VALID || res[RES_RHO_R].state != RES_VALID) return 0;
+    pw_gpu_launch_copy(res[RES_RHO_G].dev, uks_density_dev, (size_t)t_ngpts,
+                        (size_t)t_ngpts, 2, 2, 1.0, stream);
+    pw_gpu_launch_copy(res[RES_RHO_R].dev, uks_density_dev + 2 * t_nr, t_nr, t_nr, 1, 1, 1.0, stream);
+    res[RES_RHO_G].dev = uks_density_dev;
+    res[RES_RHO_R].dev = uks_density_dev + 2 * t_nr;
+    if (res_dz[0].epoch == xc_epoch) {
+      pw_gpu_launch_copy(res_dz[0].dev, xc_dev_hi, t_nr, t_nr, 1, 1, 1.0, stream);
+      res_dz[0].dev = xc_dev_hi;
+    }
+    rho_r_dev = uks_density_dev + 3 * t_nr;
+  } else {
+    res_invalidate_borrowed();
+    res_dz[0].epoch = 0;
+  }
+  res_dz[1].epoch = 0;
   protected_xc_buffer = true; // grid cache uploads must not release them
   const bool lazy = lazy_allowed && res_lazy_grant && opt_res_lazy_density;
   double *samples = NULL;
@@ -2409,8 +3037,8 @@ static int res_density(const bool lazy_allowed, const int nlevels,
     const size_t gs = 2 * pw_res_sample_count((size_t)t_ngpts);
     const size_t rs = pw_res_sample_count(t_nr);
     samples = res_small(gs > rs ? gs : rs);
-    if (samples == NULL || !res_sample_buffer(&res[RES_RHO_G], gs) ||
-        !res_sample_buffer(&res[RES_RHO_R], rs)) {
+    if (samples == NULL || !res_sample_buffer(&res[slot_g], gs) ||
+        !res_sample_buffer(&res[slot_r], rs)) {
       res_stats.density_fail++;
       return 0;
     }
@@ -2489,19 +3117,19 @@ static int res_density(const bool lazy_allowed, const int nlevels,
   offloadEventRecord(event_compute_done[0], stream); // rho_g complete and read
   fft_3d(OFFLOAD_FFT_INVERSE, t_npts[2], t_npts[1], t_npts[0], buffer_dev_2);
   if (dz != NULL) {
-    pw_gpu_launch_unpack2(buffer_dev_2, rho_r_dev, rho_r_dev + t_nr, t_nr, stream);
+    pw_gpu_launch_unpack2(buffer_dev_2, rho_r_dev, dz_dev, t_nr, stream);
   } else {
     pw_gpu_launch_complex_to_real(buffer_dev_2, rho_r_dev, (int)t_nr, stream);
   }
   offloadEventRecord(event_compute_done[1], stream);
   if (lazy) {
     if (natural) {
-      res_register_natural_lazy(rho_g_host, t_nr, rho_g_dev);
+      res_register_natural_lazy(slot_g, rho_g_host, t_nr, rho_g_dev);
     } else {
-      res_register_lazy(RES_RHO_G, rho_g_host, (size_t)t_ngpts, 2, rho_g_dev, samples);
+      res_register_lazy(slot_g, rho_g_host, (size_t)t_ngpts, 2, rho_g_dev, samples);
     }
-    res_register_lazy(RES_RHO_R, rho_r_host, t_nr, 1, rho_r_dev, samples);
-    if (dz != NULL) res_dz_record(dz, t_grid_id, t_npts);
+    res_register_lazy(slot_r, rho_r_host, t_nr, 1, rho_r_dev, samples);
+    if (dz != NULL) res_dz_record(dz, t_grid_id, t_npts, spin, dz_dev);
     offloadStreamSynchronize(stream);
     res_stats.density++;
     res_stats.lazy_density++;
@@ -2522,10 +3150,10 @@ static int res_density(const bool lazy_allowed, const int nlevels,
                          stream_copy);
   offloadStreamSynchronize(stream_copy);
   offloadStreamSynchronize(stream);
-  res_register(RES_RHO_G, rho_g_host, (size_t)t_ngpts, 2, 2, rho_g_dev);
-  res[RES_RHO_G].natural_g = natural;
-  res_register(RES_RHO_R, rho_r_host, t_nr, 1, 1, rho_r_dev);
-  if (dz != NULL) res_dz_record(dz, t_grid_id, t_npts);
+  res_register(slot_g, rho_g_host, (size_t)t_ngpts, 2, 2, rho_g_dev);
+  res[slot_g].natural_g = natural;
+  res_register(slot_r, rho_r_host, t_nr, 1, 1, rho_r_dev);
+  if (dz != NULL) res_dz_record(dz, t_grid_id, t_npts, spin, dz_dev);
   res_stats.density++;
   return 1;
 }
@@ -2538,12 +3166,16 @@ int pw_gpu_res_density_c(const int nlevels, void *const *r_host, const int *npts
                          double *rho_r_host, void *const *r_dev) {
   mem_sample_entry();
   // The token is consumed by every attempt, including rejected ones.
-  const bool lazy_allowed = res_density_token;
-  res_density_token = false;
+  const bool lazy_allowed = res_density_token > 0;
+  if (res_density_token) res_density_token--;
   const int done = res_density(lazy_allowed, nlevels, r_host, r_dev, npts, ngpts, nmaps,
                                grid_id, maps, gidx, scale, t_npts, t_ngpts,
                                t_nmaps, t_grid_id, t_map, rho_g_host, rho_r_host);
   protected_xc_buffer = false;
+  protected_uks_buffer = false;
+  if (lazy_allowed && done) res_density_spin_count++;
+  else res_density_spin_count = 0;
+  if (!done) res_density_token = 0;
   return done;
 }
 
@@ -2591,7 +3223,8 @@ static int res_potential(const double *v_host, const int nlevels,
     res_stats.potential_fail++;
     return 0;
   }
-  const double *src = res_lookup(RES_VXC, v_host, nr[aux], true);
+  const int vslot = res_find_host(v_host, RES_VXC, RES_VXC_B);
+  const double *src = res_lookup(vslot, v_host, nr[aux], true);
   protected_xc_buffer = src != NULL; // grid cache uploads must not release it
   size_t start = 0;
   if (src == NULL) {
@@ -2677,9 +3310,9 @@ static int res_potential(const double *v_host, const int nlevels,
   if (r_dev != NULL && r_dev[aux] != NULL) {
     pw_gpu_launch_copy(src, (double *)r_dev[aux], nr[aux], nr[aux], 1, 1, 1.0, stream);
     direct++;
-  } else if (res[RES_VXC].dev_authoritative && res[RES_VXC].host == v_host) {
+  } else if (res[vslot].dev_authoritative && res[vslot].host == v_host) {
     offloadMemcpyAsyncDtoH(r_host[aux], src, sizeof(double) * nr[aux], stream);
-    if (r_host[aux] == v_host) res[RES_VXC].dev_authoritative = false;
+    if (r_host[aux] == v_host) res[vslot].dev_authoritative = false;
   } else {
     res_host_copy(r_host[aux], v_host, nr[aux]);
   }
@@ -2711,7 +3344,7 @@ int pw_gpu_res_potential_c(const double *v_host, const int nlevels,
   const int done = res_potential(v_host, nlevels, r_host, npts, ngpts, nmaps,
                                  grid_id, maps, gidx, rscale, aux, fwd_scale, r_dev);
   protected_xc_buffer = false;
-  if (!done) pw_gpu_res_ensure_host_c(RES_VXC, (void *)v_host);
+  if (!done) pw_gpu_res_ensure_host_c(-1, (void *)v_host);
   return done;
 }
 
@@ -2730,12 +3363,17 @@ int pw_gpu_res_vtot_prepare_c(const double *vh_host, const double *vxc_host,
     return 0;
   }
   offload_activate_chosen_device();
-  res_slot *s = &res[RES_VXC];
+  res_vtot_active_slot = res_find_host(vxc_host, RES_VXC, RES_VXC_B);
+  res_slot *s = &res[res_vtot_active_slot];
   protected_xc_buffer = true;
   double *samples = res_small(pw_res_sample_count(n));
   protected_xc_buffer = false;
-  double *vxc = samples == NULL ? NULL : res_lookup(RES_VXC, vxc_host, n, false);
+  double *vxc = samples == NULL ? NULL : res_lookup(res_vtot_active_slot, vxc_host, n, false);
   if (vxc == NULL || !res_sample_buffer(s, pw_res_sample_count(n))) {
+    if (s->host == vxc_host) {
+      res_sync(res_vtot_active_slot);
+      res_invalidate(res_vtot_active_slot);
+    }
     res_stats.vtot_fail++;
     return 0;
   }
@@ -2747,13 +3385,18 @@ int pw_gpu_res_vtot_prepare_c(const double *vh_host, const double *vxc_host,
     protected_xc_buffer = false;
     if (!ok || s->epoch != xc_epoch) {
       res_pinned = 0;
-      if (s->epoch == xc_epoch) res_sync(RES_VXC); // a lazy Vxc is still intact
-      res_invalidate(RES_VXC);
+      if (s->epoch == xc_epoch) res_sync(res_vtot_active_slot);
+      res_invalidate(res_vtot_active_slot);
       res_stats.vtot_fail++;
       return 0;
     }
     offloadMemcpyAsyncHtoD(buffer_dev_1, vh_host, sizeof(double) * n, stream);
     vh = buffer_dev_1;
+    if (res[RES_VXC_B].state == RES_VALID && res_ensure_owned(RES_V_H_R, sizeof(double) * n)) {
+      pw_gpu_launch_copy(vh, res[RES_V_H_R].dev, n, n, 1, 1, 1.0, stream);
+      res_register(RES_V_H_R, vh_host, n, 1, 1, res[RES_V_H_R].dev);
+      vh = res[RES_V_H_R].dev;
+    }
   }
   pw_gpu_launch_axpy(vh, vxc, n, n, 1, 1, 1.0, dvol, stream);
   pw_gpu_launch_res_sample(vxc, samples, n, 1, stream);
@@ -2769,7 +3412,7 @@ int pw_gpu_res_vtot_prepare_c(const double *vh_host, const double *vxc_host,
 // Opt into the device result instead of the legacy host AXPY/commit pair.
 int pw_gpu_res_vtot_skip_host_c(void) {
   if (!is_initialized || !opt_res_pot || omp_get_num_threads() != 1) return 0;
-  res_slot *s = &res[RES_VXC];
+  res_slot *s = &res[res_vtot_active_slot];
   if (s->state == RES_VALID && s->vtot && s->dev_authoritative && s->epoch == xc_epoch) return 1;
   if (s->state != RES_PENDING || !s->vtot || s->epoch != xc_epoch || s->dev == NULL) return 0;
   s->state = RES_VALID;
@@ -2786,13 +3429,13 @@ int pw_gpu_res_vtot_commit_c(const double *vtot_host, const size_t n) {
   if (!is_initialized) {
     return 0;
   }
-  res_slot *s = &res[RES_VXC];
+  res_slot *s = &res[res_vtot_active_slot];
   bool ok = s->state == RES_PENDING && s->vtot && s->host == vtot_host &&
             s->n == n && s->epoch == xc_epoch && s->dev != NULL;
   ok = ok && res_samples_match(s, vtot_host);
   ok = ok && (!opt_res_verify || res_verify_full(s, vtot_host));
   if (!ok) {
-    res_invalidate(RES_VXC);
+    res_invalidate(res_vtot_active_slot);
     res_stats.vtot_fail++;
     return 0;
   }
@@ -2830,10 +3473,10 @@ static bool res_hartree_ready(void) {
          res_hartree.epoch == scratch_epoch && omp_get_num_threads() == 1;
 }
 
-int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host,
+static int res_hartree_begin(const double *core_host, const double *rho_g_host,
                                const double *infl_host, double *rho_tot_host,
                                const size_t ngpts, const size_t nprefix,
-                               const int *npts) {
+                               const int *npts, const double *rho_g_b_host) {
   mem_sample_entry();
   res_hartree.pending = false;
   if (!is_initialized || !opt_res_hartree || !opt_map_cache ||
@@ -2852,6 +3495,9 @@ int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host
       res[RES_RHO_G].state == RES_VALID && res[RES_RHO_G].natural_g &&
       res[RES_RHO_G].host == rho_g_host && res[RES_RHO_G].n == ngpts &&
       res_natural.n == nr && !memcmp(res_natural.npts, npts, sizeof(res_natural.npts));
+  if (rho_g_b_host != NULL &&
+      (!opt_uks || res_lookup_g(RES_RHO_G, rho_g_host, ngpts, natural) == NULL ||
+       res_lookup_g(RES_RHO_G_B, rho_g_b_host, ngpts, natural) == NULL)) return 0;
   protected_xc_buffer = natural;
   const bool fits = pw_gpu_ensure_buffer_c(2 * sizeof(double) * nr, 0, false) &&
                     pw_gpu_ensure_gbuf_c(zbytes);
@@ -2931,6 +3577,12 @@ int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host
   // rho_tot = pw_copy(rho_core) + rho_g and v_H = rho_tot * influence in one
   // pass (stage 5), bitwise as copy, pw_axpy and the product.
   pw_gpu_launch_res_tot_cmul(rho_tot, v_h, core_src, rg, infl, width, ngpts, stream);
+  if (rho_g_b_host != NULL) {
+    const double *rgb = res_lookup_g(RES_RHO_G_B, rho_g_b_host, ngpts, natural);
+    if (rgb == NULL) return res_hartree_fail();
+    pw_gpu_launch_axpy(rgb, rho_tot, ngpts, ngpts, 2, 2, 1.0, 1.0, stream);
+    pw_gpu_launch_res_cmul(v_h, rho_tot, infl, width, ngpts, stream);
+  }
   if (natural) {
     res_natural_download(rho_tot, rho_tot_host, res_natural.map, nprefix);
   } else {
@@ -2944,6 +3596,23 @@ int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host
   res_hartree.natural_g = natural;
   memcpy(res_hartree.npts, npts, sizeof(res_hartree.npts));
   return 1;
+}
+
+int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host,
+    const double *infl_host, double *rho_tot_host, size_t ngpts, size_t nprefix,
+    const int *npts) {
+  return res_hartree_begin(core_host, rho_g_host, infl_host, rho_tot_host,
+                           ngpts, nprefix, npts, NULL);
+}
+
+int pw_gpu_res_hartree_uks_begin_c(const double *rho_g_a, const double *rho_g_b,
+    const double *core, const double *infl, size_t ngpts, size_t nprefix,
+    const int *npts, double *rho_tot) {
+  if (!pw_gpu_uks_enabled_c() || rho_g_b == NULL) return 0;
+  protected_uks_buffer = true;
+  const int done = res_hartree_begin(core, rho_g_a, infl, rho_tot, ngpts, nprefix, npts, rho_g_b);
+  protected_uks_buffer = false;
+  return done;
 }
 
 int pw_gpu_res_hartree_modify_c(const double g0_delta, const int have_g0,
@@ -3246,7 +3915,7 @@ void pw_gpu_sfffc_grad3(const double *zin, double *dout_1, double *dout_2,
   }
 
   // CPU XC construction can reach this host-input path with a lazy density.
-  pw_gpu_res_ensure_host_c(RES_RHO_G, (void *)zin);
+  pw_gpu_res_ensure_host_c(-1, (void *)zin);
   offload_activate_chosen_device();
   const size_t buffer_size = 2 * sizeof(double) * nrpts;
   const size_t gbuf_size = 2 * sizeof(double) * ngpts;
@@ -3678,5 +4347,44 @@ void pw_gpu_sf(const double *zin, double *zout, const int *ghatmap,
 }
 
 #endif // defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+
+int pw_gpu_cholesky_restore_c(int op_solve, int side_right, int trans_t,
+                             int m, int n, const double *b, int ldb,
+                             const double *a, int lda, double *out, int ldout) {
+#if defined(__OFFLOAD_HIP) && defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+  if (!is_initialized || !pw_gpu_cholesky_fast_single_rank_c() ||
+      omp_get_num_threads() != 1 || m < 512 || n < 1 ||
+      (!(op_solve && n >= 256) && (size_t)m * n < (size_t)512 * 512)) return 0;
+  return cholesky_transform(op_solve, side_right, trans_t, m, n, b, ldb, a, lda, out, ldout, 0);
+#else
+  (void)op_solve;
+  (void)side_right;
+  (void)trans_t;
+  (void)m;
+  (void)n;
+  (void)b;
+  (void)ldb;
+  (void)a;
+  (void)lda;
+  (void)out;
+  (void)ldout;
+  return 0;
+#endif
+}
+
+int pw_gpu_cholesky_reduce_c(int n, double *a, int lda, const double *b, int ldb) {
+#if defined(__OFFLOAD_HIP) && defined(__OFFLOAD) && !defined(__NO_OFFLOAD_PW)
+  if (!is_initialized || !pw_gpu_cholesky_fast_single_rank_c() ||
+      omp_get_num_threads() != 1 || n < 512) return 0;
+  return cholesky_transform(1, 0, 1, n, n, b, ldb, a, lda, a, lda, 1);
+#else
+  (void)n;
+  (void)a;
+  (void)lda;
+  (void)b;
+  (void)ldb;
+  return 0;
+#endif
+}
 
 // EOF

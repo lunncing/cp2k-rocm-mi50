@@ -2,6 +2,7 @@
 #include "mock_offload.h"
 #include "pw_gpu_kernels.h"
 #include <assert.h>
+#include <limits.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -14,6 +15,7 @@
 
 size_t mock_allocated, mock_peak, mock_limit, mock_allocations;
 size_t mock_upload_bytes, mock_download_bytes;
+size_t mock_device_total_bytes, mock_device_external_bytes, mock_mem_info_calls;
 int mock_fft_calls, mock_uploads, mock_live_plans;
 int mock_live_streams, mock_live_events, mock_event_records, mock_event_waits;
 int mock_grid_calls, mock_hartree_calls, mock_pbe_calls;
@@ -94,9 +96,21 @@ static void touch(const void *ptr, size_t bytes) {
 }
 
 void offload_activate_chosen_device(void) {}
+void offloadMemGetInfo(size_t *free_bytes, size_t *total_bytes) {
+  *total_bytes = mock_device_total_bytes;
+  *free_bytes = mock_device_total_bytes > mock_device_external_bytes + mock_allocated
+      ? mock_device_total_bytes - mock_device_external_bytes - mock_allocated : 0;
+  mock_mem_info_calls++;
+}
+
 void offloadMalloc(void **ptr, size_t bytes) {
   assert(bytes > 0);
   assert(mock_limit == 0 || mock_allocated + bytes <= mock_limit);
+  if (mock_device_total_bytes != 0) {
+    size_t free_bytes, total_bytes;
+    offloadMemGetInfo(&free_bytes, &total_bytes);
+    assert(bytes <= free_bytes && "device allocation attempted without VRAM headroom");
+  }
   for (size_t i = 0; i < 64; i++) {
     if (allocations[i].ptr == NULL) {
       *ptr = malloc(bytes);
@@ -457,6 +471,35 @@ void pw_gpu_launch_pbe_lda(const double *rho, const double *norm, double *e0,
   mock_pbe_calls++;
 }
 
+void pw_gpu_launch_pbe_lsd(const double *ra, const double *rb,
+    const double *norm, const double *na, const double *nb, double *e0,
+    double *era, double *erb, double *en, double *ena, double *enb,
+    size_t n, int grad, double epsilon, double sx, double sc, offloadStream_t stream) {
+  begin_operation(MOCK_PBE, stream, e0, grad);
+  const double *parts[] = {ra, rb, norm, na, nb, e0, era, erb, en, ena, enb};
+  for (int part = 0; part < (grad ? 11 : 6); part++)
+    if (part != 5 || grad >= 0) touch(parts[part], n * sizeof(double));
+  for (size_t point = 0; point < n; point++)
+    pw_pbe_lsd_elem(ra[point], rb[point], norm[point], na[point], nb[point],
+        epsilon, sx, sc, grad, grad >= 0 ? e0 + point : NULL, grad ? era + point : NULL,
+        grad ? erb + point : NULL, grad ? en + point : NULL,
+        grad ? ena + point : NULL, grad ? enb + point : NULL);
+  mock_pbe_calls++;
+}
+
+void pw_gpu_launch_xc_pbe_lsd_combine(const double *ra, const double *rb,
+    double *ga0, double *ga1, double *ga2, double *gb0, double *gb1, double *gb2,
+    double *va, double *vb, double *energy, size_t n,
+    double epsilon, double sx, double sc, double cutoff, double smooth, offloadStream_t stream) {
+  begin_operation(MOCK_PBE, stream, energy, 1);
+  const double *parts[] = {ra, rb, ga0, ga1, ga2, gb0, gb1, gb2, va, vb, energy};
+  for (int part = 0; part < 11; part++) touch(parts[part], n * sizeof(double));
+  for (size_t point = 0; point < n; point++)
+    pw_xc_pbe_lsd_combine_elem(ra, rb, ga0, ga1, ga2, gb0, gb1, gb2, va,
+                              vb, energy, point, epsilon, sx, sc, cutoff, smooth);
+  mock_pbe_calls++;
+}
+
 void pw_gpu_launch_norm3(const double *g0, const double *g1, const double *g2,
                          double *norm, size_t n, offloadStream_t s) {
   begin_operation(MOCK_NORM3, s, norm, 0);
@@ -489,6 +532,17 @@ void pw_gpu_launch_xc_cutoff(double *values, const double *rho, size_t n,
   begin_operation(MOCK_XC_CUTOFF, s, values, 0);
   touch(values, n * sizeof(double)); touch(rho, n * sizeof(double));
   for (size_t i = 0; i < n; i++) values[i] = pw_xc_cutoff(values[i], rho[i], cutoff, range);
+}
+
+void pw_gpu_launch_xc_cutoff_lsd(double *target, const double *ra, const double *rb,
+    size_t count, double cutoff, double range, offloadStream_t stream) {
+  if (!count || range <= 0.0) return;
+  begin_operation(MOCK_XC_CUTOFF, stream, target, 0);
+  touch(target, count * sizeof(double));
+  touch(ra, count * sizeof(double));
+  touch(rb, count * sizeof(double));
+  for (size_t point = 0; point < count; point++)
+    target[point] = pw_xc_cutoff_lsd(target[point], ra[point], rb[point], cutoff, range);
 }
 
 void pw_gpu_launch_xc_reduce(const double *values, double *partial, size_t n, offloadStream_t s) {
@@ -670,4 +724,24 @@ void pw_gpu_launch_gtab_full(double *gt, const double *g, const int *map,
     for (int d = 0; d < 3; d++) gt[3 * p + (size_t)d] = g[3 * i + (size_t)d];
   }
   mock_res_calls++;
+}
+
+size_t mock_natural_mul_n, mock_natural_dot_n, mock_natural_prefix_n;
+void pw_gpu_launch_res_natural_cmul(double *out, const double *rho,
+    const double *infl, int width, size_t n, offloadStream_t stream) {
+  mock_natural_mul_n += n;
+  pw_gpu_launch_res_cmul(out, rho, infl, width, n, stream);
+}
+
+void pw_gpu_launch_res_natural_cdot_terms(const double *rho, const double *out,
+    double *terms, size_t n, offloadStream_t stream) {
+  mock_natural_dot_n += n;
+  pw_gpu_launch_res_cdot_terms(rho, out, terms, n, stream);
+}
+
+void pw_gpu_launch_res_natural_extract_prefix(const double *src, double *out,
+    const int *coords, size_t n, offloadStream_t stream) {
+  assert(n <= INT_MAX);
+  mock_natural_prefix_n += n;
+  if (n) pw_gpu_launch_gather(out, src, 1.0, (int)n, coords, stream);
 }

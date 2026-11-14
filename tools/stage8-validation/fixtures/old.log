@@ -1,0 +1,25 @@
+SYNTHETIC PARSER FIXTURE; NOT A GPU OR MOLECULAR MEASUREMENT
+ **** PROGRAM STARTED AT 2026-11-14 00:01:00
+ Spin 1
+ Number of electrons: 3
+ Spin 2
+ Number of electrons: 2
+ SCF WAVEFUNCTION OPTIMIZATION
+ Step     Update method      Time    Convergence         Total energy    Change
+ 1 OT DIIS 0.15E+00 12.0 1.0E-03 -25.0 -25.0
+ 2 OT DIIS 0.15E+00 2.0 1.0E-07 -26.0 -1.0
+ *** SCF run converged in 2 steps ***
+ Integrated spin density: 1.0
+ Integrated absolute spin density: 1.2
+ ENERGY| Total FORCE_EVAL ( QS ) energy [hartree] -26.0
+ ATOMIC FORCES in [a.u.]
+ # Atom Kind Element X Y Z
+ 1 1 Si 0.001 -0.002 0.003
+ 2 1 Si -0.001 0.002 -0.003
+ SUM OF ATOMIC FORCES 0.0 0.0 0.0
+ SUBROUTINE CALLS ASD SELF TIME TOTAL TIME
+ MAXIMUM AVERAGE MAXIMUM AVERAGE MAXIMUM
+ CP2K 1 1.0 0.1 0.2 19.0 20.0
+ qs_scf 1 2.0 0.3 0.4 14.0 15.0
+
+ **** PROGRAM ENDED AT 2026-11-14 00:01:20

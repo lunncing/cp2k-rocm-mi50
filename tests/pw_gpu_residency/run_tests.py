@@ -33,23 +33,7 @@ NATURAL_MOCK = r'''
 #include "pw_gpu_kernels.h"
 #include <assert.h>
 #include <limits.h>
-size_t mock_natural_mul_n, mock_natural_dot_n, mock_natural_prefix_n;
-void pw_gpu_launch_res_natural_cmul(double *v, const double *rho,
-    const double *infl, int width, size_t n, offloadStream_t s) {
-  mock_natural_mul_n += n;
-  pw_gpu_launch_res_cmul(v, rho, infl, width, n, s);
-}
-void pw_gpu_launch_res_natural_cdot_terms(const double *rho, const double *v,
-    double *terms, size_t n, offloadStream_t s) {
-  mock_natural_dot_n += n;
-  pw_gpu_launch_res_cdot_terms(rho, v, terms, n, s);
-}
-void pw_gpu_launch_res_natural_extract_prefix(const double *src, double *out,
-    const int *coords, size_t n, offloadStream_t s) {
-  assert(n <= INT_MAX);
-  mock_natural_prefix_n += n;
-  if (n) pw_gpu_launch_gather(out, src, 1.0, (int)n, coords, s);
-}
+extern size_t mock_natural_mul_n, mock_natural_dot_n, mock_natural_prefix_n;
 '''
 
 NATURAL_KERNEL_TESTS = r'''
@@ -334,7 +318,7 @@ static void natural_chunked_sync(void) {
   assert(pw_gpu_ensure_xc_c(4 * n * sizeof(double)));
   assert(res_sample_buffer(&res[RES_RHO_G], 2 * pw_res_sample_count(n)));
   offloadMemcpyAsyncHtoD(xc_dev, box, 2 * n * sizeof(double), stream);
-  res_register_natural_lazy(host, n, xc_dev);
+  res_register_natural_lazy(RES_RHO_G, host, n, xc_dev);
   assert(res_samples_match(&res[RES_RHO_G], ref));
   max_gpu_memory_bytes = mock_limit = current_gpu_allocated_bytes;
   mock_reset_trace();
@@ -596,7 +580,7 @@ static void natural_dz(void) {
     assert(density_fused(r, rg, rr));
     XC_OK(rg, rr, "tables after invalidation");
     assert(density_fused(r, rg, rr));
-    assert(res_dz.epoch == xc_epoch);
+    assert(res_dz[0].epoch == xc_epoch);
     double bad = 1.0;
     offloadMemcpyAsyncHtoD(xc_dev_hi + n + 3, &bad, sizeof(double), stream);
     const unsigned long bads = res_stats.dz_bad;
@@ -742,7 +726,7 @@ def main():
                    UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1")
         source = (ROOT / "src/pw/gpu/pw_gpu_kernels.cu").read_text()
         source, count = re.subn(r"(\w+)<<<(.*?)>>>\(", r"emulate(\1, \2, ", source, flags=re.S)
-        assert count == 34, count  # + 5 natural XC kernels (stage 4) + 5 paired/fused (stage 5) + 1 (stage 6)
+        assert count == 37, count
         prelude = (HERMES / "kernel_body_tests.py").read_text().split("prelude = '''", 1)[1].split("'''", 1)[0]
         body = (HERMES / "test_kernel_bodies.cpp").read_text()
         body = body.replace("int main() {", "static void hermes_main() {", 1)
@@ -773,7 +757,15 @@ def main():
         # the density token and the lazy Vxc/V_H.
         cases += [(name, {"CP2K_PW_GPU_RES_LAZY_POT": "0"})
                   for name in ("lazy_density", "integrate", "chain", "lazy_vtot", "borrowed")]
-        cases += [(name, {}) for name in ("lazy_grant", "lazy_pot")]
+        cases += [(name, {}) for name in ("lazy_grant", "lazy_pot", "lazy_vtot_prepare_failure",
+                                         "uks_density_budget", "headroom", "headroom_tables",
+                                         "uks_reclaim", "uks_compact", "uks_oom")]
+        cases += [("uks_oom", {"CP2K_PW_GPU_RES_LAZY_DENSITY": "0"})]
+        cases += [(name, overrides) for name in ("uks", "uks_sparse") for overrides in (
+            {}, {"CP2K_PW_GPU_RES_LAZY_DENSITY": "0", "CP2K_PW_GPU_RES_LAZY_POT": "0"},
+            {"CP2K_PW_GPU_RES_NATURAL_G": "0"}, {"CP2K_PW_GPU_RES_XC_PAIRS": "0"},
+            {"CP2K_PW_GPU_RES_VERIFY": "1"}, {"CP2K_PW_GPU_RES_XC_DZ": "0"},
+            {"CP2K_PW_GPU_RES_XCIN": "0"})]
         for name, overrides in cases:
             for threads in ("1", "3"):
                 r = subprocess.run([str(exes["test_res"]), name],

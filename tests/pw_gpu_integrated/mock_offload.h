@@ -12,6 +12,7 @@ typedef struct mock_fft_plan *offload_fftHandle;
 
 extern size_t mock_allocated, mock_peak, mock_limit, mock_allocations;
 extern size_t mock_upload_bytes, mock_download_bytes;
+extern size_t mock_device_total_bytes, mock_device_external_bytes, mock_mem_info_calls;
 extern int mock_fft_calls, mock_uploads, mock_live_plans;
 extern int mock_live_streams, mock_live_events, mock_event_records, mock_event_waits;
 extern int mock_grid_calls, mock_hartree_calls, mock_pbe_calls;
@@ -40,6 +41,7 @@ void mock_reset_trace(void);
 
 void offload_activate_chosen_device(void);
 void offloadMalloc(void **ptr, size_t bytes);
+void offloadMemGetInfo(size_t *free_bytes, size_t *total_bytes);
 void offloadFree(void *ptr);
 void offloadStreamCreate(offloadStream_t *stream);
 void offloadStreamDestroy(offloadStream_t stream);

@@ -14,7 +14,26 @@
 
 #define PW_GPU_ELEMENTAL static inline
 #include "pw_gpu_fused_ops.h"
+#include "pw_gpu_pbe.h"
+#include "pw_gpu_xc_ops.h"
 #undef PW_GPU_ELEMENTAL
+
+static inline void pw_gpu_host_xc_cutoff_lsd(double *target, const double *ra,
+    const double *rb, size_t count, double cutoff, double range) {
+  for (size_t point = 0; point < count; point++)
+    target[point] = pw_xc_cutoff_lsd(target[point], ra[point], rb[point], cutoff, range);
+}
+
+static inline void pw_gpu_host_pbe_lsd(const double *ra, const double *rb,
+    const double *norm, const double *na, const double *nb, double *e0,
+    double *era, double *erb, double *en, double *ena, double *enb,
+    size_t n, int grad, double epsilon, double sx, double sc) {
+  for (size_t point = 0; point < n; point++)
+    pw_pbe_lsd_elem(ra[point], rb[point], norm[point], na[point], nb[point],
+        epsilon, sx, sc, grad, grad >= 0 ? e0 + point : NULL, grad ? era + point : NULL,
+        grad ? erb + point : NULL, grad ? en + point : NULL,
+        grad ? ena + point : NULL, grad ? enb + point : NULL);
+}
 
 // A dependency-free host path is needed even in builds without FFTW. These
 // mixed-radix, unnormalized FFTs use the same signs and layouts as the device

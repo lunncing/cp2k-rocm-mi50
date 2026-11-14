@@ -500,6 +500,92 @@ static void environment_limit(void) {
 #include "test_grid_ops.h"
 #include "test_xc_pipeline.h"
 
+static void uks_operations(const int limited) {
+  xc_inputs();
+  double rb[27], zb[16], actual[6][27], expected[6][27], va[27], vb[27], energy;
+  double norm[27], na[27], nb[27];
+  for (int point = 0; point < 27; point++) {
+    rb[point] = .2 + .03 * sin(point);
+    norm[point] = .02 * point;
+    na[point] = .01 * point;
+    nb[point] = .03 * point;
+  }
+  xc_rho[0] = 0.0;
+  rb[0] = 1.0;
+  xc_rho[1] = 1.0;
+  rb[1] = 0.0;
+  for (int point = 0; point < 16; point++) zb[point] = -.3 * xc_z[point];
+  start(0);
+  const bool enabled = pw_gpu_uks_enabled_c() != 0;
+  if (limited) {
+    max_gpu_memory_bytes = 1;
+    mock_limit = 1;
+  }
+  for (int derivative = -2; derivative <= 2; derivative++) {
+    for (int output = 0; output < 6; output++)
+      for (int point = 0; point < 27; point++) actual[output][point] = expected[output][point] = .013;
+    const bool eligible = enabled && !limited && derivative >= -1 && derivative <= 1;
+    if (eligible)
+      pw_gpu_host_pbe_lsd(xc_rho, rb, norm, na, nb, expected[0], expected[1],
+          expected[2], expected[3], expected[4], expected[5], 27, derivative, 1e-12, .9, .7);
+    assert(pw_gpu_pbe_lsd_eval_c(xc_rho, rb, norm, na, nb, actual[0], actual[1],
+        actual[2], actual[3], actual[4], actual[5], 27, derivative, 1e-12, .9, .7) == eligible);
+    assert(!memcmp(actual, expected, sizeof(actual)));
+    for (int output = 0; output < 6; output++)
+      for (int point = 0; point < 27; point++) {
+        assert(isfinite(actual[output][point]));
+        if ((output == 0 && derivative < 0) || (output > 0 && derivative == 0))
+          assert(actual[output][point] == .013);
+      }
+    if (eligible && derivative != 0)
+      assert(actual[1][0] != .013 && actual[2][1] != .013);
+    if (derivative == -1 || derivative == 0) {
+      for (int output = 0; output < 6; output++)
+        for (int point = 0; point < 27; point++) actual[output][point] = .013;
+      assert(pw_gpu_pbe_lsd_eval_c(xc_rho, rb, norm, na, nb,
+          derivative >= 0 ? actual[0] : NULL, derivative ? actual[1] : NULL,
+          derivative ? actual[2] : NULL, derivative ? actual[3] : NULL,
+          derivative ? actual[4] : NULL, derivative ? actual[5] : NULL,
+          27, derivative, 1e-12, .9, .7) == eligible);
+      assert(!memcmp(actual, expected, sizeof(actual)));
+    }
+  }
+  assert(!pw_gpu_pbe_lsd_eval_c(xc_rho, rb, norm, na, nb, actual[0], actual[1],
+      actual[1], actual[3], actual[4], actual[5], 27, 1, 1e-12, .9, .7));
+  assert(!memcmp(actual, expected, sizeof(actual)));
+  for (int point = 0; point < 27; point++) va[point] = vb[point] = -7.0;
+  energy = -11.0;
+  const bool eligible = enabled && opt_full_pipeline && !limited;
+  assert(pw_gpu_xc_full_pipeline_lsd_configured_c(xc_z, zb, xc_rho, rb, va, vb, &energy,
+      xc_map, xc_g, xc_dims, 8, 2, 1, 1e-12, .9, .7, .02, 0, .37, 1) == eligible);
+  if (!eligible) {
+    assert(energy == -11.0);
+    for (int point = 0; point < 27; point++) assert(va[point] == -7.0 && vb[point] == -7.0);
+  } else {
+    double swapped_a[27], swapped_b[27], swapped_energy;
+    assert(pw_gpu_xc_full_pipeline_lsd_configured_c(zb, xc_z, rb, xc_rho,
+        swapped_a, swapped_b, &swapped_energy, xc_map, xc_g, xc_dims,
+        8, 2, 1, 1e-12, .9, .7, .02, 0, .37, 1));
+    xc_close(va, swapped_b, 27);
+    xc_close(vb, swapped_a, 27);
+    xc_close(&energy, &swapped_energy, 1);
+    double axes[3][8];
+    for (int dim = 0; dim < 3; dim++)
+      for (int point = 0; point < 8; point++) axes[dim][point] = xc_g[3 * point + dim];
+    const int bounds[6] = {-1, 1, 2, 4, 0, 2};
+    assert(pw_gpu_xc_full_pipeline_lsd_c(xc_rho, rb, xc_z, zb, 27, xc_dims, xc_dims, bounds,
+        8, NULL, xc_map, 0, axes[0], axes[1], axes[2], 1e-12, .9, .7, .02, 0, .37, va, vb, &energy));
+    assert(pw_gpu_xc_full_pipeline_lsd_configured_c(xc_z, zb, xc_rho, rb, swapped_a, swapped_b,
+        &swapped_energy, xc_map, xc_g, xc_dims, 8, 1, 1, 1e-12, .9, .7, .02, 0, .37, 0));
+    xc_close(va, swapped_a, 27);
+    xc_close(vb, swapped_b, 27);
+    xc_close(&energy, &swapped_energy, 1);
+    assert(!pw_gpu_xc_full_pipeline_lsd_c(xc_rho, rb, xc_z, zb, 26, xc_dims, xc_dims, bounds,
+        8, NULL, xc_map, 0, axes[0], axes[1], axes[2], 1e-12, .9, .7, .02, 0, .37, va, vb, &energy));
+  }
+  finish();
+}
+
 int main(int argc, char **argv) {
   assert(argc >= 2);
   if (!strcmp(argv[1], "limits")) limits();
@@ -507,6 +593,8 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[1], "xc_limits")) xc_limits(0);
   else if (!strcmp(argv[1], "xc_disabled")) xc_limits(1);
   else if (!strcmp(argv[1], "xc_edges")) xc_edges();
+  else if (!strcmp(argv[1], "uks")) uks_operations(0);
+  else if (!strcmp(argv[1], "uks_limits")) uks_operations(1);
   else if (!strcmp(argv[1], "grid_ops")) grid_ops();
   else if (!strcmp(argv[1], "new_limits")) new_limits(0);
   else if (!strcmp(argv[1], "new_disabled")) new_limits(argc > 2 ? atoi(argv[2]) + 1 : 1);

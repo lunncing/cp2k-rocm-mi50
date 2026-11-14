@@ -9,9 +9,9 @@
 #:set dims = {'1': ':', '3': ':, :, :'}
 #:set shape = {'1': '257', '3': '7, 3, 5'}
 #define CPABORT(message) ERROR STOP message
-#define MARK_USED(value)
+#define MARK_USED(value) IF (C_ASSOCIATED(value)) CONTINUE
 MODULE integral_fixture
-   USE ISO_C_BINDING, ONLY: C_DOUBLE, C_INT, C_PTR, C_LOC
+   USE ISO_C_BINDING, ONLY: C_DOUBLE, C_INT, C_PTR, C_LOC, C_ASSOCIATED
    IMPLICIT NONE
    INTEGER, PARAMETER :: dp = C_DOUBLE, HALFSPACE = 1, PW_MODE_DISTRIBUTED = 2
    INTEGER, PARAMETER :: do_accurate_sum = 0, do_standard_sum = 1

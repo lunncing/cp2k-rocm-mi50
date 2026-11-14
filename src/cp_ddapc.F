@@ -39,6 +39,8 @@ MODULE cp_ddapc
    USE kinds,                           ONLY: dp
    USE particle_types,                  ONLY: particle_type
    USE pw_gpu,                          ONLY: pw_gpu_res_enabled,&
+                                              pw_gpu_uks_enabled,&
+                                              pw_gpu_res_hartree_uks_begin,&
                                               pw_gpu_res_hartree_begin,&
                                               pw_gpu_res_hartree_cancel,&
                                               pw_gpu_res_hartree_energy,&
@@ -75,7 +77,7 @@ MODULE cp_ddapc
 
    PUBLIC :: cp_ddapc_apply_CD, & ! Apply Coupling/Decoupling to Periodic Images
              qs_ks_ddapc, &
-             qs_ks_ddapc_device_begin, qs_ks_ddapc_device_finish
+             qs_ks_ddapc_device_begin, qs_ks_ddapc_device_finish, qs_ks_periodic_device
 
 CONTAINS
 
@@ -260,10 +262,11 @@ CONTAINS
       CALL get_qs_env(qs_env, dft_control=dft_control, rho=rho, rho_core=rho_core, &
                       qs_charges=qs_charges, input=input)
       IF (.NOT. ASSOCIATED(rho) .OR. .NOT. ASSOCIATED(rho_core) .OR. .NOT. ASSOCIATED(qs_charges)) RETURN
-      IF (dft_control%nspins /= 1) RETURN
+      IF (.NOT. (dft_control%nspins == 1 .OR. &
+                 (dft_control%nspins == 2 .AND. pw_gpu_uks_enabled()))) RETURN
       CALL qs_rho_get(rho, rho_g=rho_g)
       IF (.NOT. ASSOCIATED(rho_g)) RETURN
-      IF (SIZE(rho_g) /= 1) RETURN
+      IF (SIZE(rho_g) /= dft_control%nspins) RETURN
       grid => rho_tot_gspace%pw_grid
       IF (.NOT. ASSOCIATED(grid)) RETURN
       IF (grid%para%mode /= PW_MODE_LOCAL .OR. .NOT. grid%have_g0 .OR. grid%first_gne0 /= 2) RETURN
@@ -285,13 +288,68 @@ CONTAINS
                IF (grid%gsq(ig) > gcut2) EXIT
                nprefix = ig
             END DO
-            done = pw_gpu_res_hartree_begin(rho_core, rho_g(1), poisson_env%green_fft%influence_fn, &
-                                            rho_tot_gspace, nprefix)
+            IF (SIZE(rho_g) == 1) THEN
+               done = pw_gpu_res_hartree_begin(rho_core, rho_g(1), poisson_env%green_fft%influence_fn, &
+                                               rho_tot_gspace, nprefix)
+            ELSE
+               done = pw_gpu_res_hartree_uks_begin(rho_g(1), rho_g(2), rho_core, &
+                       poisson_env%green_fft%influence_fn, nprefix, rho_tot_gspace)
+            END IF
          END IF
       END IF
       IF (done) qs_charges%total_rho_gspace = pw_integrate_function(rho_tot_gspace, isign=-1)
       CALL timestop(handle)
    END SUBROUTINE qs_ks_ddapc_device_begin
+
+   SUBROUTINE qs_ks_periodic_device(qs_env, poisson_env, rho_tot_gspace, energy, done)
+      TYPE(qs_environment_type), POINTER :: qs_env
+      TYPE(pw_poisson_type), POINTER :: poisson_env
+      TYPE(pw_c1d_gs_type), INTENT(INOUT) :: rho_tot_gspace
+      TYPE(qs_energy_type), POINTER :: energy
+      LOGICAL, INTENT(OUT) :: done
+      INTEGER, PARAMETER :: use_gs_grid = 1
+      REAL(KIND=dp) :: dot
+      TYPE(dft_control_type), POINTER :: dft_control
+      TYPE(qs_rho_type), POINTER :: rho
+      TYPE(qs_charges_type), POINTER :: qs_charges
+      TYPE(pw_c1d_gs_type), DIMENSION(:), POINTER :: rho_g
+      TYPE(pw_c1d_gs_type), POINTER :: rho_core
+      TYPE(pw_r3d_rs_type), POINTER :: v_hartree_rspace
+      TYPE(pw_grid_type), POINTER :: grid
+
+      done = .FALSE.
+      IF (.NOT. pw_gpu_res_enabled(pw_gpu_res_hartree_id)) RETURN
+      IF (.NOT. ASSOCIATED(poisson_env)) RETURN
+      IF (poisson_env%used_grid /= use_gs_grid .OR. poisson_env%parameters%has_dielectric) RETURN
+      CALL get_qs_env(qs_env, dft_control=dft_control, rho=rho, rho_core=rho_core, &
+                      qs_charges=qs_charges, v_hartree_rspace=v_hartree_rspace)
+      IF (.NOT. (dft_control%nspins == 1 .OR. &
+                 (dft_control%nspins == 2 .AND. pw_gpu_uks_enabled()))) RETURN
+      IF (.NOT. ASSOCIATED(rho) .OR. .NOT. ASSOCIATED(rho_core) .OR. &
+          .NOT. ASSOCIATED(qs_charges) .OR. .NOT. ASSOCIATED(v_hartree_rspace)) RETURN
+      CALL qs_rho_get(rho, rho_g=rho_g)
+      IF (.NOT. ASSOCIATED(rho_g)) RETURN
+      IF (SIZE(rho_g) /= dft_control%nspins) RETURN
+      grid => rho_tot_gspace%pw_grid
+      IF (.NOT. ASSOCIATED(grid)) RETURN
+      IF (grid%para%mode /= PW_MODE_LOCAL .OR. .NOT. grid%have_g0 .OR. grid%first_gne0 /= 2) RETURN
+      CALL pw_poisson_rebuild(poisson_env, rho_tot_gspace)
+      IF (.NOT. ASSOCIATED(poisson_env%green_fft)) RETURN
+      IF (.NOT. ASSOCIATED(poisson_env%green_fft%influence_fn%pw_grid, grid)) RETURN
+      IF (SIZE(rho_g) == 1) THEN
+         done = pw_gpu_res_hartree_begin(rho_core, rho_g(1), poisson_env%green_fft%influence_fn, rho_tot_gspace, 1)
+      ELSE
+         done = pw_gpu_res_hartree_uks_begin(rho_g(1), rho_g(2), rho_core, &
+                 poisson_env%green_fft%influence_fn, 1, rho_tot_gspace)
+      END IF
+      IF (done) qs_charges%total_rho_gspace = pw_integrate_function(rho_tot_gspace, isign=-1)
+      IF (done) done = pw_gpu_res_hartree_energy(dot)
+      IF (done) THEN
+         energy%hartree = 0.5_dp*(dot*poisson_env%green_fft%influence_fn%pw_grid%vol)
+         done = pw_gpu_res_hartree_finish(v_hartree_rspace, grid)
+      END IF
+      IF (.NOT. done) CALL pw_gpu_res_hartree_cancel()
+   END SUBROUTINE qs_ks_periodic_device
 
 ! **************************************************************************************************
 !> \brief Device-resident Hartree potential with DDAPC decoupling, step 2. Replaces qs_ks_ddapc

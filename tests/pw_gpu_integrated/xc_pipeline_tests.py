@@ -13,7 +13,8 @@ ROOT = HERE.parents[1]
 def run_xc_pipeline_tests(build, compiler, flags, include, blas, env, sanitize):
     wrapper = (ROOT / "src/pw/pw_gpu.F").read_text()
     bindings = "\n".join(routine(wrapper, name, True) for name in (
-        "pw_gpu_fused_xc_available", "pw_gpu_xc_full_pipeline_available", "pw_gpu_xc_full_pipeline"))
+        "pw_gpu_fused_xc_available", "pw_gpu_xc_full_pipeline_available", "pw_gpu_xc_full_pipeline",
+        "pw_gpu_xc_full_pipeline_lsd", "pw_gpu_uks_enabled", "pw_gpu_pbe_lsd_eval"))
     # The first two functions have an untyped FUNCTION declaration.
     (build / "xc_bindings.inc").write_text(bindings)
     xc = (ROOT / "src/xc/xc.F").read_text()
@@ -27,6 +28,12 @@ def run_xc_pipeline_tests(build, compiler, flags, include, blas, env, sanitize):
     pbe = pbe.replace("SUBROUTINE pbe_lda_calc", "SUBROUTINE cpu_pbe_lda_calc")
     pbe = re.sub(r"gpu_done = pbe_lda_eval_gpu\(.*?scale_ex\)", "gpu_done = .FALSE.", pbe, flags=re.S)
     (build / "xc_cpu_pbe.inc").write_text(pbe)
+    source = (ROOT / "src/xc/xc_pbe.F").read_text()
+    lsd = routine(source, "pbe_lsd_calc")
+    reference = lsd.replace("SUBROUTINE pbe_lsd_calc", "SUBROUTINE cpu_pbe_lsd_calc")
+    reference = re.sub(r"gpu_done = pbe_lsd_eval_gpu\(.*?scale_ec\)", "gpu_done = .FALSE.",
+                       reference, flags=re.S)
+    (build / "xc_lsd_pbe.inc").write_text(lsd + reference + routine(source, "pbe_lsd_eval_gpu", True))
     fc = shlex.split(os.environ.get("FC", "gfortran"))
     fflags = ["-cpp", "-ffree-form", "-std=f2008", "-Werror=line-truncation", "-fcheck=all", "-fmax-errors=5",
               "-ffp-contract=off", "-fopenmp", "-I", str(build), "-J", str(build)]

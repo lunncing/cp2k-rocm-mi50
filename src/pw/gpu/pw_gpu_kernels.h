@@ -87,6 +87,17 @@ void pw_gpu_launch_modify_hartree(double *, const double *, const double *,
 void pw_gpu_launch_pbe_lda(const double *, const double *, double *, double *,
     double *, size_t, int, double, double, double, double, double, double,
     offloadStream_t);
+void pw_gpu_launch_pbe_lsd(const double *, const double *, const double *,
+    const double *, const double *, double *, double *, double *, double *,
+    double *, double *, size_t, int, double, double, double, offloadStream_t);
+void pw_gpu_launch_xc_pbe_lsd_combine(const double *, const double *,
+    double *, double *, double *, double *, double *, double *,
+    double *, double *, double *, size_t, double, double, double, double,
+    double, offloadStream_t);
+int pw_gpu_uks_enabled_c(void);
+int pw_gpu_pbe_lsd_eval_c(const double *, const double *, const double *,
+    const double *, const double *, double *, double *, double *, double *,
+    double *, double *, size_t, int, double, double, double);
 void pw_gpu_launch_norm3(const double *, const double *, const double *,
                          double *, size_t, offloadStream_t);
 void pw_gpu_launch_combine_div_input(double *, double *, double *,
@@ -94,6 +105,8 @@ void pw_gpu_launch_combine_div_input(double *, double *, double *,
 void pw_gpu_launch_add_vrho(double *, const double *, size_t, offloadStream_t);
 void pw_gpu_launch_xc_cutoff(double *, const double *, size_t, double, double,
                              offloadStream_t);
+void pw_gpu_launch_xc_cutoff_lsd(double *, const double *, const double *,
+                                 size_t, double, double, offloadStream_t);
 // Produces pw_gpu_xc_reduce_size(n) doubles: sum/correction pairs until the
 // final scalar. Keeping the corrections avoids losing cancellation accuracy.
 void pw_gpu_launch_xc_reduce(const double *, double *, size_t, offloadStream_t);
@@ -170,6 +183,14 @@ int pw_gpu_xc_full_pipeline_configured_c(const double *zin_rho_g,
     double scale, int grid_id, double epsilon_rho, double kappa, double beta,
     double mu, double scale_ec, double scale_ex, double gradient_cutoff,
     double smooth_range, int spherical);
+int pw_gpu_xc_full_pipeline_lsd_configured_c(const double *, const double *,
+    const double *, const double *, double *, double *, double *, const int *,
+    const double *, const int *, int, int, int, double, double, double, double,
+    double, double, int);
+int pw_gpu_xc_full_pipeline_lsd_c(const double *, const double *, const double *,
+    const double *, int, const int *, const int *, const int *, int, const int *,
+    const int *, int, const double *, const double *, const double *, double,
+    double, double, double, double, double, double *, double *, double *);
 
 // Synchronous host-pointer attempts: 1 = completed, 0 = leave all host outputs
 // untouched and execute the original Fortran path. A memory failure observes
@@ -192,6 +213,7 @@ void pw_gpu_res_invalidate_c(void);
 void pw_gpu_res_ensure_host_c(int id, void *host_ptr);
 int pw_gpu_res_matches_c(int id, const void *host, size_t n);
 int pw_gpu_res_integrate_r_c(double *total_rho_out, double dvol);
+int pw_gpu_res_integrate_r_host_c(const double *, size_t, double *, double);
 // Non-NULL r_dev[l] borrows a completed, layout-compatible real Grid box and
 // replaces r_host[l]. The caller retains the allocation through this call.
 int pw_gpu_res_density_c(int nlevels, void *const *r_host, const int *npts,
@@ -215,10 +237,13 @@ int pw_gpu_res_vtot_skip_host_c(void);
 // release of a host array that is not read again (drops its device copy).
 void pw_gpu_res_set_lazy_c(int on);
 void pw_gpu_res_defer_density_c(int on);
+void pw_gpu_res_allow_density_c(void);
 void pw_gpu_res_discard_c(const void *host_ptr);
 int pw_gpu_res_hartree_begin_c(const double *core_host, const double *rho_g_host,
     const double *infl_host, double *rho_tot_host, size_t ngpts, size_t nprefix,
     const int *npts);
+int pw_gpu_res_hartree_uks_begin_c(const double *, const double *, const double *,
+    const double *, size_t, size_t, const int *, double *);
 int pw_gpu_res_hartree_modify_c(double g0_delta, int have_g0, const double *g,
     const double *gsq, const double *r, const double *radii, const double *cv,
     size_t first, size_t n, size_t natoms, size_t nradii, double gcut2, double vol);

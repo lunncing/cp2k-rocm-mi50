@@ -5,6 +5,8 @@ MODULE test_support
    INTEGER :: remote_rebuild = 0, reductions = 0, comm_refs(16) = 0
    INTEGER :: last_qr = -1, previous_qr = -1, last_flags(4) = 0
    INTEGER :: last_layout(8) = 0, last_solver = 0, last_threads = 0
+   INTEGER :: gpu_setups = 0, last_kernel = 0
+   LOGICAL :: fail_gpu_setup = .FALSE., support_avx512 = .TRUE., support_avx2 = .TRUE.
    LOGICAL :: support_gpu = .TRUE., support_amd = .TRUE., support_omp = .TRUE., initialized = .FALSE.
 CONTAINS
    SUBROUTINE verify(condition, message)
@@ -235,10 +237,12 @@ MODULE elpa
    TYPE, ABSTRACT :: elpa_t
       INTEGER :: layout(8) = 0, flags(4) = 0, solver = 0, kernel = 0, qr = 0, threads = 0
       LOGICAL :: ready = .FALSE.
+      LOGICAL :: gpu_ready = .FALSE., gpu_attempted = .FALSE.
    CONTAINS
       PROCEDURE :: set
       PROCEDURE :: can_set
       PROCEDURE :: setup
+      PROCEDURE :: setup_gpu
       PROCEDURE :: eigenvectors
    END TYPE
    TYPE, EXTENDS(elpa_t) :: mock_elpa_t
@@ -285,6 +289,17 @@ CONTAINS
          supported = support_amd
       CASE ("omp_threads")
          supported = support_omp
+      CASE ("real_kernel")
+         SELECT CASE (value)
+         CASE (ELPA_2STAGE_REAL_AVX512_BLOCK4)
+            supported = support_avx512
+         CASE (ELPA_2STAGE_REAL_AVX2_BLOCK2)
+            supported = support_avx2
+         CASE (ELPA_2STAGE_REAL_GENERIC)
+            supported = .TRUE.
+         CASE DEFAULT
+            supported = .FALSE.
+         END SELECT
       CASE DEFAULT
          supported = .FALSE.
       END SELECT
@@ -321,6 +336,7 @@ CONTAINS
          IF (error /= ELPA_OK) RETURN
          IF (key == "gpu") this%flags(1) = value
          IF (key == "amd-gpu") this%flags(2) = value
+         CALL verify(SUM(this%flags(1:2)) <= 1, "Mutually exclusive GPU flags enabled together")
          IF (key == "omp_threads") this%threads = value
       CASE ("nvidia-gpu")
          this%flags(3) = value
@@ -329,8 +345,9 @@ CONTAINS
       CASE ("real_kernel")
          CALL verify(this%solver == ELPA_SOLVER_2STAGE, "Kernel set on one-stage solver")
          IF (value == ELPA_2STAGE_REAL_AMD_GPU) THEN
-            CALL verify((this%flags(1) == 1) .EQV. support_gpu, "Generic GPU flag missing before kernel")
+            CALL verify((this%flags(1) == 1) .EQV. (support_gpu .AND. .NOT. support_amd), "GPU flag precedence")
             CALL verify((this%flags(2) == 1) .EQV. support_amd, "AMD GPU flag missing before kernel")
+            CALL verify(this%gpu_ready, "GPU kernel selected without setup_gpu")
          END IF
          this%kernel = value
       CASE ("qr")
@@ -353,6 +370,15 @@ CONTAINS
       setups = setups + 1
       setup = ELPA_OK
    END FUNCTION
+   INTEGER FUNCTION setup_gpu(this)
+      CLASS(elpa_t), INTENT(INOUT) :: this
+      CALL verify(this%ready .AND. SUM(this%flags(1:2)) == 1, "Invalid GPU setup ordering")
+      CALL verify(.NOT. this%gpu_attempted, "Repeated GPU setup on cached handle")
+      this%gpu_attempted = .TRUE.
+      gpu_setups = gpu_setups + 1
+      this%gpu_ready = .NOT. fail_gpu_setup
+      setup_gpu = MERGE(ELPA_OK, -1, this%gpu_ready)
+   END FUNCTION setup_gpu
    SUBROUTINE eigenvectors(this, matrix, eval, vectors, error)
       CLASS(elpa_t), INTENT(INOUT) :: this
       REAL(dp), INTENT(INOUT) :: matrix(:, :)
@@ -375,6 +401,7 @@ CONTAINS
       last_layout = this%layout
       last_solver = this%solver
       last_threads = this%threads
+      last_kernel = this%kernel
       solves = solves + 1
       error = ELPA_OK
    END SUBROUTINE

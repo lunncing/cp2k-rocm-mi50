@@ -155,6 +155,8 @@ MODULE cp_fm_elpa
 
 #if defined(__ELPA)
    INTEGER, SAVE :: elpa_kernel = elpa_kernel_ids(1) ! auto
+   LOGICAL, SAVE :: elpa_auto_selected = .TRUE., cached_gpu_failed = .FALSE.
+   INTEGER, SAVE :: cached_requested_kernel = ELPA_2STAGE_REAL_INVALID
    ! elpa_t is abstract; retain the polymorphic solver and its parent environment together.
    CLASS(elpa_t), POINTER, SAVE :: cached_elpa_obj => NULL()
    TYPE(mp_para_env_type), POINTER, SAVE :: cached_para_env => NULL()
@@ -236,6 +238,7 @@ CONTAINS
       INTEGER                                            :: cpuid
 
       elpa_kernel = requested_kernel
+      elpa_auto_selected = requested_kernel == ELPA_2STAGE_REAL_INVALID
 
       ! Resolve AUTO kernel.
       IF (elpa_kernel == ELPA_2STAGE_REAL_INVALID) THEN
@@ -320,6 +323,36 @@ CONTAINS
    END SUBROUTINE cp_fm_diag_elpa
 
 #if defined(__ELPA)
+   INTEGER FUNCTION elpa_gpu_min_n() RESULT(min_n)
+      INTEGER, SAVE :: configured_min = -1
+      INTEGER :: status, parsed
+      CHARACTER(LEN=64) :: value
+      IF (configured_min < 0) THEN
+         configured_min = 12288
+         CALL get_environment_variable("CP2K_ELPA_GPU_N_MIN", value, status=status)
+         IF (status == 0 .AND. LEN_TRIM(value) > 0) THEN
+            value = ADJUSTL(value)
+            IF (VERIFY(TRIM(value), "0123456789") == 0) THEN
+               READ (value, *, IOSTAT=status) parsed
+               IF (status == 0) THEN
+                  IF (parsed >= 0) configured_min = parsed
+               END IF
+            END IF
+         END IF
+      END IF
+      min_n = configured_min
+   END FUNCTION elpa_gpu_min_n
+
+   INTEGER FUNCTION elpa_cpu_kernel(elpa_obj) RESULT(kernel)
+      CLASS(elpa_t), INTENT(INOUT) :: elpa_obj
+      kernel = ELPA_2STAGE_REAL_GENERIC
+      IF (elpa_obj%can_set("real_kernel", ELPA_2STAGE_REAL_AVX512_BLOCK4) == ELPA_OK) THEN
+         kernel = ELPA_2STAGE_REAL_AVX512_BLOCK4
+      ELSE IF (elpa_obj%can_set("real_kernel", ELPA_2STAGE_REAL_AVX2_BLOCK2) == ELPA_OK) THEN
+         kernel = ELPA_2STAGE_REAL_AVX2_BLOCK2
+      END IF
+   END FUNCTION elpa_cpu_kernel
+
 ! **************************************************************************************************
 !> \brief Release the cached solver before its parent communicator or ELPA is finalized.
 ! **************************************************************************************************
@@ -335,6 +368,7 @@ CONTAINS
       cached_n = 0
       cached_nblk = 0
       cached_comm = 0
+      cached_gpu_failed = .FALSE.
    END SUBROUTINE release_cached_elpa
 
 ! **************************************************************************************************
@@ -356,13 +390,14 @@ CONTAINS
 
       CLASS(elpa_t), POINTER                   :: elpa_obj
       CHARACTER(len=default_string_length)     :: kernel_name
+      CHARACTER(len=7) :: amd_option
       TYPE(mp_comm_type) :: group
       INTEGER                                  :: i, &
                                                   mypcol, myprow, n, &
                                                   n_rows, n_cols, &
                                                   nblk, neig, io_unit, &
-                                                  success, comm, solver, nthreads, rebuild
-      LOGICAL                                  :: use_qr, check_eigenvalues, use_amd_gpu
+                                                  success, comm, solver, nthreads, rebuild, resolved_kernel, gpu_failure
+      LOGICAL                                  :: use_qr, check_eigenvalues, use_amd_gpu, prefer_cpu
       REAL(KIND=dp), DIMENSION(:), ALLOCATABLE :: eval, eval_noqr
       TYPE(cp_blacs_env_type), POINTER         :: context
       TYPE(cp_fm_type)                         :: matrix_noqr, eigenvectors_noqr
@@ -439,21 +474,12 @@ CONTAINS
 
          ! Find name for given kernel id.
          ! In case of ELPA_2STAGE_REAL_DEFAULT was used it might not be in our elpa_kernel_ids list.
-         kernel_name = "id: "//TRIM(ADJUSTL(cp_to_string(elpa_kernel)))
-         DO i = 1, SIZE(elpa_kernel_ids)
-            IF (elpa_kernel_ids(i) == elpa_kernel) THEN
-               kernel_name = elpa_kernel_names(i)
-            END IF
-         END DO
-
          WRITE (UNIT=io_unit, FMT="(T2,A,T71,I10)") &
             "ELPA| Matrix order (NA) ", n, &
             "ELPA| Matrix block size (NBLK) ", nblk, &
             "ELPA| Number of eigenvectors (NEV) ", neig, &
             "ELPA| Local rows (LOCAL_NROWS) ", n_rows, &
             "ELPA| Local columns (LOCAL_NCOLS) ", n_cols
-         WRITE (UNIT=io_unit, FMT="(T2,A,T61,A20)") &
-            "ELPA| Kernel ", ADJUSTR(TRIM(kernel_name))
          IF (elpa_qr) THEN
             WRITE (UNIT=io_unit, FMT="(T2,A,T78,A3)") &
                "ELPA| QR step requested ", "YES"
@@ -494,12 +520,22 @@ CONTAINS
       comm = group%get_handle()
       solver = MERGE(ELPA_SOLVER_1STAGE, ELPA_SOLVER_2STAGE, elpa_one_stage)
       nthreads = omp_get_max_threads()
+      resolved_kernel = elpa_kernel
+      prefer_cpu = elpa_kernel == ELPA_2STAGE_REAL_AMD_GPU .AND. &
+                   ((elpa_auto_selected .AND. n < elpa_gpu_min_n()) .OR. &
+                    IAND(nblk, nblk - 1) /= 0 .OR. nblk < 2 .OR. nblk > 1024)
+      IF (prefer_cpu) resolved_kernel = ELPA_2STAGE_REAL_INVALID
+      IF (ASSOCIATED(cached_elpa_obj)) THEN
+         IF (prefer_cpu) resolved_kernel = elpa_cpu_kernel(cached_elpa_obj)
+         IF (cached_gpu_failed .AND. cached_requested_kernel == elpa_kernel) resolved_kernel = cached_kernel
+      END IF
       rebuild = 1
       IF (ASSOCIATED(cached_elpa_obj)) THEN
          IF (cached_n == n .AND. cached_nblk == nblk .AND. cached_comm == comm .AND. &
              cached_neig == neig .AND. cached_n_rows == n_rows .AND. cached_n_cols == n_cols .AND. &
              cached_myprow == myprow .AND. cached_mypcol == mypcol .AND. &
-             cached_kernel == elpa_kernel .AND. cached_solver == solver .AND. &
+             cached_kernel == resolved_kernel .AND. cached_requested_kernel == elpa_kernel .AND. &
+             cached_solver == solver .AND. &
              cached_omp_threads == nthreads) rebuild = 0
       END IF
       ! A changed local layout on any rank requires collective setup on all ranks.
@@ -551,18 +587,35 @@ CONTAINS
          ! because the accepted options depend on the linked ELPA version and build.
          ! Only the AMD GPU kernel (ELPA_KERNEL AMD_GPU, or AUTO in a HIP build
          ! without __NO_OFFLOAD_ELPA) enables the device; a CPU kernel stays on the CPU.
-         use_amd_gpu = elpa_kernel == ELPA_2STAGE_REAL_AMD_GPU
+         resolved_kernel = elpa_kernel
+         IF (prefer_cpu) resolved_kernel = elpa_cpu_kernel(elpa_obj)
+         use_amd_gpu = resolved_kernel == ELPA_2STAGE_REAL_AMD_GPU
          IF (use_amd_gpu) THEN
-            IF (elpa_obj%can_set("gpu", 1) == ELPA_OK) THEN
-               CALL elpa_obj%set("gpu", 1, success)
-               CPASSERT(success == ELPA_OK)
-            END IF
+            amd_option = ""
             IF (elpa_obj%can_set("amd-gpu", 1) == ELPA_OK) THEN
-               CALL elpa_obj%set("amd-gpu", 1, success)
-               CPASSERT(success == ELPA_OK)
+               amd_option = "amd-gpu"
+            ELSE IF (elpa_obj%can_set("gpu", 1) == ELPA_OK) THEN
+               amd_option = "gpu"
+            END IF
+            gpu_failure = 1
+            IF (LEN_TRIM(amd_option) > 0) THEN
+               CALL elpa_obj%set(TRIM(amd_option), 1, success)
+               IF (success == ELPA_OK) THEN
+                  success = elpa_obj%setup_gpu()
+                  gpu_failure = MERGE(0, 1, success == ELPA_OK)
+               END IF
+            END IF
+            CALL group%max(gpu_failure)
+            IF (gpu_failure /= 0) THEN
+               IF (LEN_TRIM(amd_option) > 0) THEN
+                  CALL elpa_obj%set(TRIM(amd_option), 0, success)
+                  CPASSERT(success == ELPA_OK)
+               END IF
+               resolved_kernel = elpa_cpu_kernel(elpa_obj)
+               cached_gpu_failed = .TRUE.
             END IF
          END IF
-         SELECT CASE (elpa_kernel)
+         SELECT CASE (resolved_kernel)
          CASE (ELPA_2STAGE_REAL_NVIDIA_GPU)
             CALL elpa_obj%set("nvidia-gpu", 1, success)
             CPASSERT(success == ELPA_OK)
@@ -572,7 +625,7 @@ CONTAINS
          END SELECT
 
          IF (.NOT. elpa_one_stage) THEN
-            CALL elpa_obj%set("real_kernel", elpa_kernel, success)
+            CALL elpa_obj%set("real_kernel", resolved_kernel, success)
             CPWARN_IF(success /= ELPA_OK, "Setting real_kernel for ELPA failed")
          END IF
 
@@ -590,11 +643,19 @@ CONTAINS
          cached_n_cols = n_cols
          cached_myprow = myprow
          cached_mypcol = mypcol
-         cached_kernel = elpa_kernel
+         cached_kernel = resolved_kernel
+         cached_requested_kernel = elpa_kernel
          cached_solver = solver
          cached_omp_threads = nthreads
       END IF
       elpa_obj => cached_elpa_obj
+      IF (io_unit > 0 .AND. elpa_print) THEN
+         kernel_name = "id: "//TRIM(ADJUSTL(cp_to_string(cached_kernel)))
+         DO i = 1, SIZE(elpa_kernel_ids)
+            IF (elpa_kernel_ids(i) == cached_kernel) kernel_name = elpa_kernel_names(i)
+         END DO
+         WRITE (UNIT=io_unit, FMT="(T2,A,T61,A20)") "ELPA| Kernel ", ADJUSTR(TRIM(kernel_name))
+      END IF
 
       ! Reset QR for each solve, including after the diagnostic solve without QR below.
       IF (.NOT. elpa_one_stage) THEN

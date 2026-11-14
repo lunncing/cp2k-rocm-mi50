@@ -103,6 +103,7 @@ MODULE qs_scf
    USE pw_env_types,                    ONLY: pw_env_get,&
                                               pw_env_type
    USE pw_gpu,                          ONLY: pw_gpu_res_defer_density,&
+                                              pw_gpu_uks_enabled,&
                                               pw_gpu_res_set_lazy
    USE pw_pool_types,                   ONLY: pw_pool_type
    USE qs_block_davidson_types,         ONLY: block_davidson_deallocate
@@ -490,7 +491,8 @@ CONTAINS
       ! mixing, closed shell GPW without ADMM, GAPW, external or embedding potentials, ...).
       ! Closing the window at the end of the SCF writes every live result to its host array.
       lazy_window = scf_env%method == ot_method_nr .AND. scf_env%mixing_method < gspace_mixing_nr .AND. &
-                    dft_control%nspins == 1 .AND. .NOT. do_kpoints .AND. &
+                    (dft_control%nspins == 1 .OR. (dft_control%nspins == 2 .AND. pw_gpu_uks_enabled())) .AND. &
+                    .NOT. do_kpoints .AND. &
                     dft_control%sic_method_id == sic_none .AND. &
                     .NOT. (dft_control%qs_control%gapw .OR. dft_control%qs_control%gapw_xc .OR. &
                            dft_control%qs_control%lrigpw .OR. dft_control%qs_control%rigpw .OR. &
@@ -687,7 +689,7 @@ CONTAINS
 
             ! Only this density of the iteration may stay on the device: its consumer is the
             ! next Kohn-Sham build. The final density (qs_scf_inner_finalize) is written to the host.
-            CALL pw_gpu_res_defer_density(lazy_window)
+            CALL pw_gpu_res_defer_density(lazy_window .OR. (dft_control%nspins == 2 .AND. pw_gpu_uks_enabled()))
             CALL qs_scf_rho_update(rho, qs_env, scf_env, ks_env, &
                                    mix_rho=scf_env%mixing_method >= gspace_mixing_nr)
             CALL pw_gpu_res_defer_density(.FALSE.)

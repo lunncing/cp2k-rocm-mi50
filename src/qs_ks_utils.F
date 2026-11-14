@@ -83,6 +83,7 @@ MODULE qs_ks_utils
                                               NEUMANN_BC,&
                                               PERIODIC_BC
    USE pw_gpu,                          ONLY: pw_gpu_res_discard,&
+                                              pw_gpu_uks_enabled,&
                                               pw_gpu_res_ensure_host,&
                                               pw_gpu_res_vtot_prepare,&
                                               pw_gpu_res_vtot_skip_host
@@ -1436,7 +1437,8 @@ CONTAINS
             ELSE
                ! Add v_hartree + v_xc = v_rspace_new. Without further terms below, the same sum
                ! is formed in VRAM, where Vxc is still resident, for the potential distribution.
-               plain_sum = nspins == 1 .AND. .NOT. dft_control%qs_control%ddapc_explicit_potential .AND. &
+               plain_sum = (nspins == 1 .OR. (nspins == 2 .AND. pw_gpu_uks_enabled())) .AND. &
+                           .NOT. dft_control%qs_control%ddapc_explicit_potential .AND. &
                            .NOT. dft_control%qs_control%cdft .AND. .NOT. dft_control%do_sccs .AND. &
                            .NOT. dft_control%apply_external_potential .AND. .NOT. do_ppl .AND. &
                            dft_control%sic_method_id == sic_none .AND. .NOT. dft_control%apply_embed_pot .AND. &
@@ -1447,6 +1449,7 @@ CONTAINS
                                                                     v_rspace_new(ispin)%pw_grid%dvol)
                IF (vtot_device) vtot_device = pw_gpu_res_vtot_skip_host()
                IF (.NOT. vtot_device) THEN
+                  CALL pw_gpu_res_ensure_host(v_rspace_new(ispin))
                   CALL pw_axpy(v_rspace, v_rspace_new(ispin), 1.0_dp, v_rspace_new(ispin)%pw_grid%dvol)
                END IF
             END IF ! gapw_xc

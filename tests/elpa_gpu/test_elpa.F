@@ -7,14 +7,19 @@ PROGRAM test_elpa
    USE message_passing
    USE OMP_LIB, ONLY: omp_set_num_threads, omp_get_max_threads
    USE test_support
+   USE test_elpa_threshold, ONLY: configured_threshold => elpa_gpu_min_n
    IMPLICIT NONE
    TYPE(cp_fm_struct_type), POINTER :: layout
    TYPE(cp_fm_type) :: matrix, vectors
    INTEGER :: i, mask, neig, calls_before, expected_flags(4), requested_kernel
+   INTEGER :: threshold = 12288, setup_before
    CHARACTER(16) :: argument
 
    CALL get_command_argument(1, argument)
    READ (argument, *) mask
+   CALL get_command_argument(2, argument)
+   IF (LEN_TRIM(argument) > 0) READ (argument, *) threshold
+   CALL verify(configured_threshold() == threshold, "Incorrect calibrated AUTO threshold (default 12288)")
    support_gpu = BTEST(mask, 0)
    support_amd = BTEST(mask, 1)
    support_omp = BTEST(mask, 2)
@@ -59,6 +64,36 @@ PROGRAM test_elpa
    CALL set_elpa_kernel(requested_kernel)
    CALL solve(.TRUE.)
    CALL solve(.FALSE.)
+   requested_kernel = ELPA_2STAGE_REAL_GENERIC
+   CALL set_elpa_kernel(requested_kernel)
+   CALL solve(.TRUE.)
+   fail_gpu_setup = .TRUE.
+   requested_kernel = ELPA_2STAGE_REAL_AMD_GPU
+   CALL set_elpa_kernel(requested_kernel)
+   setup_before = gpu_setups
+   CALL solve(.TRUE.)
+   CALL solve(.FALSE.)
+   CALL verify(gpu_setups == setup_before + MERGE(1, 0, support_gpu .OR. support_amd), "GPU setup retry")
+   CALL verify(last_kernel == ELPA_2STAGE_REAL_AVX512_BLOCK4, "Failed GPU setup did not select SIMD")
+   fail_gpu_setup = .FALSE.
+   layout%nrow_block = 3
+   CALL solve(.TRUE.)
+   CALL verify(last_kernel == ELPA_2STAGE_REAL_AVX512_BLOCK4, "Invalid block did not fall back")
+   support_avx512 = .FALSE.
+   CALL solve(.TRUE.)
+   CALL verify(last_kernel == ELPA_2STAGE_REAL_AVX2_BLOCK2, "AVX2 fallback order")
+   support_avx2 = .FALSE.
+   CALL solve(.TRUE.)
+   CALL verify(last_kernel == ELPA_2STAGE_REAL_GENERIC, "Generic fallback order")
+   support_avx512 = .TRUE.
+   support_avx2 = .TRUE.
+   layout%nrow_block = 1
+   CALL solve(.TRUE.)
+   layout%nrow_block = 2048
+   CALL solve(.TRUE.)
+   CALL verify(gpu_setups == setup_before + MERGE(1, 0, support_gpu .OR. support_amd), "Invalid block used GPU")
+   layout%nrow_block = 4
+   CALL solve(.TRUE.)
    requested_kernel = ELPA_2STAGE_REAL_GENERIC
    CALL set_elpa_kernel(requested_kernel)
    CALL solve(.TRUE.)
@@ -108,6 +143,7 @@ PROGRAM test_elpa
 #endif
 #if defined(__OFFLOAD_HIP)
    requested_kernel = ELPA_2STAGE_REAL_AMD_GPU
+   IF (layout%nrow_global < threshold) requested_kernel = ELPA_2STAGE_REAL_AVX512_BLOCK4
 #endif
 #if defined(__OFFLOAD_OPENCL)
    requested_kernel = ELPA_2STAGE_REAL_INTEL_GPU_SYCL
@@ -157,7 +193,7 @@ CONTAINS
    SUBROUTINE solve(expect_new)
       LOGICAL, INTENT(IN) :: expect_new
       REAL(dp), ALLOCATABLE :: eval(:)
-      INTEGER :: j, old_allocations, old_setups, old_reductions
+      INTEGER :: j, old_allocations, old_setups, old_reductions, expected_kernel
       LOGICAL :: amd_requested
 
       old_allocations = allocations
@@ -176,18 +212,30 @@ CONTAINS
       CALL verify(allocations == old_allocations + MERGE(1, 0, expect_new), "Incorrect cache reuse or invalidation")
       CALL verify(setups == old_setups + MERGE(1, 0, expect_new), "Unexpected setup count")
       CALL verify(allocations == releases + 1, "Cache must keep exactly one handle alive")
-      CALL verify(reductions == old_reductions + 1, "Missing collective cache decision")
+      CALL verify(reductions >= old_reductions + 1, "Missing collective cache decision")
       CALL verify(ALL(last_layout == [layout%nrow_global, neig, layout%local_leading_dimension, &
                                      layout%ncol_local, layout%nrow_block, layout%para_env%id, &
                                      layout%context%mepos]), "Stale ELPA layout")
       CALL verify(last_solver == MERGE(ELPA_SOLVER_1STAGE, ELPA_SOLVER_2STAGE, elpa_one_stage), "Stale solver")
       CALL verify(last_threads == MERGE(omp_get_max_threads(), 0, support_omp), "Stale OpenMP thread count")
       amd_requested = requested_kernel == ELPA_2STAGE_REAL_AMD_GPU
-      expected_flags = [MERGE(1, 0, amd_requested .AND. support_gpu), &
+      expected_kernel = requested_kernel
+      IF (amd_requested) THEN
+         IF (fail_gpu_setup .OR. .NOT. (support_gpu .OR. support_amd) .OR. &
+             IAND(layout%nrow_block, layout%nrow_block - 1) /= 0 .OR. &
+             layout%nrow_block < 2 .OR. layout%nrow_block > 1024) THEN
+            amd_requested = .FALSE.
+            expected_kernel = ELPA_2STAGE_REAL_GENERIC
+            IF (support_avx2) expected_kernel = ELPA_2STAGE_REAL_AVX2_BLOCK2
+            IF (support_avx512) expected_kernel = ELPA_2STAGE_REAL_AVX512_BLOCK4
+         END IF
+      END IF
+      expected_flags = [MERGE(1, 0, amd_requested .AND. support_gpu .AND. .NOT. support_amd), &
                         MERGE(1, 0, amd_requested .AND. support_amd), &
                         MERGE(1, 0, requested_kernel == ELPA_2STAGE_REAL_NVIDIA_GPU), &
                         MERGE(1, 0, requested_kernel == ELPA_2STAGE_REAL_INTEL_GPU_SYCL)]
       CALL verify(ALL(last_flags == expected_flags), "Incorrect GPU enablement or stale backend")
+      IF (.NOT. elpa_one_stage) CALL verify(last_kernel == expected_kernel, "Incorrect resolved kernel")
       CALL cp_fm_release(matrix)
       CALL cp_fm_release(vectors)
    END SUBROUTINE

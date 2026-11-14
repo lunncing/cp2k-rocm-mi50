@@ -24,6 +24,7 @@ MODULE xc
                               cp_logger_type, &
                               cp_to_string
    USE input_section_types, ONLY: section_get_ival, &
+                                  section_vals_get, &
                                   section_get_lval, &
                                   section_get_rval, &
                                   section_vals_get_subs_vals, &
@@ -38,7 +39,8 @@ MODULE xc
    USE pw_gpu, ONLY: pw_gpu_filter_r3d, &
                      pw_gpu_fused_xc_available, &
                      pw_gpu_res_ensure_host, &
-                     pw_gpu_xc_full_pipeline, pw_gpu_xc_full_pipeline_available
+                     pw_gpu_xc_full_pipeline, pw_gpu_xc_full_pipeline_available, &
+                     pw_gpu_xc_full_pipeline_lsd, pw_gpu_uks_enabled
    USE pw_grid_types, ONLY: PW_MODE_DISTRIBUTED, &
                             pw_grid_type
    USE pw_methods, ONLY: pw_axpy, &
@@ -478,7 +480,7 @@ CONTAINS
 !>      energy should be kept consistent with xc_exc_calc
 ! **************************************************************************************************
    SUBROUTINE xc_vxc_pw_create(vxc_rho, vxc_tau, exc, rho_r, rho_g, tau, xc_section, weights, &
-                               pw_pool, compute_virial, virial_xc, exc_r)
+                               pw_pool, compute_virial, virial_xc, exc_r, do_triplet)
       TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER        :: vxc_rho, vxc_tau
       REAL(KIND=dp), INTENT(out)                         :: exc
       TYPE(pw_r3d_rs_type), DIMENSION(:), POINTER        :: rho_r, tau
@@ -489,6 +491,7 @@ CONTAINS
       LOGICAL                                            :: compute_virial
       REAL(KIND=dp), DIMENSION(3, 3), INTENT(OUT)        :: virial_xc
       TYPE(pw_r3d_rs_type), INTENT(INOUT), OPTIONAL      :: exc_r
+      LOGICAL, INTENT(IN), OPTIONAL :: do_triplet
 
       CHARACTER(len=*), PARAMETER                        :: routineN = 'xc_vxc_pw_create'
       INTEGER, DIMENSION(2), PARAMETER :: norm_drho_spin_name = [deriv_norm_drhoa, deriv_norm_drhob]
@@ -500,7 +503,7 @@ CONTAINS
       LOGICAL                                            :: dealloc_pw_to_deriv, has_laplace, &
                                                             has_tau, lsd, use_virial, has_gradient, &
                                                             has_derivs, has_rho, dealloc_pw_to_deriv_rho, &
-                                                            use_fused_filter, gpu_done
+                                                            use_fused_filter, gpu_done, gpu_triplet
       REAL(KIND=dp)                                      :: density_smooth_cut_range, drho_cutoff, &
                                                             rho_cutoff, kappa, beta, mu, scale_ec, scale_ex
       REAL(kind=dp), DIMENSION(:, :, :), POINTER         :: deriv_data, norm_drho, norm_drho_spin, &
@@ -531,6 +534,8 @@ CONTAINS
 
       use_virial = compute_virial
       virial_xc = 0.0_dp
+      gpu_triplet = .FALSE.
+      IF (PRESENT(do_triplet)) gpu_triplet = do_triplet
 
       ! Try before constructing rho_set/deriv_set: their gradient and PBE arrays
       ! would otherwise force the intermediate VRAM data back through the host.
@@ -550,6 +555,31 @@ CONTAINS
                      RETURN
                   END IF
                   CALL pw_pool%give_back_pw(vxc_rho(1))
+                  DEALLOCATE (vxc_rho)
+               END IF
+            END IF
+         END IF
+      END IF
+
+      IF (lsd .AND. .NOT. use_virial .AND. .NOT. gpu_triplet .AND. &
+          .NOT. PRESENT(exc_r) .AND. .NOT. ASSOCIATED(weights) .AND. pw_gpu_uks_enabled()) THEN
+         IF (pw_gpu_xc_full_pipeline_available(pw_grid) .AND. ASSOCIATED(rho_g)) THEN
+            IF (SIZE(rho_g) == 2) THEN
+               IF (xc_vram_pbe_parameters(xc_section, rho_cutoff, drho_cutoff, density_smooth_cut_range, &
+                                         kappa, beta, mu, scale_ec, scale_ex, lsd=.TRUE.)) THEN
+                  ALLOCATE (vxc_rho(2))
+                  CALL pw_pool%create_pw(vxc_rho(1))
+                  CALL pw_pool%create_pw(vxc_rho(2))
+                  exc = 0.0_dp
+                  gpu_done = pw_gpu_xc_full_pipeline_lsd(rho_g(1), rho_g(2), rho_r(1), rho_r(2), &
+                              vxc_rho(1), vxc_rho(2), exc, rho_cutoff, scale_ec, scale_ex, &
+                              drho_cutoff, density_smooth_cut_range)
+                  IF (gpu_done) THEN
+                     CALL timestop(handle)
+                     RETURN
+                  END IF
+                  CALL pw_pool%give_back_pw(vxc_rho(1))
+                  CALL pw_pool%give_back_pw(vxc_rho(2))
                   DEALLOCATE (vxc_rho)
                END IF
             END IF
@@ -825,11 +855,12 @@ CONTAINS
 !>        Mixed, spin, meta, weighted, energy-grid and virial cases retain the existing XC path.
 ! **************************************************************************************************
    LOGICAL FUNCTION xc_vram_pbe_parameters(xc_section, rho_cutoff, drho_cutoff, smooth_range, &
-                                           kappa, beta, mu, scale_ec, scale_ex) RESULT(eligible)
+                                           kappa, beta, mu, scale_ec, scale_ex, lsd) RESULT(eligible)
       TYPE(section_vals_type), POINTER :: xc_section
       REAL(KIND=dp), INTENT(OUT) :: rho_cutoff, drho_cutoff, smooth_range, kappa, beta, mu, scale_ec, scale_ex
+      LOGICAL, OPTIONAL, INTENT(IN) :: lsd
 
-      TYPE(section_vals_type), POINTER :: functionals, functional, pbe
+      TYPE(section_vals_type), POINTER :: functionals, functional, pbe, adiabatic
       INTEGER :: ifun, param
       LOGICAL :: active
 
@@ -850,6 +881,16 @@ CONTAINS
       END DO
       IF (.NOT. ASSOCIATED(pbe)) RETURN
       CALL section_vals_val_get(pbe, "PARAMETRIZATION", i_val=param)
+      IF (PRESENT(lsd)) THEN
+         IF (lsd) THEN
+            IF (param /= xc_pbe_orig) RETURN
+            adiabatic => section_vals_get_subs_vals(xc_section, "ADIABATIC_RESCALING")
+            IF (ASSOCIATED(adiabatic)) THEN
+               CALL section_vals_get(adiabatic, explicit=active)
+               IF (active) RETURN
+            END IF
+         END IF
+      END IF
       SELECT CASE (param)
       CASE (xc_pbe_orig, xc_pbe_rev)
          kappa = 0.804e0_dp

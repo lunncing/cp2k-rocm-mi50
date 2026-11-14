@@ -312,7 +312,7 @@ CONTAINS
       norm(1:6) = 0.0_dp
       norm(20:30) = 0.0_dp
       DO param = 1, 3
-         DO grad = 0, 3
+         DO grad = -3, 3
             DO scaling = 0, 3
                sc = MERGE(1.0_dp, .37_dp, scaling == 0)
                sx = MERGE(1.0_dp, -.21_dp, scaling == 0)
@@ -333,7 +333,15 @@ CONTAINS
                   CALL close(e(:, i), ref(:, i), 'PBE energy/derivatives')
                END DO
                IF (ANY(e(1:4, :) /= .17_dp) .OR. ANY(e(6, :) /= .17_dp)) ERROR STOP 'PBE cutoff changed'
-               IF (grad <= 1 .AND. nuse > 0 .AND. gpu_enabled .AND. .NOT. limited) THEN
+               IF (grad < 0 .AND. ANY(e(:, 1) /= .17_dp)) ERROR STOP 'PBE negative grad wrote energy'
+               IF (grad < -1 .OR. grad == 0) THEN
+                  IF (ANY(e(:, 2:3) /= .17_dp)) ERROR STOP 'PBE wrote unrequested first derivatives'
+               END IF
+               IF (ABS(grad) < 2 .OR. grad == -3) THEN
+                  IF (ANY(e(:, 4:6) /= .17_dp)) ERROR STOP 'PBE wrote unrequested second derivatives'
+               END IF
+               IF (ABS(grad) < 3 .AND. ANY(e(:, 7:) /= .17_dp)) ERROR STOP 'PBE wrote unrequested third derivatives'
+               IF (grad >= 0 .AND. grad <= 1 .AND. nuse > 0 .AND. gpu_enabled .AND. .NOT. limited) THEN
                   IF (test_kernel_calls(2_C_INT) /= before + 1) ERROR STOP 'PBE must launch exactly once per OMP team'
                ELSE
                   IF (test_kernel_calls(2_C_INT) /= before) ERROR STOP 'unexpected PBE offload'

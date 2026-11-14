@@ -24,14 +24,14 @@ def main():
     fc = shlex.split(os.environ.get("FC", "gfortran"))
     flags = ["-cpp", "-ffree-form", "-std=f2008", "-fopenmp", "-fcheck=all",
              "-Werror=line-truncation", "-g", "-O0"]
-    with tempfile.TemporaryDirectory(prefix="elpa-tests-") as directory:
+    with tempfile.TemporaryDirectory(prefix=".build-", dir=HERE) as directory:
         build = Path(directory)
         (build / "fm").mkdir()
         (build / "base").mkdir()
         (build / "fm/cp_fm_elpa.F").write_text(source)
         (build / "base/base_uses.f90").write_text(
-            'USE test_support, ONLY: verify, abort_test, warn_test, timeset, timestop\n'
-            '#define CPASSERT(condition) CALL verify(condition, "CPASSERT")\n'
+            'USE test_support, ONLY: verify_assert => verify, abort_test, warn_test, timeset, timestop\n'
+            '#define CPASSERT(condition) CALL verify_assert(condition, "CPASSERT")\n'
             '#define CPABORT(message) CALL abort_test(message)\n'
             '#define CPWARN_IF(condition, message) CALL warn_test(condition, message)\n'
             '#define MARK_USED(value)\n'
@@ -42,6 +42,12 @@ def main():
             + "".join(f"INTEGER, PARAMETER :: {name} = {i}\n" for i, name in enumerate(constants, 10))
             + "END MODULE elpa_constants\n"
         )
+        threshold_function = re.search(
+            r"   INTEGER FUNCTION elpa_gpu_min_n\(\).*?   END FUNCTION elpa_gpu_min_n", source, re.S)
+        assert threshold_function
+        (build / "threshold.f90").write_text(
+            "MODULE test_elpa_threshold\nIMPLICIT NONE\nCONTAINS\n" +
+            threshold_function[0] + "\nEND MODULE test_elpa_threshold\n")
         configurations = {
             "cpu": [],
             "hip": ["-D__OFFLOAD_HIP", "-D__HAS_IEEE_EXCEPTIONS"],
@@ -51,11 +57,13 @@ def main():
         for name, defines in configurations.items():
             exe = build / name
             subprocess.run(fc + flags + ["-D__ELPA", *defines, str(build / "constants.f90"),
-                           str(HERE / "mock_dependencies.F"), str(build / "fm/cp_fm_elpa.F"),
+                           str(HERE / "mock_dependencies.F"), str(build / "fm/cp_fm_elpa.F"), str(build / "threshold.f90"),
                            str(HERE / "test_elpa.F"), "-o", str(exe)], cwd=build, check=True)
             for support_mask in range(8):
-                subprocess.run([str(exe), str(support_mask)], cwd=build, check=True, timeout=30,
-                               env=os.environ | {"OMP_NUM_THREADS": "1"})
+                for value, threshold in (("", 12288), ("0", 0), ("6", 6), ("7", 7), ("invalid", 12288),
+                                         ("999999999999999999999999999999999999", 12288)):
+                    subprocess.run([str(exe), str(support_mask), str(threshold)], cwd=build, check=True, timeout=30,
+                                   env=os.environ | {"OMP_NUM_THREADS": "1", "CP2K_ELPA_GPU_N_MIN": value})
             print(f"PASS {name}: all 8 GPU/OpenMP capability combinations", flush=True)
         subprocess.run(fc + flags + ["-c", str(build / "fm/cp_fm_elpa.F")], cwd=build, check=True)
         print("PASS compilation without ELPA", flush=True)

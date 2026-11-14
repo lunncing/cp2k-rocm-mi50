@@ -1,0 +1,27 @@
+SYNTHETIC PARSER FIXTURE; NOT A GPU OR MOLECULAR MEASUREMENT
+ **** PROGRAM STARTED AT 2026-11-14 00:00:00
+ Spin 1
+ Number of electrons: 3
+ Spin 2
+ Number of electrons: 2
+ SCF WAVEFUNCTION OPTIMIZATION
+ Step     Update method      Time    Convergence         Total energy    Change
+ 1 Broy./Diag. 0.40D+00 1.20D+01 1.0D-03 -2.5D+01 -2.5D+01
+ 2 Broy./Diag. 0.40D+00 2.00D+00 1.0D-07 -2.6D+01 -1.0D+00
+ *** SCF run converged in 2 steps ***
+ Integrated spin density: 1.0D+00
+ Integrated absolute spin density: 1.2D+00
+ ENERGY| Total FORCE_EVAL ( QS ) energy [hartree] -2.6D+01
+ FORCES| Atomic forces [hartree/bohr]
+ FORCES| Atom x y z |f|
+ FORCES| 1 1.0D-03 -2.0D-03 3.0D-03 3.741657D-03
+ FORCES| 2 -1.0D-03 2.0D-03 -3.0D-03 3.741657D-03
+ FORCES| Sum 0.0 0.0 0.0
+ [PW_GPU] device memory (MiB): PW peak 5, device in use at most 7 of 16000 at 12 samples
+ SUBROUTINE CALLS ASD SELF TIME TOTAL TIME
+ MAXIMUM AVERAGE MAXIMUM AVERAGE MAXIMUM
+ CP2K 1 1.0 0.1 0.2 19.0 20.0
+ qs_scf 1 2.0 0.3 0.4 14.0 15.0
+ nested_update 2 3.0 2.0 3.0 10.0 11.0
+
+ **** PROGRAM ENDED AT 2026-11-14 00:00:20

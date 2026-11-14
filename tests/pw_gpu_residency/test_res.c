@@ -9,9 +9,20 @@
 // with a tolerance.
 #define _POSIX_C_SOURCE 200809L
 #include <stddef.h>
+#include "mock_offload.h"
 static size_t mock_free_memory_value = (size_t)1 << 40;
-static size_t mock_free_memory(void) { return mock_free_memory_value; }
+static size_t mock_total_memory_value = (size_t)1 << 40;
+static size_t mock_free_memory(void) {
+  if (mock_device_total_bytes == 0) return mock_free_memory_value;
+  size_t free_bytes, total_bytes;
+  offloadMemGetInfo(&free_bytes, &total_bytes);
+  return free_bytes;
+}
+static size_t mock_total_memory(void) {
+  return mock_device_total_bytes ? mock_device_total_bytes : mock_total_memory_value;
+}
 #define PW_GPU_TEST_FREE_MEMORY mock_free_memory
+#define PW_GPU_TEST_TOTAL_MEMORY mock_total_memory
 #include "pw_gpu_internal.c"
 #include "mock_offload.h"
 #define PW_GPU_ELEMENTAL static inline
@@ -148,7 +159,7 @@ static int density_call(double *const *r, double *rho_g, double *rho_r, const in
     memcpy(npts + 3 * l, dims[l], sizeof(dims[l]));
     ids[l] = l + 1; nm[l] = nmaps_; scale[l] = 1.0 / nr_[l];
   }
-  pw_gpu_res_defer_density_c(token);
+  if (token >= 0) pw_gpu_res_defer_density_c(token);
   return pw_gpu_res_density_c(NLEV, rp, npts, ng_, nm, ids, mp, gp, scale, dims[0],
                               ng_[0], nmaps_, 1, map_[0], rho_g, rho_r, NULL);
 }
@@ -612,10 +623,10 @@ static void lazy_grant(void) {
     density_reference(r, ref_g, ref_r);
     const size_t ng2 = 2 * (size_t)ng_[0], nr = (size_t)nr_[0];
 
-    // Closed window: a token is ignored, the result is written to the host.
+    // A closed window permits a density cycle but still writes to the host.
     pw_gpu_res_set_lazy_c(0);
     pw_gpu_res_defer_density_c(1);
-    assert(!res_density_token);
+    assert(res_density_token == 2);
     memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
     mock_reset_trace();
     assert(density_call(r, g, rr, 1));
@@ -631,11 +642,11 @@ static void lazy_grant(void) {
     same(ref_g, g, ng2, "no token g");
     assert(!res[RES_RHO_R].dev_authoritative);
 
-    // The token defers exactly one density.
+    // The first density consumes one of the cycle's two spin tokens.
     memset(g, 0, sizeof(g)); memset(rr, 0, sizeof(rr));
     mock_reset_trace();
     assert(density_call(r, g, rr, 1));
-    assert(!res_density_token);
+    assert(res_density_token == 1);
     assert(res[RES_RHO_G].dev_authoritative && res[RES_RHO_R].dev_authoritative);
     for (size_t i = 0; i < ng2; i++) assert(g[i] == 0.0);
     for (size_t i = 0; i < mock_operation_count; i++) { // fingerprints only
@@ -884,6 +895,44 @@ static void integrate(void) {
   }
 }
 
+static void lazy_vtot_prepare_failure(void) {
+  const size_t points = 64, bytes = points * sizeof(double);
+  const int slots[2] = {RES_VXC, RES_VXC_B};
+  double host[2][64] = {{0}}, values[2][64], vh[64] = {0};
+  start(0);
+  assert(pw_gpu_ensure_xc_c(4 * bytes));
+  assert(ensure_uks_buffer(&uks_density_dev, &allocated_uks_density_size, 4 * bytes));
+  double *device[2] = {uks_density_dev, xc_dev};
+  double *samples = res_small(pw_res_sample_count(points));
+  assert(samples != NULL);
+  for (size_t spin = 0; spin < 2; spin++) {
+    for (size_t point = 0; point < points; point++) {
+      values[spin][point] = (spin + 1) * (point + 1) * -0.125;
+    }
+    offloadMemcpyAsyncHtoD(device[spin], values[spin], bytes, stream);
+    assert(res_sample_buffer(&res[slots[spin]], pw_res_sample_count(points)));
+    res_register_lazy(slots[spin], host[spin], points, 1, device[spin], samples);
+  }
+  offloadStreamSynchronize(stream);
+  res_free_small();
+  max_gpu_memory_bytes = mock_limit = current_gpu_allocated_bytes + PW_GPU_MIB - 1;
+  for (size_t spin = 0; spin < 2; spin++) {
+    assert(res[slots[spin]].state == RES_VALID && res[slots[spin]].dev_authoritative);
+    for (size_t point = 0; point < points; point++) assert(host[spin][point] == 0.0);
+    mock_reset_trace();
+    assert(!pw_gpu_res_vtot_prepare_c(vh, host[spin], points, 0.125));
+    assert(res_vtot_active_slot == slots[spin]);
+    same(values[spin], host[spin], points, "Vtot scratch failure preserves lazy Vxc");
+    assert(res[slots[spin]].state == RES_INVALID && !res[slots[spin]].dev_authoritative);
+    assert(res_small_dev == NULL && res_small_bytes == 0);
+    assert(res_stats.vtot_fail == spin + 1 && res_stats.syncs == spin + 1);
+    assert(mock_download_bytes == bytes && mock_upload_bytes == 0);
+    assert(!pw_gpu_res_vtot_skip_host_c());
+    mock_assert_idle();
+  }
+  finish();
+}
+
 static void lazy_vtot(void) {
   grids(1);
   start(0);
@@ -937,8 +986,10 @@ static void memory(void) {
   finish();
   // No free memory beyond the reserve: no owned slot.
   start(0);
-  mock_free_memory_value = res_reserve_bytes;
   assert(hartree_fused(&h, tot, v, &e, 0));
+  for (int id = RES_V_H_R; id <= RES_INFL; id++) res_free_owned(id);
+  mock_free_memory_value = res_reserve_bytes;
+  assert(!hartree_fused(&h, tot, v, &e, 0));
   same(ref_v, v, (size_t)nr_[0], "no free memory");
   for (int i = RES_V_H_R; i < RES_NSLOTS; i++) assert(res[i].owned_bytes == 0);
   mock_free_memory_value = (size_t)1 << 40;
@@ -1047,6 +1098,470 @@ static void verify(void) {
   free(rho_g); free(rho_r);
 }
 
+static void uks_density_budget(void) {
+  grids(1);
+  start(0);
+  double *input[NLEV];
+  for (int level = 0; level < NLEV; level++) input[level] = rarray((size_t)nr_[level]);
+  double ga[128], gb[128], ra[64], rb[64], expected_g[128], expected_r[64];
+  density_reference(input, expected_g, expected_r);
+  assert(density_call(input, ga, ra, 1));
+  max_gpu_memory_bytes = current_gpu_allocated_bytes;
+  for (int point = 0; point < 128; point++) gb[point] = -99.0;
+  for (int point = 0; point < 64; point++) rb[point] = -99.0;
+  assert(!density_call(input, gb, rb, -1));
+  assert(res_density_token == 0 && res_density_spin_count == 0);
+  for (int point = 0; point < 128; point++) assert(gb[point] == -99.0);
+  for (int point = 0; point < 64; point++) assert(rb[point] == -99.0);
+  pw_gpu_res_ensure_host_c(-1, ga);
+  pw_gpu_res_ensure_host_c(-1, ra);
+  same(ga, expected_g, 2 * (size_t)ng_[0], "UKS alpha survives beta budget fallback");
+  same(ra, expected_r, (size_t)nr_[0], "UKS real alpha survives beta budget fallback");
+  max_gpu_memory_bytes = 0;
+  assert(density_call(input, gb, rb, 0));
+  same(gb, expected_g, 2 * (size_t)ng_[0], "UKS density after failed cycle");
+  same(rb, expected_r, (size_t)nr_[0], "UKS real density after failed cycle");
+  pw_gpu_res_set_lazy_c(0);
+  finish();
+  for (int level = 0; level < NLEV; level++) free(input[level]);
+}
+
+static void mock_set_device_free(const size_t free_bytes) {
+  mock_device_total_bytes = 16 * 1024 * PW_GPU_MIB;
+  assert(mock_allocated <= mock_device_total_bytes);
+  assert(free_bytes <= mock_device_total_bytes - mock_allocated);
+  mock_device_external_bytes = mock_device_total_bytes - mock_allocated - free_bytes;
+}
+
+static void headroom(void) {
+  start(0);
+  const size_t bytes = 64 * sizeof(double);
+  const size_t saved_reserve = res_reserve_bytes;
+  res_reserve_bytes = 1024 * PW_GPU_MIB;
+  assert(pw_gpu_ensure_buffer_c(2 * bytes, 0, true));
+  assert(pw_gpu_ensure_gbuf_c(2 * bytes));
+  assert(pw_gpu_ensure_xc_c(4 * bytes));
+  assert(ensure_uks_buffer(&uks_density_dev, &allocated_uks_density_size, 4 * bytes));
+  assert(ensure_uks_buffer(&uks_xc_dev, &allocated_uks_xc_size, 2 * bytes));
+  for (int slot = RES_V_H_R; slot <= RES_INFL; slot++) assert(res_ensure_owned(slot, bytes));
+  const int map[2] = {0, 1};
+  grid_cache_entry *oldest = grid_cache_lookup_or_upload(501, map, 2, 1);
+  grid_cache_entry *newer = grid_cache_lookup_or_upload(502, map, 2, 1);
+  grid_cache_entry *active = grid_cache_lookup_or_upload(503, map, 2, 1);
+  assert(oldest && newer && active);
+  protected_grid_entry = active;
+  protected_xc_buffer = protected_uks_buffer = true;
+  const size_t allocations_before = mock_allocations;
+  mock_set_device_free(res_reserve_bytes - 1);
+  assert(ensure_device_headroom(0, 0));
+  assert(allocated_buffer_size_b == 0 && res[RES_INFL].owned_bytes == bytes);
+  const int evict_order[] = {RES_INFL, RES_RHO_CORE, RES_V_H_R};
+  for (int index = 0; index < 3; index++) {
+    mock_set_device_free(res_reserve_bytes - 1);
+    assert(ensure_device_headroom(0, 0));
+    assert(res[evict_order[index]].owned_bytes == 0);
+    assert(oldest->grid_id == 501);
+  }
+  mock_set_device_free(res_reserve_bytes - 1);
+  assert(ensure_device_headroom(0, 0));
+  assert(oldest->grid_id == 0 && newer->grid_id == 502 && active->grid_id == 503);
+  mock_set_device_free(res_reserve_bytes - 1);
+  assert(ensure_device_headroom(0, 0));
+  assert(newer->grid_id == 0 && active->grid_id == 503);
+  mock_set_device_free(0);
+  assert(!ensure_device_headroom(1, 0));
+  assert(!pw_gpu_ensure_buffer_c(4 * bytes, 0, false));
+  assert(!pw_gpu_ensure_buffer_c(0, bytes, false));
+  assert(!pw_gpu_ensure_gbuf_c(4 * bytes));
+  assert(!pw_gpu_ensure_xc_c(8 * bytes));
+  double *density_before = uks_density_dev, *xc_before = uks_xc_dev;
+  assert(!ensure_uks_buffer(&uks_density_dev, &allocated_uks_density_size, 8 * bytes));
+  assert(!ensure_uks_buffer(&uks_xc_dev, &allocated_uks_xc_size, 4 * bytes));
+  assert(uks_density_dev == density_before && uks_xc_dev == xc_before);
+  assert(allocated_buffer_size == 2 * bytes && allocated_gbuf_size == 2 * bytes);
+  assert(allocated_xc_size == 4 * bytes);
+  assert(allocated_uks_density_size + allocated_uks_xc_size == 6 * bytes);
+  double vectors[6] = {0};
+  assert(grid_cache_get_g(active, vectors) == NULL);
+  assert(protected_grid_entry == active && active->grid_id == 503);
+  assert(protected_xc_buffer && protected_uks_buffer);
+  assert(mock_allocations == allocations_before);
+  mock_set_device_free(res_reserve_bytes + bytes);
+  assert(res_ensure_owned(RES_INFL, bytes));
+  res_pinned = 1u << RES_INFL;
+  mock_set_device_free(res_reserve_bytes - 1);
+  assert(!ensure_device_headroom(0, 0));
+  assert(res[RES_INFL].owned_bytes == bytes);
+  res_pinned = 0;
+  assert(ensure_device_headroom(0, 0));
+  assert(res[RES_INFL].owned_bytes == 0);
+  mock_set_device_free(res_reserve_bytes - 1);
+  protected_uks_buffer = false;
+  assert(!ensure_device_headroom(0, 0));
+  protected_xc_buffer = false;
+  assert(ensure_device_headroom(0, 0));
+  assert(uks_density_dev == NULL && uks_xc_dev == NULL && xc_dev != NULL);
+  mock_set_device_free(res_reserve_bytes - 1);
+  assert(ensure_device_headroom(0, 0));
+  assert(xc_dev == NULL && active->grid_id == 503);
+  protected_grid_entry = NULL;
+  grid_cache_clear_entry(active);
+  mock_set_device_free(res_reserve_bytes + bytes - 1);
+  assert(!ensure_device_headroom(bytes, 0));
+  mock_set_device_free(res_reserve_bytes + bytes);
+  assert(ensure_device_headroom(bytes, 0));
+  assert(!ensure_device_headroom(SIZE_MAX, 0));
+  res_reserve_bytes = 0;
+  mock_set_device_free(256 * PW_GPU_MIB + bytes - 1);
+  assert(!ensure_device_headroom(bytes, 0));
+  mock_set_device_free(256 * PW_GPU_MIB + bytes);
+  assert(ensure_device_headroom(bytes, 0));
+  res_reserve_bytes = 8 * PW_GPU_MIB;
+  mock_set_device_free(res_reserve_bytes + bytes);
+  assert(ensure_device_headroom(bytes, 0));
+  assert(!ensure_device_headroom(bytes, 16 * PW_GPU_MIB));
+  mock_set_device_free(16 * PW_GPU_MIB + bytes);
+  assert(ensure_device_headroom(bytes, 16 * PW_GPU_MIB));
+  mock_set_device_free(4 * bytes);
+  host_fallback_enabled = 0;
+  const size_t queries_before = mock_mem_info_calls;
+  assert(ensure_device_headroom(SIZE_MAX, SIZE_MAX));
+  assert(mock_mem_info_calls == queries_before);
+  assert(pw_gpu_ensure_gbuf_c(4 * bytes));
+  host_fallback_enabled = 1;
+  mock_device_total_bytes = mock_device_external_bytes = 0;
+  mock_total_memory_value = mock_free_memory_value = 0;
+  assert(ensure_device_headroom(SIZE_MAX, SIZE_MAX));
+  assert(pw_gpu_ensure_gbuf_c(8 * bytes));
+  mock_total_memory_value = mock_free_memory_value = (size_t)1 << 40;
+  res_reserve_bytes = saved_reserve;
+  finish();
+}
+
+static void headroom_tables(void) {
+  start(0);
+  const int npts[3] = {2, 2, 2}, map[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+  const size_t bytes = 8 * sizeof(double), tab_bytes = 6 * sizeof(double);
+  double vectors[24] = {0};
+  vectors[9] = 1.0;
+  assert(pw_gpu_ensure_buffer_c(2 * bytes, 0, false));
+  grid_cache_entry *entry = grid_cache_lookup_or_upload(501, map, 8, 1);
+  assert(entry && grid_cache_get_g(entry, vectors));
+  protected_grid_entry = entry;
+  const double *sorted = entry->g_dev, *tables = NULL;
+  size_t allocations_before = mock_allocations;
+  mock_set_device_free(res_reserve_bytes + tab_bytes - 1);
+  assert(!grid_natural_g(entry, vectors, npts, buffer_dev_1, &tables));
+  assert(mock_allocations == allocations_before && entry->g_dev == sorted);
+  assert(entry->gt_mode == 0 && entry->gt_dev == NULL && protected_grid_entry == entry);
+  mock_set_device_free(res_reserve_bytes + 3 * bytes - 1);
+  assert(!grid_natural_g(entry, vectors, npts, buffer_dev_1, &tables));
+  assert(mock_allocations == allocations_before + 1 && entry->g_dev == sorted);
+  assert(entry->gt_mode == 0 && entry->gt_dev == NULL && protected_grid_entry == entry);
+  mock_set_device_free(res_reserve_bytes + 3 * bytes);
+  assert(grid_natural_g(entry, vectors, npts, buffer_dev_1, &tables) == 2);
+  assert(tables == entry->gt_dev && entry->gt_bytes == 3 * bytes && entry->g_dev == NULL);
+  assert(protected_grid_entry == entry);
+  protected_grid_entry = NULL;
+  mock_device_total_bytes = mock_device_external_bytes = 0;
+  finish();
+}
+
+static void uks_reclaim(void) {
+  const size_t nr = 64, bytes = nr * sizeof(double);
+  const int slots[2] = {RES_VXC, RES_VXC_B};
+  double values[2][64], host[2][64];
+  for (int release = 0; release < 2; release++) {
+    start(0);
+    assert(pw_gpu_ensure_xc_c(4 * bytes));
+    assert(ensure_uks_buffer(&uks_density_dev, &allocated_uks_density_size, 4 * bytes));
+    assert(ensure_uks_buffer(&uks_xc_dev, &allocated_uks_xc_size, 2 * bytes));
+    double *samples = res_small(pw_res_sample_count(nr));
+    assert(samples != NULL);
+    double *device[2] = {uks_density_dev, xc_dev};
+    for (int spin = 0; spin < 2; spin++) {
+      for (size_t point = 0; point < nr; point++) {
+        values[spin][point] = (spin + 1) * (point + 1) * .125;
+        host[spin][point] = -99.0;
+      }
+      offloadMemcpyAsyncHtoD(device[spin], values[spin], bytes, stream);
+      assert(res_sample_buffer(&res[slots[spin]], pw_res_sample_count(nr)));
+      res_register_lazy(slots[spin], host[spin], nr, 1, device[spin], samples);
+    }
+    assert(res[RES_VXC].dev_authoritative && res[RES_VXC_B].dev_authoritative);
+    if (release) release_xc_buffer();
+    else release_uks_buffers();
+    for (int spin = 0; spin < 2; spin++) {
+      same(host[spin], values[spin], nr, "UKS reclamation preserves both lazy potentials");
+      assert(res[slots[spin]].state == RES_INVALID && !res[slots[spin]].dev_authoritative);
+    }
+    finish();
+  }
+}
+
+static void uks_compact(void) {
+  grids(1);
+  const size_t nr = (size_t)nr_[0], ng = (size_t)ng_[0], bytes = nr * sizeof(double);
+  const size_t budget = 16 * bytes + ng * (sizeof(int) + 3 * sizeof(double));
+  double spectrum[2][128], density[2][64], potential[2][64], reference[2][64];
+  double energy, reference_energy = 0.0;
+  for (int spin = 0; spin < 2; spin++) {
+    for (size_t point = 0; point < nr; point++)
+      density[spin][point] = .3 + .1 * spin + .01 * sin((double)point);
+    for (size_t point = 0; point < 2 * ng; point++)
+      spectrum[spin][point] = .001 * cos((double)point + spin);
+  }
+  for (int limited = 0; limited < 2; limited++) {
+    start(0);
+    res_lazy_grant = false;
+    if (limited) {
+      max_gpu_memory_bytes = mock_limit = budget;
+      mock_set_device_free(res_reserve_bytes + budget);
+    }
+    assert(pw_gpu_xc_full_pipeline_lsd_configured_c(spectrum[0], spectrum[1],
+        density[0], density[1], potential[0], potential[1], &energy, map_[0], g_fine,
+        dims[0], (int)ng, 1, 1, .2, .9, .7, .02, 2.0, .37, 0));
+    assert(allocated_uks_density_size == 4 * bytes && allocated_uks_xc_size == 2 * bytes);
+    assert(current_gpu_allocated_bytes == budget && peak_gpu_allocated_bytes == budget);
+    if (limited) {
+      same(potential[0], reference[0], nr, "UKS compact VRAM alpha potential");
+      same(potential[1], reference[1], nr, "UKS compact VRAM beta potential");
+      assert(energy == reference_energy);
+    } else {
+      memcpy(reference, potential, sizeof(reference));
+      reference_energy = energy;
+    }
+    mock_device_total_bytes = mock_device_external_bytes = 0;
+    finish();
+  }
+}
+
+static void uks_oom(void) {
+  grids(1);
+  double *input[NLEV];
+  for (int level = 0; level < NLEV; level++) input[level] = rarray((size_t)nr_[level]);
+  const size_t nr = (size_t)nr_[0], ng = (size_t)ng_[0], bytes = nr * sizeof(double);
+  double ga[128], gb[128], ra[64], rb[64], expected_g[128], expected_r[64];
+  double va[64], vb[64], exc;
+  for (int phase = 0; phase < 4; phase++) {
+    start(0);
+    density_reference(input, expected_g, expected_r);
+    memset(ga, 0, sizeof(ga));
+    memset(ra, 0, sizeof(ra));
+    assert(density_call(input, ga, ra, 1));
+    memcpy(gb, expected_g, 2 * ng * sizeof(double));
+    memcpy(rb, expected_r, bytes);
+    if (phase) assert(density_call(input, gb, rb, -1));
+    assert(pw_gpu_ensure_gbuf_c(2 * bytes));
+    if (phase >= 2)
+      assert(ensure_uks_buffer(&uks_xc_dev, &allocated_uks_xc_size, 2 * bytes));
+    for (int index = 0; index < PW_GPU_GRID_CACHE_SIZE; index++)
+      grid_cache_clear_entry(&grid_cache[index]);
+    if (phase == 3)
+      assert(grid_cache_lookup_or_upload(1, map_[0], (int)ng, 1));
+    const size_t requests[] = {4 * bytes, 2 * bytes, ng * sizeof(int), 3 * ng * sizeof(double)};
+    double *alpha_g = res[RES_RHO_G].dev, *alpha_r = res[RES_RHO_R].dev;
+    double *beta_g = res[RES_RHO_G_B].dev, *beta_r = res[RES_RHO_R_B].dev;
+    const unsigned long epoch_before = xc_epoch;
+    const size_t allocations_before = mock_allocations;
+    for (size_t point = 0; point < nr; point++) va[point] = vb[point] = -99.0;
+    exc = -99.0;
+    mock_set_device_free(res_reserve_bytes + requests[phase] - 1);
+    assert(!pw_gpu_xc_full_pipeline_lsd_configured_c(ga, gb, ra, rb, va, vb, &exc,
+        map_[0], g_fine, dims[0], (int)ng, 1, 1, 1e-12, .9, .7, .02, 0.0, .37, 0));
+    assert(mock_allocations == allocations_before && xc_epoch == epoch_before);
+    assert(!protected_xc_buffer && !protected_uks_buffer && protected_grid_entry == NULL);
+    assert(res[RES_RHO_G].dev == alpha_g && res[RES_RHO_R].dev == alpha_r);
+    assert(res[RES_RHO_G].state == RES_VALID && res[RES_RHO_R].state == RES_VALID);
+    if (phase) {
+      assert(res[RES_RHO_G_B].dev == beta_g && res[RES_RHO_R_B].dev == beta_r);
+      assert(res[RES_RHO_G_B].state == RES_VALID && res[RES_RHO_R_B].state == RES_VALID);
+    }
+    for (size_t point = 0; point < nr; point++) assert(va[point] == -99.0 && vb[point] == -99.0);
+    assert(exc == -99.0);
+    pw_gpu_res_ensure_host_c(-1, ga);
+    pw_gpu_res_ensure_host_c(-1, ra);
+    pw_gpu_res_ensure_host_c(-1, gb);
+    pw_gpu_res_ensure_host_c(-1, rb);
+    same(ga, expected_g, 2 * ng, "alpha spectrum survives real VRAM exhaustion");
+    same(ra, expected_r, nr, "alpha density survives real VRAM exhaustion");
+    same(gb, expected_g, 2 * ng, "beta spectrum survives real VRAM exhaustion");
+    same(rb, expected_r, nr, "beta density survives real VRAM exhaustion");
+    mock_device_total_bytes = mock_device_external_bytes = 0;
+    assert(pw_gpu_xc_full_pipeline_lsd_configured_c(ga, gb, ra, rb, va, vb, &exc,
+        map_[0], g_fine, dims[0], (int)ng, 1, 1, 1e-12, .9, .7, .02, 0.0, .37, 0));
+    pw_gpu_res_set_lazy_c(0);
+    double ref_va[64], ref_vb[64], ref_exc;
+    assert(pw_gpu_xc_full_pipeline_lsd_configured_c(expected_g, expected_g,
+        expected_r, expected_r, ref_va, ref_vb, &ref_exc, map_[0], g_fine, dims[0],
+        (int)ng, 1, 1, 1e-12, .9, .7, .02, 0.0, .37, 0));
+    same(va, ref_va, nr, "UKS recovery alpha potential");
+    same(vb, ref_vb, nr, "UKS recovery beta potential");
+    assert(exc == ref_exc);
+    finish();
+  }
+  for (int level = 0; level < NLEV; level++) free(input[level]);
+}
+
+static void uks_chain(const bool full) {
+  grids(full ? 1 : 2);
+  if (full) {
+    ng_[0] = nr_[0];
+    free(map_[0]);
+    map_[0] = malloc((size_t)ng_[0] * sizeof(int));
+    free(g_fine);
+    free(gsq_fine);
+    g_fine = malloc(3 * (size_t)ng_[0] * sizeof(double));
+    gsq_fine = malloc((size_t)ng_[0] * sizeof(double));
+    for (int point = 0; point < ng_[0]; point++) {
+      map_[0][point] = 7 * point % ng_[0];
+      int offset = map_[0][point];
+      gsq_fine[point] = 0.0;
+      for (int dim = 0; dim < 3; dim++) {
+        int coordinate = offset % dims[0][dim];
+        offset /= dims[0][dim];
+        if (coordinate > dims[0][dim] / 2) coordinate -= dims[0][dim];
+        g_fine[3 * point + dim] = (.2 + .1 * dim) * coordinate;
+        gsq_fine[point] += g_fine[3 * point + dim] * g_fine[3 * point + dim];
+      }
+    }
+  }
+  start(0);
+  assert(pw_gpu_uks_enabled_c());
+  const size_t nr = (size_t)nr_[0], ng = (size_t)ng_[0];
+  double *r[2][NLEV], *pot[NLEV];
+  double rscale[NLEV] = {1.0, .7, .9};
+  for (int level = 0; level < NLEV; level++) {
+    pot[level] = rarray((size_t)nr_[level]);
+    for (int spin = 0; spin < 2; spin++) {
+      r[spin][level] = rarray((size_t)nr_[level]);
+      for (int point = 0; point < nr_[level]; point++)
+        r[spin][level][point] = .3 + .1 * spin + .04 * r[spin][level][point];
+    }
+  }
+  double ref_g[2][128], ref_r[2][64], rho_g[2][128], rho_r[2][64];
+  double ref_v[2][64], vxc[2][64], exc, ref_exc, total[128], vh[64];
+  double ref_total[128], ref_vhg[128], ref_vh[64], expected_vtot[64];
+  for (int spin = 0; spin < 2; spin++) density_reference(r[spin], ref_g[spin], ref_r[spin]);
+  const bool natural_xc = opt_res_natural_xc;
+  const bool grant = res_lazy_grant;
+  opt_res_natural_xc = false;
+  res_lazy_grant = false;
+  assert(pw_gpu_xc_full_pipeline_lsd_configured_c(ref_g[0], ref_g[1], ref_r[0], ref_r[1],
+      ref_v[0], ref_v[1], &ref_exc, map_[0], g_fine, dims[0], (int)ng, nmaps_, 1,
+      1e-12, .9, .7, .02, 0.0, .37, 0));
+  opt_res_natural_xc = natural_xc;
+  res_lazy_grant = grant;
+  hartree_in h = hartree_inputs();
+  for (int pass = 0; pass < 3; pass++) {
+    for (size_t point = 0; point < 2 * ng; point++)
+      ref_total[point] = (h.core[point] + ref_g[0][point]) + ref_g[1][point];
+    for (size_t point = 0; point < ng; point++) {
+      const double re = ref_total[2 * point], im = ref_total[2 * point + 1];
+      ref_vhg[2 * point] = re * h.infl[2 * point] - im * h.infl[2 * point + 1];
+      ref_vhg[2 * point + 1] = re * h.infl[2 * point + 1] + im * h.infl[2 * point];
+    }
+    if (pass == 1) {
+      ref_vhg[0] += h.g0_delta;
+      ref_vhg[1] += 0.0;
+      for (int point = 1; point < (int)ng && gsq_fine[point] <= h.gcut2; point++)
+        pw_hartree_elem(ref_vhg + 2, g_fine + 3, gsq_fine + 1, h.r, h.radii, h.cv,
+            (size_t)(point - 1), (size_t)h.natoms, (size_t)h.nradii, h.gcut2, h.vol);
+    }
+    host_sfffc(ref_vhg, ref_vh, map_[0], dims[0], (int)ng, nmaps_, 1.0);
+    for (size_t point = 0; point < nr; point++) ref_vh[point] *= h.dvol;
+    memset(rho_g, 0, sizeof(rho_g));
+    memset(rho_r, 0, sizeof(rho_r));
+    assert(density_call(r[0], rho_g[0], rho_r[0], 1));
+    assert(res_density_token == 1 && res_density_spin_count == 1);
+    double alpha_before[64], spin_real[64];
+    offloadMemcpyAsyncDtoH(alpha_before, res[RES_RHO_R].dev, nr * sizeof(double), stream);
+    offloadStreamSynchronize(stream);
+    assert(density_call(r[1], rho_g[1], rho_r[1], -1));
+    assert(res_density_token == 0 && res_density_spin_count == 2);
+    assert(res[RES_RHO_G].dev == uks_density_dev);
+    assert(res[RES_RHO_R].dev == uks_density_dev + 2 * nr);
+    assert(res_verify_full(&res[RES_RHO_G], ref_g[0]));
+    assert(res_verify_full(&res[RES_RHO_G_B], ref_g[1]));
+    assert(res_verify_full(&res[RES_RHO_R], alpha_before));
+    for (int spin = 0; spin < 2; spin++) {
+      offloadMemcpyAsyncDtoH(spin_real, res[spin ? RES_RHO_R_B : RES_RHO_R].dev, nr * sizeof(double), stream);
+      offloadStreamSynchronize(stream);
+      for (size_t point = 0; point < nr; point++)
+        assert(fabs(spin_real[point] - ref_r[spin][point]) <= 1e-12 * (1 + fabs(ref_r[spin][point])));
+    }
+    double beta_charge, expected_charge = 0;
+    for (size_t point = 0; point < nr; point++) expected_charge += ref_r[1][point];
+    mock_reset_trace();
+    assert(pw_gpu_res_integrate_r_host_c(rho_r[1], nr, &beta_charge, -.37));
+    assert(fabs(beta_charge + .37 * expected_charge) < 1e-12 * (1 + fabs(expected_charge)));
+    if (!opt_res_verify) assert(mock_download_bytes == sizeof(double) && mock_upload_bytes == 0);
+    const bool dz = full && pass && opt_res_xcin && opt_res_xc_dz && res_dz[0].epoch == xc_epoch;
+    if (dz) {
+      assert(res_dz[1].epoch == xc_epoch);
+      assert(res_dz[0].dev == xc_dev_hi && res_dz[1].dev == xc_dev_hi + nr);
+    }
+    for (size_t point = 0; point < 2 * ng; point++) total[point] = -99.0;
+    const size_t prefix = pass == 1 ? 10 : 1;
+    assert(pw_gpu_res_hartree_uks_begin_c(rho_g[0], rho_g[1], h.core, h.infl,
+        ng, prefix, dims[0], total));
+    same(total, ref_total, 2 * prefix, "UKS Hartree prefix");
+    for (size_t point = 2 * prefix; point < 2 * ng; point++) assert(total[point] == -99.0);
+    if (pass == 1)
+      assert(pw_gpu_res_hartree_modify_c(h.g0_delta, 1, g_fine + 3, gsq_fine + 1, h.r,
+          h.radii, h.cv, 1, ng - 1, (size_t)h.natoms, (size_t)h.nradii, h.gcut2, h.vol));
+    double dot, expected_dot = 0;
+    for (size_t point = 0; point < 2 * ng; point++) expected_dot += ref_total[point] * ref_vhg[point];
+    assert(pw_gpu_res_hartree_energy_c(&dot));
+    assert(fabs(dot - expected_dot) < 1e-12 * (1 + fabs(expected_dot)));
+    assert(pw_gpu_res_hartree_finish_c(vh, dims[0], (int)ng, nmaps_, 1, map_[0], h.dvol));
+    const unsigned long dz_used = res_stats.dz_used;
+    for (int spin = 0; spin < 2; spin++)
+      for (size_t point = 0; point < nr; point++) vxc[spin][point] = -99.0;
+    assert(pw_gpu_xc_full_pipeline_lsd_configured_c(rho_g[0], rho_g[1], rho_r[0], rho_r[1],
+        vxc[0], vxc[1], &exc, map_[0], g_fine, dims[0], (int)ng, nmaps_, 1,
+        1e-12, .9, .7, .02, 0.0, .37, 0));
+    assert(allocated_uks_density_size == 4 * nr * sizeof(double));
+    assert(allocated_uks_xc_size == 2 * nr * sizeof(double));
+    assert(res[RES_VXC].dev == uks_density_dev && res[RES_VXC_B].dev == xc_dev);
+    if (dz) assert(res_stats.dz_used == dz_used + 2);
+    assert(fabs(exc - ref_exc) <= 1e-12 * (1 + fabs(ref_exc)));
+    assert(res[RES_VXC].dev != res[RES_VXC_B].dev);
+    for (int spin = 0; spin < 2; spin++) {
+      const int slot = spin ? RES_VXC_B : RES_VXC;
+      if (res_lazy_grant && opt_res_lazy_pot) {
+        assert(res[slot].dev_authoritative);
+        for (size_t point = 0; point < nr; point++) assert(vxc[spin][point] == -99.0);
+      }
+    }
+    pw_gpu_res_ensure_host_c(-1, vh);
+    for (size_t point = 0; point < nr; point++)
+      assert(fabs(vh[point] - ref_vh[point]) <= 1e-12 * (1 + fabs(ref_vh[point])));
+    if (pass == 2) res_free_owned(RES_V_H_R);
+    for (int spin = 0; spin < 2; spin++) {
+      for (size_t point = 0; point < nr; point++)
+        expected_vtot[point] = .37 * ref_v[spin][point] + vh[point];
+      assert(pw_gpu_res_vtot_prepare_c(vh, vxc[spin], nr, .37));
+      assert(res_vtot_active_slot == (spin ? RES_VXC_B : RES_VXC));
+      assert(pw_gpu_res_vtot_skip_host_c());
+      assert(res[res_vtot_active_slot].dev_authoritative);
+      assert(potential_fused(vxc[spin], pot, rscale));
+      for (size_t point = 0; point < nr; point++)
+        assert(fabs(pot[0][point] - expected_vtot[point]) <= 1e-12 * (1 + fabs(expected_vtot[point])));
+    }
+    if (pass == 2) assert(res[RES_V_H_R].state == RES_VALID);
+  }
+  pw_gpu_res_set_lazy_c(0);
+  pw_gpu_set_memory_limit(1);
+  accounting();
+  finish();
+  for (int level = 0; level < NLEV; level++) {
+    free(pot[level]);
+    for (int spin = 0; spin < 2; spin++) free(r[spin][level]);
+  }
+  hartree_free(&h);
+}
+
 int main(int argc, char **argv) {
   assert(argc >= 2);
   if (!strcmp(argv[1], "density")) density();
@@ -1061,8 +1576,17 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[1], "lazy_density")) lazy_density();
   else if (!strcmp(argv[1], "integrate")) integrate();
   else if (!strcmp(argv[1], "lazy_vtot")) lazy_vtot();
+  else if (!strcmp(argv[1], "lazy_vtot_prepare_failure")) lazy_vtot_prepare_failure();
   else if (!strcmp(argv[1], "lazy_grant")) lazy_grant();
   else if (!strcmp(argv[1], "lazy_pot")) lazy_pot();
+  else if (!strcmp(argv[1], "uks")) uks_chain(true);
+  else if (!strcmp(argv[1], "uks_sparse")) uks_chain(false);
+  else if (!strcmp(argv[1], "uks_density_budget")) uks_density_budget();
+  else if (!strcmp(argv[1], "headroom")) headroom();
+  else if (!strcmp(argv[1], "headroom_tables")) headroom_tables();
+  else if (!strcmp(argv[1], "uks_reclaim")) uks_reclaim();
+  else if (!strcmp(argv[1], "uks_compact")) uks_compact();
+  else if (!strcmp(argv[1], "uks_oom")) uks_oom();
   else assert(!"unknown test");
   for (int l = 0; l < NLEV; l++) { free(map_[l]); free(gidx_[l]); }
   free(g_fine); free(gsq_fine);
